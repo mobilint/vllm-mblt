@@ -9,8 +9,8 @@
   </picture>
 </a>
 
-[![PyPI - Version](https://img.shields.io/pypi/v/vllm-mblt?logo=pypi&logoColor=white)](https://pypi.org/project/vllm-mblt/)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/vllm-mblt?logo=python&logoColor=gold)](https://pypi.org/project/vllm-mblt/)
+[![PyPI - Version](https://img.shields.io/pypi/v/vllm-mblt?logo=pypi)](https://pypi.org/project/vllm-mblt/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/vllm-mblt?logo=python)](https://pypi.org/project/vllm-mblt/)
 [![vLLM](https://img.shields.io/badge/vLLM-0.11.2-blue)](https://github.com/vllm-project/vllm)
 [![Mobilint](https://img.shields.io/badge/Mobilint-NPU-green)](https://www.mobilint.com/)
 
