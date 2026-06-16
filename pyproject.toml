@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=70.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-mblt"
+authors = [
+    {name = "Mobilint Inc.", email = "tech-support@mobilint.com"},
+]
+dynamic = ["version"]
+description = "An out-of-tree vLLM plugin for Mobilint NPU runtime integration."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+keywords = [
+    "vllm",
+    "mobilint",
+    "mblt",
+    "npu",
+    "inference",
+    "llm",
+    "vlm",
+    "aries",
+]
+dependencies = [
+    "vllm>=0.11.2,<=0.11.2",
+    "mblt-model-zoo[transformers]>=1.5.1",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Home = "https://www.mobilint.com/"
+Repository = "https://github.com/mobilint/vllm-mblt"
+
+[project.entry-points."vllm.platform_plugins"]
+mblt = "vllm_mblt:register"
+
+[project.entry-points."vllm.general_plugins"]
+mblt_models = "vllm_mblt:register_model"
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["vllm_mblt", "vllm_mblt.*"] } }
+
+[tool.setuptools.dynamic]
+version = { attr = "vllm_mblt.__version__" }
+
+[dependency-groups]
+dev = [
+    "build",
+    "pytest>=8.0.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
