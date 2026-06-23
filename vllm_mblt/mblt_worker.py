@@ -1076,16 +1076,16 @@ class MbltWorker(WorkerBase):
             )
 
         target_tokens = req_state.num_computed_tokens
+        self._dump_loaded_request_before_switch(
+            next_req_id=req_id,
+            print_debug=print_debug,
+        )
+
         if target_tokens <= 0:
             self.loaded_cache_req_id = None
             if print_debug:
                 print(f"[cache] req={req_id} skip-load target_tokens=0")
             return 0
-
-        self._dump_loaded_request_before_switch(
-            next_req_id=req_id,
-            print_debug=print_debug,
-        )
 
         # If the active accelerator cache already belongs to this request,
         # it already contains the up-to-date KV state from previous steps.

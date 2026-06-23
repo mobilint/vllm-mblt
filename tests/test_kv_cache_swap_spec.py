@@ -98,3 +98,16 @@ class TestKvCacheSwapSpec:
         assert "return target_tokens" in WORKER_CODE, (
             "Expected live-cache reuse to preserve full computed-token cache_size."
         )
+
+    def test_switch_dump_precedes_zero_token_skip_load(self) -> None:
+        pattern = re.compile(
+            r"def _load_snapshot_if_needed\(.*?"
+            r"target_tokens = req_state\.num_computed_tokens.*?"
+            r"self\._dump_loaded_request_before_switch\(.*?"
+            r"if target_tokens <= 0:",
+            re.DOTALL,
+        )
+        assert pattern.search(WORKER_CODE), (
+            "Expected live cache owner to be dumped before zero-token requests clear "
+            "loaded_cache_req_id."
+        )
