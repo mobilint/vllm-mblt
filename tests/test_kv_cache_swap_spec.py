@@ -61,8 +61,17 @@ class TestKvCacheSwapSpec:
         assert "def _should_dump_snapshot_after_step(" in WORKER_CODE, (
             "Expected explicit policy for event-driven cache dump."
         )
-        assert "and self._should_dump_snapshot_after_step(req_id, next_cache_sizes[i])" in WORKER_CODE, (
-            "Expected execute loop to conditionally dump snapshots."
+        assert "def _dump_loaded_request_before_switch(" in WORKER_CODE, (
+            "Expected live cache owner switch to be the event that can trigger snapshots."
+        )
+        pattern = re.compile(
+            r"def _dump_loaded_request_before_switch\(.*?"
+            r"if not self\._should_dump_snapshot_after_step\(.*?"
+            r"self\._dump_snapshot\(",
+            re.DOTALL,
+        )
+        assert pattern.search(WORKER_CODE), (
+            "Expected request-switch snapshot dumps to be gated by the event-driven policy."
         )
 
     def test_live_request_avoids_immediate_block_boundary_dump(self) -> None:
@@ -72,8 +81,14 @@ class TestKvCacheSwapSpec:
         assert "req_state.num_computed_tokens = next_cache_size" in WORKER_CODE, (
             "Expected post-step token count to advance before a later request switch dump."
         )
-        assert "self.loaded_cache_req_id != req_id" in WORKER_CODE, (
-            "Expected same-request decode to avoid immediate block-boundary snapshot dumps."
+        immediate_dump_pattern = re.compile(
+            r"req_state\.num_computed_tokens = next_cache_size.*?"
+            r"self\.loaded_cache_req_id = req_id.*?"
+            r"self\._dump_snapshot\(",
+            re.DOTALL,
+        )
+        assert not immediate_dump_pattern.search(WORKER_CODE), (
+            "Expected same-request decode to keep the live accelerator cache instead of immediately dumping it."
         )
 
     def test_live_cache_is_reused_for_same_request(self) -> None:

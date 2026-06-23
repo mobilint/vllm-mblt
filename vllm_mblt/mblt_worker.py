@@ -1687,15 +1687,6 @@ class MbltWorker(WorkerBase):
                     logits_batch.append(torch.from_numpy(logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
-                if self.loaded_cache_req_id != req_id and self._should_dump_snapshot_after_step(
-                    req_id, next_cache_sizes[i]
-                ):
-                    self._dump_snapshot(
-                        req_id=req_id,
-                        req_state=req_state,
-                        next_num_tokens=next_cache_sizes[i],
-                        print_debug=print_debug,
-                    )
 
         sampled_token_ids: list[np.ndarray] = [np.empty(0, dtype=np.int64) for _ in req_ids]
         logprobs = None
