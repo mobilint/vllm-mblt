@@ -1,4 +1,5 @@
 import json
+import logging
 from types import SimpleNamespace
 from vllm_mblt.mblt_platform import MbltPlatform, resolve_effective_npu_prefill_chunk_size, resolve_model_max_batch_size, resolve_npu_prefill_chunk_size
 
@@ -57,6 +58,7 @@ class TestMbltPlatformPrefill:
         assert config.scheduler_config.max_num_seqs == 32
 
     def test_platform_warns_when_max_num_seqs_exceeds_model_batch_size(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger="vllm_mblt.mblt_platform")
         config = _make_vllm_config(
             {'single': 256},
             hf_core_mode='single',
@@ -70,6 +72,7 @@ class TestMbltPlatformPrefill:
         assert "Clamping scheduler max_num_seqs from 64 to model-configured max batch size 32." in caplog.text
 
     def test_platform_keeps_smaller_user_max_num_seqs_without_warning(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger="vllm_mblt.mblt_platform")
         config = _make_vllm_config(
             {'single': 256},
             hf_core_mode='single',
@@ -80,4 +83,18 @@ class TestMbltPlatformPrefill:
         MbltPlatform.check_and_update_config(config)
 
         assert config.scheduler_config.max_num_seqs == 8
+        assert "Clamping scheduler max_num_seqs" not in caplog.text
+
+    def test_platform_keeps_equal_user_max_num_seqs_without_warning(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger="vllm_mblt.mblt_platform")
+        config = _make_vllm_config(
+            {'single': 256},
+            hf_core_mode='single',
+            max_batch_size=32,
+            scheduler_max_num_seqs=32,
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.scheduler_config.max_num_seqs == 32
         assert "Clamping scheduler max_num_seqs" not in caplog.text
