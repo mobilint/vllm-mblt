@@ -55,3 +55,29 @@ class TestMbltPlatformPrefill:
         assert config.scheduler_config.chunked_prefill_enabled
         assert config.scheduler_config.max_num_batched_tokens == 128
         assert config.scheduler_config.max_num_seqs == 32
+
+    def test_platform_warns_when_max_num_seqs_exceeds_model_batch_size(self, caplog) -> None:
+        config = _make_vllm_config(
+            {'single': 256},
+            hf_core_mode='single',
+            max_batch_size=32,
+            scheduler_max_num_seqs=64,
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.scheduler_config.max_num_seqs == 32
+        assert "Clamping scheduler max_num_seqs from 64 to model-configured max batch size 32." in caplog.text
+
+    def test_platform_keeps_smaller_user_max_num_seqs_without_warning(self, caplog) -> None:
+        config = _make_vllm_config(
+            {'single': 256},
+            hf_core_mode='single',
+            max_batch_size=32,
+            scheduler_max_num_seqs=8,
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.scheduler_config.max_num_seqs == 8
+        assert "Clamping scheduler max_num_seqs" not in caplog.text

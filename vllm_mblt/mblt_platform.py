@@ -213,11 +213,16 @@ class MbltPlatform(Platform):
             )
             if configured_max_num_seqs is None:
                 scheduler_config.max_num_seqs = resolved_max_batch_size
-            else:
-                scheduler_config.max_num_seqs = min(
+            elif configured_max_num_seqs > resolved_max_batch_size:
+                logger.warning(
+                    "Clamping scheduler max_num_seqs from %d to model-configured "
+                    "max batch size %d.",
                     configured_max_num_seqs,
                     resolved_max_batch_size,
                 )
+                scheduler_config.max_num_seqs = resolved_max_batch_size
+            else:
+                scheduler_config.max_num_seqs = configured_max_num_seqs
             logger.info(
                 "Using model-configured max batch size %d for scheduler max_num_seqs=%d.",
                 resolved_max_batch_size,
