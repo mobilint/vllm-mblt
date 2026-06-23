@@ -61,6 +61,7 @@ version = { attr = "vllm_mblt.__version__" }
 dev = [
     "build",
     "pytest>=8.0.0",
+    "ruff",
 ]
 
 [tool.ruff]

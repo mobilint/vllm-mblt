@@ -1,14 +1,11 @@
 import torch
-
 from mblt_model_zoo.hf_transformers.models.exaone.modeling_exaone import (
     MobilintExaoneForCausalLM as OriginalMobilintExaoneForCausalLM,
 )
 from vllm.model_executor.models import VllmModelForTextGeneration
 
 
-class MobilintExaoneForCausalLM(
-    OriginalMobilintExaoneForCausalLM, VllmModelForTextGeneration
-):
+class MobilintExaoneForCausalLM(OriginalMobilintExaoneForCausalLM, VllmModelForTextGeneration):
     def __init__(
         self,
         config=None,

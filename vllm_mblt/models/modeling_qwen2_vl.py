@@ -6,14 +6,14 @@ from mblt_model_zoo.hf_transformers.models.qwen2_vl.modeling_qwen2_vl import (
 from mblt_model_zoo.hf_transformers.models.qwen2_vl.processing_qwen2_vl import (
     MobilintQwen2VLProcessor,
 )
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.model_executor.models import VllmModelForTextGeneration
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.qwen2_vl import (
     Qwen2VLDummyInputsBuilder,
-    Qwen2VLProcessingInfo,
     Qwen2VLMultiModalProcessor,
+    Qwen2VLProcessingInfo,
 )
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_mblt.models.modeling_vl_utils import MobilintVLCachedProcessorMixin
 
