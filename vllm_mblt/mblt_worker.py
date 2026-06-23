@@ -1,9 +1,9 @@
-from dataclasses import dataclass, field
 import math
 import os
 import time
 from collections import OrderedDict
-from typing import TYPE_CHECKING, List, Dict, Optional, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -12,34 +12,32 @@ import torch.nn as nn
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-from vllm.v1.worker.worker_base import WorkerBase
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MLAAttentionSpec
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.v1.sample.sampler import Sampler
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.tasks import SupportedTask
-from vllm.sampling_params import SamplingParams
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from qbruntime import BatchParam
-
-from mblt_model_zoo.hf_transformers.utils.configuration_utils import MobilintConfigMixin
-from mblt_model_zoo.hf_transformers.utils.modeling_utils import MobilintModelMixin
 from mblt_model_zoo.hf_transformers.utils.generation_utils import MobilintGenerationMixin
-
-from transformers import AutoModelForCausalLM
-from transformers import AutoModelForImageTextToText
+from qbruntime import BatchParam
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.sampling_params import SamplingParams
+from vllm.tasks import SupportedTask
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MLAAttentionSpec
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.worker_base import WorkerBase
+
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 
 logger = init_logger(__name__)
 
 
-_MULTIMODAL_HF_MODEL_TYPES = frozenset({
-    "mobilint-qwen2_vl",
-    "mobilint-qwen3_vl",
-})
+_MULTIMODAL_HF_MODEL_TYPES = frozenset(
+    {
+        "mobilint-qwen2_vl",
+        "mobilint-qwen3_vl",
+    }
+)
 
 
 def _is_multimodal_hf_config(hf_config: object) -> bool:
@@ -50,6 +48,7 @@ def _is_multimodal_hf_config(hf_config: object) -> bool:
 def _is_qwen3_vl_hf_config(hf_config: object) -> bool:
     model_type = getattr(hf_config, "model_type", None)
     return model_type == "mobilint-qwen3_vl"
+
 
 @dataclass
 class RequestState:
@@ -112,13 +111,13 @@ class MbltWorker(WorkerBase):
         is_driver_worker: bool = False,
     ) -> None:
         super().__init__(vllm_config, local_rank, rank, distributed_init_method, is_driver_worker)
-        
+
         self.model: Optional[MobilintGenerationMixin] = None
         self.input_embeddings: Optional[nn.Module] = None
         self.cache_model: Optional[Any] = None
         self._infer_output_buffers: Optional[list[np.ndarray]] = None
         self.snapshot_index_root = SnapshotIndexNode()
-                
+
         self.req_states: Dict[str, RequestState] = {}
         self.cache_snapshots: Dict[str, CacheSnapshot] = {}
         self.finished_snapshot_lru: OrderedDict[str, None] = OrderedDict()
@@ -128,11 +127,11 @@ class MbltWorker(WorkerBase):
         self.free_cache_slots: list[int] = []
         self._warned_batch_cache_snapshot_unsupported = False
         self._vlm_image_positions_by_session: dict[str, tuple[int, int, Optional[tuple[bool, ...]]]] = {}
-        
+
         self.max_batch_size = resolve_model_max_batch_size(self.vllm_config) or 1
         self._reset_cache_slots()
         self.max_seq_len = self.vllm_config.model_config.max_model_len
-        self.sampler = Sampler(logprobs_mode='raw_logits')
+        self.sampler = Sampler(logprobs_mode="raw_logits")
         self.empty_logits_processors = LogitsProcessors(None)
         self.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
         self.enable_chunked_prefill = self.vllm_config.scheduler_config.enable_chunked_prefill
@@ -188,9 +187,7 @@ class MbltWorker(WorkerBase):
             return self._normalize_block_ids(new_block_ids)
         if len(current_block_ids) != len(new_block_ids):
             raise RuntimeError(
-                "KV block_ids layout mismatch: "
-                f"current={len(current_block_ids)} seqs, "
-                f"new={len(new_block_ids)} seqs"
+                f"KV block_ids layout mismatch: current={len(current_block_ids)} seqs, new={len(new_block_ids)} seqs"
             )
         merged_block_ids: list[list[int]] = []
         for current_seq_blocks, new_seq_blocks in zip(current_block_ids, new_block_ids):
@@ -285,9 +282,7 @@ class MbltWorker(WorkerBase):
             if modality.startswith("image"):
                 image_features.append(feature)
             else:
-                raise RuntimeError(
-                    f"Unsupported multimodal modality for Mobilint Qwen2/3-VL on NPU: {modality}"
-                )
+                raise RuntimeError(f"Unsupported multimodal modality for Mobilint Qwen2/3-VL on NPU: {modality}")
 
         if len(image_features) != 1:
             raise RuntimeError(
@@ -361,9 +356,7 @@ class MbltWorker(WorkerBase):
         cache_sizes: list[int],
         cache_ids: list[int],
     ) -> list[BatchParam]:
-        if not (
-            len(sequence_lengths) == len(cache_sizes) == len(cache_ids)
-        ):
+        if not (len(sequence_lengths) == len(cache_sizes) == len(cache_ids)):
             raise RuntimeError(
                 "BatchParam inputs must have identical lengths: "
                 f"sequence_lengths={len(sequence_lengths)}, "
@@ -433,8 +426,7 @@ class MbltWorker(WorkerBase):
             grid_thw = grid_thw.unsqueeze(0)
         elif grid_thw.ndim != 2 or grid_thw.shape[-1] != 3:
             raise RuntimeError(
-                "Multimodal grid_thw must have shape (3,) or (N, 3), "
-                f"but got shape={tuple(grid_thw.shape)}."
+                f"Multimodal grid_thw must have shape (3,) or (N, 3), but got shape={tuple(grid_thw.shape)}."
             )
 
         return grid_thw
@@ -453,8 +445,7 @@ class MbltWorker(WorkerBase):
             if isinstance(first, (list, tuple)) and first:
                 if not all(isinstance(item, torch.Tensor) for item in first):
                     raise RuntimeError(
-                        "Unsupported nested multimodal embedding output: "
-                        f"{[type(item).__name__ for item in first]!r}"
+                        f"Unsupported nested multimodal embedding output: {[type(item).__name__ for item in first]!r}"
                     )
                 if len(first) == 1:
                     return first[0]
@@ -472,14 +463,10 @@ class MbltWorker(WorkerBase):
         if deepstack is None:
             return None
         if not isinstance(deepstack, (list, tuple)):
-            raise RuntimeError(
-                "Unsupported deepstack multimodal embedding output: "
-                f"{type(deepstack)!r}"
-            )
+            raise RuntimeError(f"Unsupported deepstack multimodal embedding output: {type(deepstack)!r}")
         if not all(isinstance(item, torch.Tensor) for item in deepstack):
             raise RuntimeError(
-                "Unsupported deepstack multimodal embedding tensors: "
-                f"{[type(item).__name__ for item in deepstack]!r}"
+                f"Unsupported deepstack multimodal embedding tensors: {[type(item).__name__ for item in deepstack]!r}"
             )
         return list(deepstack)
 
@@ -505,8 +492,7 @@ class MbltWorker(WorkerBase):
 
         if int(deepstack_prompt_embeds.shape[0]) != num_layers:
             raise RuntimeError(
-                "Deepstack layer-count mismatch: "
-                f"current={deepstack_prompt_embeds.shape[0]}, new={num_layers}"
+                f"Deepstack layer-count mismatch: current={deepstack_prompt_embeds.shape[0]}, new={num_layers}"
             )
 
         start = int(placeholder.offset)
@@ -522,8 +508,7 @@ class MbltWorker(WorkerBase):
             layer_embeds = layer_embeds.to(device=prompt_embeds.device, dtype=prompt_embeds.dtype)
             if int(layer_embeds.shape[0]) != expected:
                 raise RuntimeError(
-                    "Deepstack placeholder length mismatch: "
-                    f"expected={expected}, embeds={layer_embeds.shape[0]}"
+                    f"Deepstack placeholder length mismatch: expected={expected}, embeds={layer_embeds.shape[0]}"
                 )
             deepstack_prompt_embeds[layer_idx, target_indices, :] = layer_embeds
 
@@ -556,8 +541,7 @@ class MbltWorker(WorkerBase):
         expected = int(mask.sum().item())
         if multimodal_embeds.shape[0] != expected:
             raise RuntimeError(
-                "Multimodal placeholder embed-count mismatch: "
-                f"expected={expected}, embeds={multimodal_embeds.shape[0]}"
+                f"Multimodal placeholder embed-count mismatch: expected={expected}, embeds={multimodal_embeds.shape[0]}"
             )
         target[mask] = multimodal_embeds
 
@@ -595,9 +579,7 @@ class MbltWorker(WorkerBase):
             modality = feature.modality
             if modality.startswith("image"):
                 if not callable(get_image_features):
-                    raise RuntimeError(
-                        f"Model {type(self.model).__name__} does not expose get_image_features()."
-                    )
+                    raise RuntimeError(f"Model {type(self.model).__name__} does not expose get_image_features().")
                 pixel_values = self._extract_multimodal_value(feature, "pixel_values")
                 image_grid_thw = self._extract_multimodal_value(feature, "image_grid_thw")
                 if pixel_values is None:
@@ -621,9 +603,7 @@ class MbltWorker(WorkerBase):
                     )
             elif modality.startswith("video"):
                 if not callable(get_video_features):
-                    raise RuntimeError(
-                        f"Model {type(self.model).__name__} does not expose get_video_features()."
-                    )
+                    raise RuntimeError(f"Model {type(self.model).__name__} does not expose get_video_features().")
                 pixel_values_videos = self._extract_multimodal_value(feature, "pixel_values_videos")
                 video_grid_thw = self._extract_multimodal_value(feature, "video_grid_thw")
                 if pixel_values_videos is None:
@@ -646,9 +626,7 @@ class MbltWorker(WorkerBase):
                         self._extract_deepstack_embeddings(video_features),
                     )
             else:
-                raise NotImplementedError(
-                    f"Unsupported multimodal modality for MBLT worker: {modality}"
-                )
+                raise NotImplementedError(f"Unsupported multimodal modality for MBLT worker: {modality}")
 
         return merged_prompt_embeds, deepstack_prompt_embeds
 
@@ -701,9 +679,7 @@ class MbltWorker(WorkerBase):
             return True
         if next_num_tokens <= snapshot.num_tokens:
             return False
-        return self._required_blocks(next_num_tokens) > self._required_blocks(
-            snapshot.num_tokens
-        )
+        return self._required_blocks(next_num_tokens) > self._required_blocks(snapshot.num_tokens)
 
     def _dump_loaded_request_before_switch(
         self,
@@ -912,9 +888,7 @@ class MbltWorker(WorkerBase):
             return batched_input
         if not self._supports_deepstack_input():
             if deepstack_embeds is not None:
-                raise RuntimeError(
-                    "Deepstack embeddings are only supported for Qwen3-VL models."
-                )
+                raise RuntimeError("Deepstack embeddings are only supported for Qwen3-VL models.")
             return batched_input
 
         deepstack_shape = input_shapes[1]
@@ -991,10 +965,7 @@ class MbltWorker(WorkerBase):
         if len(output_shape) != output_buffers[0].ndim:
             return True
 
-        expected_shape = tuple(
-            input_seq_len if dim == -1 else dim
-            for dim in output_shape
-        )
+        expected_shape = tuple(input_seq_len if dim == -1 else dim for dim in output_shape)
         return output_buffers[0].shape == expected_shape
 
     def _infer_logits(
@@ -1074,8 +1045,7 @@ class MbltWorker(WorkerBase):
             return last_token_logits
         if logits_np.size % batch_size != 0:
             raise RuntimeError(
-                "Batched infer returned logits with unexpected shape: "
-                f"shape={logits_np.shape}, batch_size={batch_size}"
+                f"Batched infer returned logits with unexpected shape: shape={logits_np.shape}, batch_size={batch_size}"
             )
         logits_np = logits_np.reshape(batch_size, -1)
         return [logits_np[i] for i in range(batch_size)]
@@ -1106,16 +1076,16 @@ class MbltWorker(WorkerBase):
             )
 
         target_tokens = req_state.num_computed_tokens
+        self._dump_loaded_request_before_switch(
+            next_req_id=req_id,
+            print_debug=print_debug,
+        )
+
         if target_tokens <= 0:
             self.loaded_cache_req_id = None
             if print_debug:
                 print(f"[cache] req={req_id} skip-load target_tokens=0")
             return 0
-
-        self._dump_loaded_request_before_switch(
-            next_req_id=req_id,
-            print_debug=print_debug,
-        )
 
         # If the active accelerator cache already belongs to this request,
         # it already contains the up-to-date KV state from previous steps.
@@ -1139,22 +1109,16 @@ class MbltWorker(WorkerBase):
                     cache_model.load_cache_memory(own_snapshot.blobs)
                     self.loaded_cache_req_id = req_id
                     if print_debug:
-                        print(
-                            f"[cache] req={req_id} load-own matched={matched_tokens}/{target_tokens}"
-                        )
+                        print(f"[cache] req={req_id} load-own matched={matched_tokens}/{target_tokens}")
                 elif print_debug:
-                    print(
-                        f"[cache] req={req_id} reuse-loaded-own matched={matched_tokens}/{target_tokens}"
-                    )
+                    print(f"[cache] req={req_id} reuse-loaded-own matched={matched_tokens}/{target_tokens}")
                 return target_tokens
 
         snapshot, matched_tokens = self._choose_snapshot(req_state)
         if snapshot is None or matched_tokens <= 0:
             self.loaded_cache_req_id = None
             if print_debug:
-                print(
-                    f"[cache] req={req_id} cache-miss fallback matched=0/{target_tokens}"
-                )
+                print(f"[cache] req={req_id} cache-miss fallback matched=0/{target_tokens}")
             return 0
 
         cache_model = self._get_cache_model()
@@ -1162,9 +1126,7 @@ class MbltWorker(WorkerBase):
         cache_model.load_cache_memory(snapshot.blobs)
         self.loaded_cache_req_id = req_id
         if print_debug:
-            print(
-                f"[cache] req={req_id} load-shared matched={matched_tokens}/{target_tokens}"
-            )
+            print(f"[cache] req={req_id} load-shared matched={matched_tokens}/{target_tokens}")
         return matched_tokens
 
     def _load_snapshot_for_batch_slot(
@@ -1184,10 +1146,7 @@ class MbltWorker(WorkerBase):
         live_owner = self.cache_slot_to_req.get(slot_id)
         if live_owner == req_id:
             if print_debug:
-                print(
-                    f"[cache] req={req_id} slot={slot_id} reuse-live-cache "
-                    f"matched={target_tokens}/{target_tokens}"
-                )
+                print(f"[cache] req={req_id} slot={slot_id} reuse-live-cache matched={target_tokens}/{target_tokens}")
             return target_tokens
 
         own_snapshot = self.cache_snapshots.get(req_id)
@@ -1202,10 +1161,7 @@ class MbltWorker(WorkerBase):
                 if self._load_runtime_cache(own_snapshot.blobs, slot_id=slot_id):
                     self.cache_slot_to_req[slot_id] = req_id
                     if print_debug:
-                        print(
-                            f"[cache] req={req_id} slot={slot_id} "
-                            f"load-own matched={matched_tokens}/{target_tokens}"
-                        )
+                        print(f"[cache] req={req_id} slot={slot_id} load-own matched={matched_tokens}/{target_tokens}")
                     return target_tokens
 
         snapshot, matched_tokens = self._choose_snapshot(req_state)
@@ -1213,17 +1169,12 @@ class MbltWorker(WorkerBase):
             if self._load_runtime_cache(snapshot.blobs, slot_id=slot_id):
                 self.cache_slot_to_req[slot_id] = req_id
                 if print_debug:
-                    print(
-                        f"[cache] req={req_id} slot={slot_id} "
-                        f"load-shared matched={matched_tokens}/{target_tokens}"
-                    )
+                    print(f"[cache] req={req_id} slot={slot_id} load-shared matched={matched_tokens}/{target_tokens}")
                 return matched_tokens
 
         self.cache_slot_to_req[slot_id] = req_id
         if print_debug:
-            print(
-                f"[cache] req={req_id} slot={slot_id} cache-miss fallback matched=0/{target_tokens}"
-            )
+            print(f"[cache] req={req_id} slot={slot_id} cache-miss fallback matched=0/{target_tokens}")
         return 0
 
     def _dump_snapshot(
@@ -1256,7 +1207,8 @@ class MbltWorker(WorkerBase):
         if print_debug:
             num_blocks = len(req_state.first_seq_blocks)
             print(
-                f"[cache] req={req_id} dump tokens={stored_tokens} blocks={num_blocks} snapshots={len(self.cache_snapshots)}"
+                f"[cache] req={req_id} dump tokens={stored_tokens} "
+                f"blocks={num_blocks} snapshots={len(self.cache_snapshots)}"
             )
         return True
 
@@ -1266,22 +1218,24 @@ class MbltWorker(WorkerBase):
         print_debug: bool = False,
     ) -> None:
         finished_req_state = self.req_states.pop(req_id, None)
-        finished_slot_id = (
-            finished_req_state.cache_slot_id if finished_req_state is not None else None
-        )
+        finished_slot_id = finished_req_state.cache_slot_id if finished_req_state is not None else None
         if finished_req_state is not None:
             should_dump = self._should_dump_snapshot_after_step(
                 req_id,
                 finished_req_state.num_computed_tokens,
             )
             if self._is_batch_model():
-                if should_dump and self._dump_snapshot(
-                    req_id=req_id,
-                    req_state=finished_req_state,
-                    next_num_tokens=finished_req_state.num_computed_tokens,
-                    slot_id=finished_slot_id,
-                    print_debug=print_debug,
-                ) and print_debug:
+                if (
+                    should_dump
+                    and self._dump_snapshot(
+                        req_id=req_id,
+                        req_state=finished_req_state,
+                        next_num_tokens=finished_req_state.num_computed_tokens,
+                        slot_id=finished_slot_id,
+                        print_debug=print_debug,
+                    )
+                    and print_debug
+                ):
                     print(f"[cache] req={req_id} slot={finished_slot_id} dump-on-finish")
             elif (
                 self.loaded_cache_req_id == req_id
@@ -1302,7 +1256,7 @@ class MbltWorker(WorkerBase):
             self.loaded_cache_req_id = None
         if self._is_batch_model():
             self._release_cache_slot(req_id)
-        
+
     def init_device(self) -> None:
         self._log_init_stage("init_device")
         return
@@ -1315,6 +1269,7 @@ class MbltWorker(WorkerBase):
             if isinstance(value, str):
                 try:
                     import json
+
                     value = json.loads(value)
                 except Exception:
                     return
@@ -1343,11 +1298,7 @@ class MbltWorker(WorkerBase):
             model_kwargs=model_kwargs,
         )
         hf_config = getattr(self.model_config, "hf_config", None)
-        auto_model_cls = (
-            AutoModelForImageTextToText
-            if _is_multimodal_hf_config(hf_config)
-            else AutoModelForCausalLM
-        )
+        auto_model_cls = AutoModelForImageTextToText if _is_multimodal_hf_config(hf_config) else AutoModelForCausalLM
         self.model = auto_model_cls.from_pretrained(
             self.model_config.model,
             trust_remote_code=True,
@@ -1439,11 +1390,7 @@ class MbltWorker(WorkerBase):
         return CachedSamplingState(
             temperature=float(sampling_params.temperature),
             top_p=float(sampling_params.top_p),
-            top_k=int(
-                sampling_params.top_k
-                if sampling_params.top_k > 0
-                else self.model.config.vocab_size
-            ),
+            top_k=int(sampling_params.top_k if sampling_params.top_k > 0 else self.model.config.vocab_size),
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
@@ -1451,11 +1398,7 @@ class MbltWorker(WorkerBase):
             max_num_logprobs=max_num_logprobs,
             bad_words_token_ids=sampling_params._bad_words_token_ids or None,
             prompt_token_ids=torch.as_tensor(prompt_token_ids or [], dtype=torch.int64),
-            has_penalties=(
-                frequency_penalty != 0.0
-                or presence_penalty != 0.0
-                or repetition_penalty != 1.0
-            ),
+            has_penalties=(frequency_penalty != 0.0 or presence_penalty != 0.0 or repetition_penalty != 1.0),
         )
 
     def _pack_prompt_token_ids(
@@ -1480,17 +1423,12 @@ class MbltWorker(WorkerBase):
             if token_ids.numel() > 0:
                 prompt_token_ids[row, : token_ids.numel()] = token_ids
         return prompt_token_ids
-        
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {
-            "mblt": MLAAttentionSpec(
-                block_size=self._kv_block_size(),
-                num_kv_heads=1,
-                head_size=1,
-                dtype=torch.int8
-            )
+            "mblt": MLAAttentionSpec(block_size=self._kv_block_size(), num_kv_heads=1, head_size=1, dtype=torch.int8)
         }
-    
+
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         self.kv_cache_config = kv_cache_config
         self._log_init_stage(
@@ -1501,8 +1439,8 @@ class MbltWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> None:
         self._log_init_stage("compile_or_warm_up_model")
-        pass 
-    
+        pass
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return ("generate",)
 
@@ -1514,9 +1452,7 @@ class MbltWorker(WorkerBase):
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
         )
-        assert num_gpu_blocks == expected, (
-            f"GPU Blocks mismatch: expected {expected}, got {num_gpu_blocks}"
-        )
+        assert num_gpu_blocks == expected, f"GPU Blocks mismatch: expected {expected}, got {num_gpu_blocks}"
 
     def determine_available_memory(self) -> int:
         spec = self.get_kv_cache_spec()["mblt"]
@@ -1529,7 +1465,7 @@ class MbltWorker(WorkerBase):
             available_memory=available_memory,
         )
         return available_memory
-    
+
     def check_health(self) -> None:
         self._log_init_stage(
             "check_health",
@@ -1544,16 +1480,14 @@ class MbltWorker(WorkerBase):
         return self.model
 
     @torch.inference_mode()
-    def execute_model(
-        self, scheduler_output: SchedulerOutput
-    ) -> ModelRunnerOutput | None:
+    def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | None:
         if self.model is None:
             raise RuntimeError("Model is not initialized.")
         if self.input_embeddings is None:
             raise RuntimeError("Input embeddings are not initialized.")
-        
+
         print_debug = self.print_debug
-        
+
         if print_debug:
             print("new: ", scheduler_output.scheduled_new_reqs)
             print("cached: ", scheduler_output.scheduled_cached_reqs)
@@ -1581,14 +1515,10 @@ class MbltWorker(WorkerBase):
             normalized_block_ids = self._normalize_block_ids(new_req.block_ids)
             prompt_embeds_np = self._to_cpu_float32_numpy(prompt_embeds)
             prompt_deepstack_embeds_np = (
-                self._to_cpu_float32_numpy(prompt_deepstack_embeds)
-                if prompt_deepstack_embeds is not None
-                else None
+                self._to_cpu_float32_numpy(prompt_deepstack_embeds) if prompt_deepstack_embeds is not None else None
             )
-            cache_slot_id = (
-                self._assign_cache_slot(new_req.req_id) if self._is_batch_model() else None
-            )
-            
+            cache_slot_id = self._assign_cache_slot(new_req.req_id) if self._is_batch_model() else None
+
             self.req_states[new_req.req_id] = RequestState(
                 is_prefill=True,
                 output_token_ids=[],
@@ -1613,11 +1543,11 @@ class MbltWorker(WorkerBase):
         # Continue cached requests
         for i, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
             cached_request_state = self.req_states[req_id]
-            
+
             # all_token_ids = scheduler_output.scheduled_cached_reqs.all_token_ids[req_id]
             cached_request_state.num_computed_tokens = scheduler_output.scheduled_cached_reqs.num_computed_tokens[i]
             cached_request_state.num_output_tokens = scheduler_output.scheduled_cached_reqs.num_output_tokens[i]
-            
+
             new_block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[i]
             if new_block_ids is not None:
                 if req_id in scheduler_output.scheduled_cached_reqs.resumed_req_ids:
@@ -1627,12 +1557,10 @@ class MbltWorker(WorkerBase):
                         cached_request_state.block_ids,
                         new_block_ids,
                     )
-                cached_request_state.first_seq_blocks = self._first_seq_blocks(
-                    cached_request_state.block_ids
-                )
-        
+                cached_request_state.first_seq_blocks = self._first_seq_blocks(cached_request_state.block_ids)
+
         batch_size = len(scheduler_output.num_scheduled_tokens)
-        
+
         if batch_size <= 0:
             return ModelRunnerOutput(
                 req_ids=[],
@@ -1642,7 +1570,7 @@ class MbltWorker(WorkerBase):
                 prompt_logprobs_dict={},
                 pooler_output=[],
             )
-        
+
         req_ids: list[str] = []
         req_id_to_index: dict[str, int] = {}
         scheduled_end_positions: list[int] = []
@@ -1759,22 +1687,10 @@ class MbltWorker(WorkerBase):
                     logits_batch.append(torch.from_numpy(logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
-                if (
-                    self.loaded_cache_req_id != req_id
-                    and self._should_dump_snapshot_after_step(req_id, next_cache_sizes[i])
-                ):
-                    self._dump_snapshot(
-                        req_id=req_id,
-                        req_state=req_state,
-                        next_num_tokens=next_cache_sizes[i],
-                        print_debug=print_debug,
-                    )
-            
-        sampled_token_ids: list[np.ndarray] = [
-            np.empty(0, dtype=np.int64) for _ in req_ids
-        ]
+
+        sampled_token_ids: list[np.ndarray] = [np.empty(0, dtype=np.int64) for _ in req_ids]
         logprobs = None
-        
+
         if logits_batch:
             logits = torch.cat(logits_batch, dim=0)
             sampling_metadata = self._make_sampling_metadata(req_states_for_sampling)
@@ -1786,9 +1702,11 @@ class MbltWorker(WorkerBase):
                     sampled_token_ids_int[i],
                     dtype=np.int64,
                 )
-                
-            logprobs = sampler_output.logprobs_tensors.tolists() if sampler_output.logprobs_tensors is not None else None
-        
+
+            logprobs = (
+                sampler_output.logprobs_tensors.tolists() if sampler_output.logprobs_tensors is not None else None
+            )
+
         if print_debug:
             print(req_ids, req_id_to_index, sampled_token_ids)
 
@@ -1800,7 +1718,7 @@ class MbltWorker(WorkerBase):
             prompt_logprobs_dict={},
             pooler_output=[],
         )
-    
+
     def _make_sampling_metadata(
         self,
         request_states: List[RequestState],
@@ -1867,41 +1785,29 @@ class MbltWorker(WorkerBase):
             all_greedy = all_greedy and is_greedy
             all_random = all_random and not is_greedy
 
-        prompt_token_ids = (
-            self._pack_prompt_token_ids(prompt_token_ids_list)
-            if any_penalties
-            else None
-        )
+        prompt_token_ids = self._pack_prompt_token_ids(prompt_token_ids_list) if any_penalties else None
 
         return SamplingMetadata(
             temperature=temperatures,
             all_greedy=all_greedy,
             all_random=all_random,
-            
             top_p=top_ps,
             top_k=top_ks,
-            
             generators=generators,
-            
             max_num_logprobs=max_num_logprobs,
-            
             no_penalties=not any_penalties,
             prompt_token_ids=prompt_token_ids,
             frequency_penalties=frequency_penalties,
             presence_penalties=presence_penalties,
             repetition_penalties=repetition_penalties,
-            
             output_token_ids=output_token_ids,
-            
             allowed_token_ids_mask=None,
             bad_words_token_ids=bad_words_token_ids,
             logitsprocs=self.empty_logits_processors,
-            spec_token_ids=None
+            spec_token_ids=None,
         )
 
-    def sample_tokens(
-        self, grammar_output: GrammarOutput
-    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+    def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         raise NotImplementedError
 
     def shutdown(self) -> None:

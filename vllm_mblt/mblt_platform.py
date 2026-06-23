@@ -2,7 +2,7 @@ import json
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig, ParallelConfig, CacheConfig, SchedulerConfig
+    from vllm.config import CacheConfig, ParallelConfig, SchedulerConfig, VllmConfig
 
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
@@ -140,8 +140,7 @@ def resolve_effective_npu_prefill_chunk_size(vllm_config: "VllmConfig") -> int:
         and resolved_chunk_size > SINGLE_CORE_BATCH_MODEL_MAX_PREFILL_CHUNK_SIZE
     ):
         logger.warning(
-            "Clamping model-configured chunked prefill size from %d to %d "
-            "for batch execution.",
+            "Clamping model-configured chunked prefill size from %d to %d for batch execution.",
             resolved_chunk_size,
             SINGLE_CORE_BATCH_MODEL_MAX_PREFILL_CHUNK_SIZE,
         )
@@ -208,16 +207,18 @@ class MbltPlatform(Platform):
 
         resolved_max_batch_size = resolve_model_max_batch_size(vllm_config)
         if resolved_max_batch_size is not None:
-            configured_max_num_seqs = _coerce_positive_int(
-                getattr(scheduler_config, "max_num_seqs", None)
-            )
+            configured_max_num_seqs = _coerce_positive_int(getattr(scheduler_config, "max_num_seqs", None))
             if configured_max_num_seqs is None:
                 scheduler_config.max_num_seqs = resolved_max_batch_size
-            else:
-                scheduler_config.max_num_seqs = min(
+            elif configured_max_num_seqs > resolved_max_batch_size:
+                logger.warning(
+                    "Clamping scheduler max_num_seqs from %d to model-configured max batch size %d.",
                     configured_max_num_seqs,
                     resolved_max_batch_size,
                 )
+                scheduler_config.max_num_seqs = resolved_max_batch_size
+            else:
+                scheduler_config.max_num_seqs = configured_max_num_seqs
             logger.info(
                 "Using model-configured max batch size %d for scheduler max_num_seqs=%d.",
                 resolved_max_batch_size,
