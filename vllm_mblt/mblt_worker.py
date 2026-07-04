@@ -39,6 +39,22 @@ _MULTIMODAL_HF_MODEL_TYPES = frozenset(
     }
 )
 
+_MBLT_BACKEND_KWARG_FIELDS = frozenset(
+    {
+        "mxq_path",
+        "dev_no",
+        "max_batch_size",
+        "core_mode",
+        "target_cores",
+        "target_clusters",
+        "npu_prefill_chunk_size",
+    }
+)
+_MBLT_BACKEND_KWARG_PREFIXES = ("", "text_", "vision_", "encoder_", "decoder_", "base_", "draft_", "fc_")
+_MBLT_BACKEND_KWARG_NAMES = frozenset(
+    f"{prefix}{field}" for prefix in _MBLT_BACKEND_KWARG_PREFIXES for field in _MBLT_BACKEND_KWARG_FIELDS
+)
+
 
 def _is_multimodal_hf_config(hf_config: object) -> bool:
     model_type = getattr(hf_config, "model_type", None)
@@ -1274,12 +1290,7 @@ class MbltWorker(WorkerBase):
                 except Exception:
                     return
             if isinstance(value, dict):
-                for key in (
-                    "dev_no",
-                    "target_cores",
-                    "target_clusters",
-                    "core_mode",
-                ):
+                for key in _MBLT_BACKEND_KWARG_NAMES:
                     if key in value:
                         model_kwargs[key] = value[key]
 

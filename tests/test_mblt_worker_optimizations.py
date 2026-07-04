@@ -474,9 +474,18 @@ class TestMbltWorkerOptimizations:
         worker.load_config = SimpleNamespace(
             model_loader_extra_config={
                 "dev_no": 2,
+                "mxq_path": "/tmp/model.mxq",
+                "max_batch_size": 8,
+                "npu_prefill_chunk_size": {"global8": 512},
                 "target_cores": ["1:0"],
                 "target_clusters": [0, 1],
                 "core_mode": "global8",
+                "text_core_mode": "single",
+                "text_target_cores": ["0:0"],
+                "vision_mxq_path": "/tmp/vision.mxq",
+                "vision_core_mode": "global4",
+                "vision_target_clusters": [0],
+                "unrelated": "ignored",
             }
         )
         worker.model_config = SimpleNamespace(
@@ -506,9 +515,17 @@ class TestMbltWorkerOptimizations:
                 {
                     "trust_remote_code": True,
                     "dev_no": 2,
+                    "mxq_path": "/tmp/model.mxq",
+                    "max_batch_size": 8,
+                    "npu_prefill_chunk_size": {"global8": 512},
                     "target_cores": ["1:0"],
                     "target_clusters": [0, 1],
                     "core_mode": "global8",
+                    "text_core_mode": "single",
+                    "text_target_cores": ["0:0"],
+                    "vision_mxq_path": "/tmp/vision.mxq",
+                    "vision_core_mode": "global4",
+                    "vision_target_clusters": [0],
                 },
             )
         ]
