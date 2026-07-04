@@ -39,9 +39,14 @@ def _get_model_loader_extra_config(vllm_config: "VllmConfig") -> dict | None:
     return _coerce_config_dict(getattr(load_config, "model_loader_extra_config", None))
 
 
-def _resolve_core_mode(vllm_config: "VllmConfig") -> str | None:
+def _resolve_core_mode(vllm_config: "VllmConfig", *, prefer_text_core_mode: bool = False) -> str | None:
     extra_config = _get_model_loader_extra_config(vllm_config)
     if extra_config is not None:
+        if prefer_text_core_mode:
+            configured_text_core_mode = extra_config.get("text_core_mode")
+            if isinstance(configured_text_core_mode, str) and configured_text_core_mode:
+                return configured_text_core_mode
+
         configured_core_mode = extra_config.get("core_mode")
         if isinstance(configured_core_mode, str) and configured_core_mode:
             return configured_core_mode
@@ -88,6 +93,7 @@ def _resolve_model_config_positive_int(
     raw_value: object,
     *,
     field_name: str,
+    prefer_text_core_mode: bool = False,
 ) -> int | None:
     if raw_value is None:
         return None
@@ -99,7 +105,7 @@ def _resolve_model_config_positive_int(
     if not isinstance(raw_value, dict):
         return None
 
-    core_mode = _resolve_core_mode(vllm_config)
+    core_mode = _resolve_core_mode(vllm_config, prefer_text_core_mode=prefer_text_core_mode)
     if core_mode is not None:
         chunk_size = _coerce_positive_int(raw_value.get(core_mode))
         if chunk_size is not None:
@@ -125,6 +131,7 @@ def resolve_npu_prefill_chunk_size(vllm_config: "VllmConfig") -> int | None:
         vllm_config,
         raw_chunk_size,
         field_name="npu_prefill_chunk_size",
+        prefer_text_core_mode=True,
     )
 
 

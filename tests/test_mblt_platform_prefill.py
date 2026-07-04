@@ -56,6 +56,24 @@ class TestMbltPlatformPrefill:
         )
         assert resolve_npu_prefill_chunk_size(config) == 256
 
+    def test_prefers_loader_text_core_mode_for_prefill_chunk_size(self) -> None:
+        config = _make_vllm_config(
+            {"single": 64, "global4": 256},
+            loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+        )
+
+        assert resolve_npu_prefill_chunk_size(config) == 64
+
+    def test_platform_uses_loader_text_core_mode_for_scheduler_prefill_limit(self) -> None:
+        config = _make_vllm_config(
+            {"single": 64, "global4": 256},
+            loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.scheduler_config.max_num_batched_tokens == 64
+
     def test_resolves_json_string_loader_max_batch_size_override(self) -> None:
         config = _make_vllm_config(
             {"global4": 256},
