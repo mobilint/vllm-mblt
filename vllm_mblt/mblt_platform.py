@@ -10,6 +10,12 @@ from vllm.platforms import Platform, PlatformEnum
 logger = init_logger(__name__)
 
 SINGLE_CORE_BATCH_MODEL_MAX_PREFILL_CHUNK_SIZE = 128
+_MULTIMODAL_HF_MODEL_TYPES = frozenset(
+    {
+        "mobilint-qwen2_vl",
+        "mobilint-qwen3_vl",
+    }
+)
 
 
 def _coerce_positive_int(value: object) -> int | None:
@@ -39,15 +45,35 @@ def _get_model_loader_extra_config(vllm_config: "VllmConfig") -> dict | None:
     return _coerce_config_dict(getattr(load_config, "model_loader_extra_config", None))
 
 
-def _resolve_core_mode(vllm_config: "VllmConfig") -> str | None:
+def _get_hf_config(vllm_config: "VllmConfig") -> object:
+    model_config = getattr(vllm_config, "model_config", None)
+    return getattr(model_config, "hf_config", None)
+
+
+def _is_multimodal_hf_config(hf_config: object) -> bool:
+    model_type = getattr(hf_config, "model_type", None)
+    if not isinstance(model_type, str) and isinstance(hf_config, dict):
+        model_type = hf_config.get("model_type")
+    return isinstance(model_type, str) and model_type in _MULTIMODAL_HF_MODEL_TYPES
+
+
+def _prefer_text_runtime(vllm_config: "VllmConfig") -> bool:
+    return _is_multimodal_hf_config(_get_hf_config(vllm_config))
+
+
+def _resolve_core_mode(vllm_config: "VllmConfig", *, prefer_text_core_mode: bool = False) -> str | None:
     extra_config = _get_model_loader_extra_config(vllm_config)
     if extra_config is not None:
+        if prefer_text_core_mode:
+            configured_text_core_mode = extra_config.get("text_core_mode")
+            if isinstance(configured_text_core_mode, str) and configured_text_core_mode:
+                return configured_text_core_mode
+
         configured_core_mode = extra_config.get("core_mode")
         if isinstance(configured_core_mode, str) and configured_core_mode:
             return configured_core_mode
 
-    model_config = getattr(vllm_config, "model_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
+    hf_config = _get_hf_config(vllm_config)
     configured_core_mode = getattr(hf_config, "core_mode", None)
     if isinstance(configured_core_mode, str) and configured_core_mode:
         return configured_core_mode
@@ -56,8 +82,7 @@ def _resolve_core_mode(vllm_config: "VllmConfig") -> str | None:
 
 
 def _get_model_config_value(vllm_config: "VllmConfig", *field_names: str) -> object:
-    model_config = getattr(vllm_config, "model_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
+    hf_config = _get_hf_config(vllm_config)
     if hf_config is None:
         return None
 
@@ -88,6 +113,7 @@ def _resolve_model_config_positive_int(
     raw_value: object,
     *,
     field_name: str,
+    prefer_text_core_mode: bool = False,
 ) -> int | None:
     if raw_value is None:
         return None
@@ -99,7 +125,7 @@ def _resolve_model_config_positive_int(
     if not isinstance(raw_value, dict):
         return None
 
-    core_mode = _resolve_core_mode(vllm_config)
+    core_mode = _resolve_core_mode(vllm_config, prefer_text_core_mode=prefer_text_core_mode)
     if core_mode is not None:
         chunk_size = _coerce_positive_int(raw_value.get(core_mode))
         if chunk_size is not None:
@@ -125,6 +151,7 @@ def resolve_npu_prefill_chunk_size(vllm_config: "VllmConfig") -> int | None:
         vllm_config,
         raw_chunk_size,
         field_name="npu_prefill_chunk_size",
+        prefer_text_core_mode=_prefer_text_runtime(vllm_config),
     )
 
 
@@ -149,9 +176,21 @@ def resolve_effective_npu_prefill_chunk_size(vllm_config: "VllmConfig") -> int:
     return resolved_chunk_size
 
 
-def resolve_model_max_batch_size(vllm_config: "VllmConfig") -> int | None:
+def resolve_model_max_batch_size(
+    vllm_config: "VllmConfig",
+    *,
+    prefer_text_runtime: bool | None = None,
+) -> int | None:
+    if prefer_text_runtime is None:
+        prefer_text_runtime = _prefer_text_runtime(vllm_config)
+
     extra_config = _get_model_loader_extra_config(vllm_config)
     if extra_config is not None:
+        if prefer_text_runtime:
+            text_override = _coerce_positive_int(extra_config.get("text_max_batch_size"))
+            if text_override is not None:
+                return text_override
+
         override = _coerce_positive_int(extra_config.get("max_batch_size"))
         if override is not None:
             return override
@@ -165,6 +204,7 @@ def resolve_model_max_batch_size(vllm_config: "VllmConfig") -> int | None:
         vllm_config,
         raw_max_batch_size,
         field_name="max_batch_size",
+        prefer_text_core_mode=prefer_text_runtime,
     )
 
 

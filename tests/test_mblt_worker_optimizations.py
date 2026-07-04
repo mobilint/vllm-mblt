@@ -460,7 +460,49 @@ class TestMbltWorkerOptimizations:
         with pytest.raises(RuntimeError, match="VLM batch execution is not supported"):
             worker._ensure_batch_vlm_supported(req_state)
 
-    def test_load_model_passes_runtime_layout_kwargs_to_from_pretrained(self, monkeypatch) -> None:
+    def test_init_uses_text_runtime_max_batch_size_for_cache_slots(self, monkeypatch) -> None:
+        def worker_base_init(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False):
+            self.vllm_config = vllm_config
+            self.local_rank = local_rank
+            self.rank = rank
+
+        monkeypatch.setattr("vllm_mblt.mblt_worker.WorkerBase.__init__", worker_base_init)
+        config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=128),
+            load_config=SimpleNamespace(
+                model_loader_extra_config={"core_mode": "global4", "max_batch_size": 16, "text_max_batch_size": 4}
+            ),
+            model_config=SimpleNamespace(max_model_len=1024, hf_config=SimpleNamespace(model_type="mobilint-qwen3_vl")),
+            scheduler_config=SimpleNamespace(enable_chunked_prefill=True, max_num_batched_tokens=128),
+        )
+
+        worker = MbltWorker(config, local_rank=0, rank=0, distributed_init_method="env://")
+
+        assert worker.max_batch_size == 4
+        assert worker.free_cache_slots == [0, 1, 2, 3]
+
+    def test_init_uses_shared_text_only_max_batch_size_for_cache_slots(self, monkeypatch) -> None:
+        def worker_base_init(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False):
+            self.vllm_config = vllm_config
+            self.local_rank = local_rank
+            self.rank = rank
+
+        monkeypatch.setattr("vllm_mblt.mblt_worker.WorkerBase.__init__", worker_base_init)
+        config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=128),
+            load_config=SimpleNamespace(
+                model_loader_extra_config={"core_mode": "global4", "max_batch_size": 16, "text_max_batch_size": 4}
+            ),
+            model_config=SimpleNamespace(max_model_len=1024, hf_config=SimpleNamespace(model_type="qwen2")),
+            scheduler_config=SimpleNamespace(enable_chunked_prefill=True, max_num_batched_tokens=128),
+        )
+
+        worker = MbltWorker(config, local_rank=0, rank=0, distributed_init_method="env://")
+
+        assert worker.max_batch_size == 16
+        assert worker.free_cache_slots == list(range(16))
+
+    def test_load_model_passes_text_runtime_layout_kwargs_to_from_pretrained(self, monkeypatch) -> None:
         worker = MbltWorker.__new__(MbltWorker)
         worker.rank = 0
         worker.local_rank = 0
@@ -474,9 +516,18 @@ class TestMbltWorkerOptimizations:
         worker.load_config = SimpleNamespace(
             model_loader_extra_config={
                 "dev_no": 2,
+                "mxq_path": "/tmp/model.mxq",
+                "max_batch_size": 8,
+                "npu_prefill_chunk_size": {"global8": 512},
                 "target_cores": ["1:0"],
                 "target_clusters": [0, 1],
                 "core_mode": "global8",
+                "text_core_mode": "single",
+                "text_target_cores": ["0:0"],
+                "vision_mxq_path": "/tmp/vision.mxq",
+                "vision_core_mode": "global4",
+                "vision_target_clusters": [0],
+                "unrelated": "ignored",
             }
         )
         worker.model_config = SimpleNamespace(
@@ -506,9 +557,90 @@ class TestMbltWorkerOptimizations:
                 {
                     "trust_remote_code": True,
                     "dev_no": 2,
+                    "mxq_path": "/tmp/model.mxq",
+                    "max_batch_size": 8,
+                    "npu_prefill_chunk_size": {"global8": 512},
                     "target_cores": ["1:0"],
                     "target_clusters": [0, 1],
                     "core_mode": "global8",
+                    "text_core_mode": "single",
+                    "text_target_cores": ["0:0"],
+                    "vision_mxq_path": "/tmp/vision.mxq",
+                    "vision_core_mode": "global4",
+                    "vision_target_clusters": [0],
+                },
+            )
+        ]
+
+    def test_load_model_expands_vlm_runtime_layout_kwargs_to_subconfigs(self, monkeypatch) -> None:
+        worker = MbltWorker.__new__(MbltWorker)
+        worker.rank = 0
+        worker.local_rank = 0
+        worker.model = None
+        worker.cache_model = None
+        worker._infer_output_buffers = None
+        worker.max_batch_size = 1
+        worker.req_to_cache_slot = {}
+        worker.cache_slot_to_req = {}
+        worker.free_cache_slots = []
+        worker.load_config = SimpleNamespace(
+            model_loader_extra_config={
+                "dev_no": 0,
+                "mxq_path": "/tmp/ignored-top-level.mxq",
+                "max_batch_size": 4,
+                "npu_prefill_chunk_size": {"global4": 256},
+                "target_cores": ["1:0"],
+                "target_clusters": [0, 1],
+                "core_mode": "global4",
+                "text_core_mode": "single",
+                "text_target_cores": ["0:0"],
+                "vision_mxq_path": "/tmp/vision.mxq",
+                "vision_core_mode": "multi",
+                "vision_target_clusters": [0],
+            }
+        )
+        worker.model_config = SimpleNamespace(
+            model="mobilint/Qwen3-VL-2B-Instruct",
+            hf_config=SimpleNamespace(model_type="mobilint-qwen3_vl"),
+            model_kwargs={},
+            hf_overrides={},
+        )
+        worker.vllm_config = SimpleNamespace(
+            load_config=SimpleNamespace(model_loader_extra_config={}), model_config=worker.model_config
+        )
+        fake_model = SimpleNamespace(
+            eval=lambda: None,
+            get_input_embeddings=lambda: SimpleNamespace(),
+            get_cache_mxq_model=lambda: SimpleNamespace(),
+        )
+        calls = []
+
+        def from_pretrained(*args, **kwargs):
+            calls.append((args, kwargs))
+            return fake_model
+
+        monkeypatch.setattr("vllm_mblt.mblt_worker.AutoModelForImageTextToText.from_pretrained", from_pretrained)
+
+        worker.load_model()
+
+        assert calls == [
+            (
+                ("mobilint/Qwen3-VL-2B-Instruct",),
+                {
+                    "trust_remote_code": True,
+                    "vision_dev_no": 0,
+                    "text_dev_no": 0,
+                    "vision_max_batch_size": 4,
+                    "text_max_batch_size": 4,
+                    "vision_npu_prefill_chunk_size": {"global4": 256},
+                    "text_npu_prefill_chunk_size": {"global4": 256},
+                    "vision_target_cores": ["1:0"],
+                    "text_target_cores": ["0:0"],
+                    "vision_target_clusters": [0],
+                    "text_target_clusters": [0, 1],
+                    "vision_core_mode": "multi",
+                    "text_core_mode": "single",
+                    "vision_mxq_path": "/tmp/vision.mxq",
                 },
             )
         ]

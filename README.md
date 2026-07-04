@@ -36,7 +36,7 @@ can be served through familiar vLLM commands and OpenAI-compatible APIs.
 
 - Python 3.10+
 - `vllm==0.11.2`
-- `mblt-model-zoo[transformers] >= 1.5.1`
+- `mblt-model-zoo[transformers] >= 2.1.0`
 - A Mobilint NPU environment. If you are not yet a Mobilint customer, please contact
   [tech-support@mobilint.com](mailto:tech-support@mobilint.com).
 
@@ -117,8 +117,8 @@ Current Mobilint Qwen2/3-VL notes:
 By default, `vllm-mblt` follows the runtime layout encoded in the Mobilint model artifact/config. Use
 `--model-loader-extra-config` only when you intentionally want to override runtime placement or testing knobs.
 
-Runtime settings such as `dev_no`, `target_cores`, `target_clusters`, `core_mode`, and `max_batch_size` are
-forwarded to `from_pretrained(...)` through `--model-loader-extra-config`.
+Runtime settings such as `dev_no`, `target_cores`, `target_clusters`, `core_mode`, and `max_batch_size` can be
+provided through `--model-loader-extra-config`.
 For detailed `core_mode` and multicore runtime layout guidance, see the
 [Mobilint multicore documentation](https://docs.mobilint.com/v1.2/en/multicore.html).
 
@@ -127,6 +127,19 @@ vllm serve mobilint/Llama-3.2-1B-Instruct \
   --trust-remote-code \
   --model-loader-extra-config '{"dev_no": 0, "target_cores": ["1:0"]}'
 ```
+
+For VLMs such as `mobilint/Qwen3-VL-2B-Instruct`, shared runtime layout keys are applied to both Mobilint
+submodules by forwarding them as model-zoo VLM subconfig keys (`vision_*` and `text_*`). Use explicit prefixed
+keys when the vision encoder and text model need different placement:
+
+```bash
+vllm serve mobilint/Qwen3-VL-2B-Instruct \
+  --trust-remote-code \
+  --model-loader-extra-config '{"dev_no": 0, "core_mode": "global4", "vision_core_mode": "single"}'
+```
+
+For VLM-specific MXQ path overrides, use `vision_mxq_path` and/or `text_mxq_path`; a single top-level `mxq_path`
+is only meaningful for single-module text models.
 
 ### Chunked Prefill Auto-Tuning
 

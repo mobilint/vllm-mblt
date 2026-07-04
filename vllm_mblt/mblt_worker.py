@@ -39,6 +39,24 @@ _MULTIMODAL_HF_MODEL_TYPES = frozenset(
     }
 )
 
+_MBLT_BACKEND_KWARG_FIELDS = frozenset(
+    {
+        "mxq_path",
+        "dev_no",
+        "max_batch_size",
+        "core_mode",
+        "target_cores",
+        "target_clusters",
+        "npu_prefill_chunk_size",
+    }
+)
+_MBLT_BACKEND_KWARG_PREFIXES = ("", "text_", "vision_", "encoder_", "decoder_", "base_", "draft_", "fc_")
+_MBLT_BACKEND_KWARG_NAMES = frozenset(
+    f"{prefix}{field}" for prefix in _MBLT_BACKEND_KWARG_PREFIXES for field in _MBLT_BACKEND_KWARG_FIELDS
+)
+_MULTIMODAL_SHARED_BACKEND_KWARG_FIELDS = _MBLT_BACKEND_KWARG_FIELDS - {"mxq_path"}
+_MULTIMODAL_BACKEND_PREFIXES = ("vision_", "text_")
+
 
 def _is_multimodal_hf_config(hf_config: object) -> bool:
     model_type = getattr(hf_config, "model_type", None)
@@ -48,6 +66,28 @@ def _is_multimodal_hf_config(hf_config: object) -> bool:
 def _is_qwen3_vl_hf_config(hf_config: object) -> bool:
     model_type = getattr(hf_config, "model_type", None)
     return model_type == "mobilint-qwen3_vl"
+
+
+def _normalize_model_kwargs_for_hf_config(
+    model_kwargs: dict[str, object],
+    hf_config: object,
+) -> dict[str, object]:
+    if not _is_multimodal_hf_config(hf_config):
+        return model_kwargs
+
+    normalized: dict[str, object] = {}
+    shared: dict[str, object] = {}
+    for key, value in model_kwargs.items():
+        if any(key.startswith(prefix) for prefix in _MULTIMODAL_BACKEND_PREFIXES):
+            normalized[key] = value
+        elif key in _MULTIMODAL_SHARED_BACKEND_KWARG_FIELDS:
+            shared[key] = value
+
+    for field, value in shared.items():
+        for prefix in _MULTIMODAL_BACKEND_PREFIXES:
+            normalized.setdefault(f"{prefix}{field}", value)
+
+    return normalized
 
 
 @dataclass
@@ -1274,12 +1314,7 @@ class MbltWorker(WorkerBase):
                 except Exception:
                     return
             if isinstance(value, dict):
-                for key in (
-                    "dev_no",
-                    "target_cores",
-                    "target_clusters",
-                    "core_mode",
-                ):
+                for key in _MBLT_BACKEND_KWARG_NAMES:
                     if key in value:
                         model_kwargs[key] = value[key]
 
@@ -1291,13 +1326,15 @@ class MbltWorker(WorkerBase):
             _merge_kwargs(getattr(self.model_config, source, None))
             _merge_kwargs(getattr(self.vllm_config.model_config, source, None))
 
+        hf_config = getattr(self.model_config, "hf_config", None)
+        model_kwargs = _normalize_model_kwargs_for_hf_config(model_kwargs, hf_config)
+
         start = time.perf_counter()
         self._log_init_stage(
             "load_model:before_from_pretrained",
             model=self.model_config.model,
             model_kwargs=model_kwargs,
         )
-        hf_config = getattr(self.model_config, "hf_config", None)
         auto_model_cls = AutoModelForImageTextToText if _is_multimodal_hf_config(hf_config) else AutoModelForCausalLM
         self.model = auto_model_cls.from_pretrained(
             self.model_config.model,
