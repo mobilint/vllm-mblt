@@ -156,9 +156,18 @@ def resolve_effective_npu_prefill_chunk_size(vllm_config: "VllmConfig") -> int:
     return resolved_chunk_size
 
 
-def resolve_model_max_batch_size(vllm_config: "VllmConfig") -> int | None:
+def resolve_model_max_batch_size(
+    vllm_config: "VllmConfig",
+    *,
+    prefer_text_runtime: bool = True,
+) -> int | None:
     extra_config = _get_model_loader_extra_config(vllm_config)
     if extra_config is not None:
+        if prefer_text_runtime:
+            text_override = _coerce_positive_int(extra_config.get("text_max_batch_size"))
+            if text_override is not None:
+                return text_override
+
         override = _coerce_positive_int(extra_config.get("max_batch_size"))
         if override is not None:
             return override
@@ -172,6 +181,7 @@ def resolve_model_max_batch_size(vllm_config: "VllmConfig") -> int | None:
         vllm_config,
         raw_max_batch_size,
         field_name="max_batch_size",
+        prefer_text_core_mode=prefer_text_runtime,
     )
 
 

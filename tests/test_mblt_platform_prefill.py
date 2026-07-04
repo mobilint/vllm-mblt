@@ -82,6 +82,55 @@ class TestMbltPlatformPrefill:
         )
         assert resolve_model_max_batch_size(config) == 16
 
+    def test_prefers_loader_text_max_batch_size_override(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={"core_mode": "global4", "max_batch_size": 16, "text_max_batch_size": 4},
+            max_batch_size=32,
+        )
+
+        assert resolve_model_max_batch_size(config) == 4
+
+    def test_uses_loader_text_core_mode_for_max_batch_size_mapping(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+            max_batch_size={"single": 4, "global4": 16},
+        )
+
+        assert resolve_model_max_batch_size(config) == 4
+
+    def test_falls_back_to_shared_core_mode_for_max_batch_size_mapping(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={"core_mode": "global4"},
+            max_batch_size={"single": 4, "global4": 16},
+        )
+
+        assert resolve_model_max_batch_size(config) == 16
+
+    def test_platform_uses_loader_text_max_batch_size_for_scheduler_limit(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={"core_mode": "global4", "max_batch_size": 16, "text_max_batch_size": 4},
+            max_batch_size=32,
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.scheduler_config.max_num_seqs == 4
+
+    def test_platform_uses_loader_text_core_mode_for_scheduler_batch_limit(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+            max_batch_size={"single": 4, "global4": 16},
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.scheduler_config.max_num_seqs == 4
+
     def test_falls_back_to_hf_core_mode(self) -> None:
         config = _make_vllm_config({"single": 64, "global8": 512}, hf_core_mode="global8")
         assert resolve_npu_prefill_chunk_size(config) == 512
