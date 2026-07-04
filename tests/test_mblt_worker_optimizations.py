@@ -481,6 +481,27 @@ class TestMbltWorkerOptimizations:
         assert worker.max_batch_size == 4
         assert worker.free_cache_slots == [0, 1, 2, 3]
 
+    def test_init_uses_shared_text_only_max_batch_size_for_cache_slots(self, monkeypatch) -> None:
+        def worker_base_init(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False):
+            self.vllm_config = vllm_config
+            self.local_rank = local_rank
+            self.rank = rank
+
+        monkeypatch.setattr("vllm_mblt.mblt_worker.WorkerBase.__init__", worker_base_init)
+        config = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=128),
+            load_config=SimpleNamespace(
+                model_loader_extra_config={"core_mode": "global4", "max_batch_size": 16, "text_max_batch_size": 4}
+            ),
+            model_config=SimpleNamespace(max_model_len=1024, hf_config=SimpleNamespace(model_type="qwen2")),
+            scheduler_config=SimpleNamespace(enable_chunked_prefill=True, max_num_batched_tokens=128),
+        )
+
+        worker = MbltWorker(config, local_rank=0, rank=0, distributed_init_method="env://")
+
+        assert worker.max_batch_size == 16
+        assert worker.free_cache_slots == list(range(16))
+
     def test_load_model_passes_text_runtime_layout_kwargs_to_from_pretrained(self, monkeypatch) -> None:
         worker = MbltWorker.__new__(MbltWorker)
         worker.rank = 0

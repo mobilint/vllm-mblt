@@ -16,6 +16,7 @@ def _make_vllm_config(
     loader_core_mode=None,
     loader_extra_config=None,
     hf_core_mode=None,
+    hf_model_type="qwen2",
     max_batch_size=None,
     scheduler_max_num_batched_tokens=2048,
     scheduler_max_num_seqs=None,
@@ -32,7 +33,10 @@ def _make_vllm_config(
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
-                npu_prefill_chunk_size=npu_prefill_chunk_size, max_batch_size=max_batch_size, core_mode=hf_core_mode
+                model_type=hf_model_type,
+                npu_prefill_chunk_size=npu_prefill_chunk_size,
+                max_batch_size=max_batch_size,
+                core_mode=hf_core_mode,
             )
         ),
         load_config=SimpleNamespace(model_loader_extra_config=loader_extra_config),
@@ -60,6 +64,7 @@ class TestMbltPlatformPrefill:
         config = _make_vllm_config(
             {"single": 64, "global4": 256},
             loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+            hf_model_type="mobilint-qwen3_vl",
         )
 
         assert resolve_npu_prefill_chunk_size(config) == 64
@@ -68,11 +73,24 @@ class TestMbltPlatformPrefill:
         config = _make_vllm_config(
             {"single": 64, "global4": 256},
             loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+            hf_model_type="mobilint-qwen3_vl",
         )
 
         MbltPlatform.check_and_update_config(config)
 
         assert config.scheduler_config.max_num_batched_tokens == 64
+
+    def test_text_only_uses_shared_core_mode_for_scheduler_prefill_limit(self) -> None:
+        config = _make_vllm_config(
+            {"single": 64, "global4": 96},
+            loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+            hf_model_type="qwen2",
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert resolve_npu_prefill_chunk_size(config) == 96
+        assert config.scheduler_config.max_num_batched_tokens == 96
 
     def test_resolves_json_string_loader_max_batch_size_override(self) -> None:
         config = _make_vllm_config(
@@ -86,6 +104,7 @@ class TestMbltPlatformPrefill:
         config = _make_vllm_config(
             {"global4": 256},
             loader_extra_config={"core_mode": "global4", "max_batch_size": 16, "text_max_batch_size": 4},
+            hf_model_type="mobilint-qwen3_vl",
             max_batch_size=32,
         )
 
@@ -95,6 +114,7 @@ class TestMbltPlatformPrefill:
         config = _make_vllm_config(
             {"global4": 256},
             loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+            hf_model_type="mobilint-qwen3_vl",
             max_batch_size={"single": 4, "global4": 16},
         )
 
@@ -113,6 +133,7 @@ class TestMbltPlatformPrefill:
         config = _make_vllm_config(
             {"global4": 256},
             loader_extra_config={"core_mode": "global4", "max_batch_size": 16, "text_max_batch_size": 4},
+            hf_model_type="mobilint-qwen3_vl",
             max_batch_size=32,
         )
 
@@ -124,12 +145,39 @@ class TestMbltPlatformPrefill:
         config = _make_vllm_config(
             {"global4": 256},
             loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+            hf_model_type="mobilint-qwen3_vl",
             max_batch_size={"single": 4, "global4": 16},
         )
 
         MbltPlatform.check_and_update_config(config)
 
         assert config.scheduler_config.max_num_seqs == 4
+
+    def test_text_only_uses_shared_runtime_keys_for_scheduler_batch_limit(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 96},
+            loader_extra_config={"core_mode": "global4", "max_batch_size": 16, "text_max_batch_size": 4},
+            hf_model_type="qwen2",
+            max_batch_size=32,
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert resolve_model_max_batch_size(config) == 16
+        assert config.scheduler_config.max_num_seqs == 16
+
+    def test_text_only_uses_shared_core_mode_for_scheduler_batch_mapping(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 96},
+            loader_extra_config={"core_mode": "global4", "text_core_mode": "single"},
+            hf_model_type="qwen2",
+            max_batch_size={"single": 4, "global4": 16},
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert resolve_model_max_batch_size(config) == 16
+        assert config.scheduler_config.max_num_seqs == 16
 
     def test_falls_back_to_hf_core_mode(self) -> None:
         config = _make_vllm_config({"single": 64, "global8": 512}, hf_core_mode="global8")
