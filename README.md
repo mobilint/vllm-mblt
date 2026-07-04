@@ -36,7 +36,7 @@ can be served through familiar vLLM commands and OpenAI-compatible APIs.
 
 - Python 3.10+
 - `vllm==0.11.2`
-- `mblt-model-zoo[transformers] >= 1.5.1`
+- `mblt-model-zoo[transformers] >= 2.1.0`
 - A Mobilint NPU environment. If you are not yet a Mobilint customer, please contact
   [tech-support@mobilint.com](mailto:tech-support@mobilint.com).
 
