@@ -12,7 +12,7 @@ from vllm_mblt.mblt_worker import (
     _is_multimodal_hf_config,
     _is_qwen3_vl_hf_config,
 )
-from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheSnapshot
+from vllm_mblt.runtime_cache import MbltRuntimeCacheManager
 
 
 class TestMbltWorkerOptimizations:
@@ -174,14 +174,22 @@ class TestMbltWorkerOptimizations:
 
     def test_snapshot_index_can_prefer_shallower_prefix_with_more_tokens(self) -> None:
         worker = self._make_worker()
-        short_shared = RuntimeCacheSnapshot(
-            blobs=[], block_ids=([1, 2, 8],), first_seq_blocks=(1, 2, 8), num_tokens=384
+        worker.runtime_cache.store_snapshot(
+            req_id="short_shared",
+            blobs=[],
+            block_ids=([1, 2, 8],),
+            first_seq_blocks=(1, 2, 8),
+            num_tokens=384,
         )
-        deep_but_short = RuntimeCacheSnapshot(
-            blobs=[], block_ids=([1, 2, 3, 7],), first_seq_blocks=(1, 2, 3, 7), num_tokens=100
+        short_shared = worker.runtime_cache.get_snapshot("short_shared")
+        assert short_shared is not None
+        worker.runtime_cache.store_snapshot(
+            req_id="deep_but_short",
+            blobs=[],
+            block_ids=([1, 2, 3, 7],),
+            first_seq_blocks=(1, 2, 3, 7),
+            num_tokens=100,
         )
-        worker.runtime_cache.snapshots = {"short_shared": short_shared, "deep_but_short": deep_but_short}
-        worker._rebuild_snapshot_index()
         req_state = SimpleNamespace(num_computed_tokens=300, first_seq_blocks=(1, 2, 3, 9))
         snapshot, matched_tokens = worker._choose_snapshot(req_state)
         assert snapshot is short_shared

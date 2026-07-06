@@ -7,7 +7,16 @@ from vllm_mblt.runtime_cache import (
     first_seq_blocks,
     normalize_block_ids,
     prefix_compatible_tokens,
+    required_blocks,
 )
+
+
+def _make_manager(*, block_size: int = 4, max_batch_size: int = 2, max_finished_snapshots: int = 16):
+    return MbltRuntimeCacheManager(
+        max_batch_size=max_batch_size,
+        block_size=block_size,
+        max_finished_snapshots=max_finished_snapshots,
+    )
 
 
 def _request(req_id: str, blocks: tuple[int, ...], tokens: int) -> RuntimeCacheRequest:
@@ -22,30 +31,37 @@ def _request(req_id: str, blocks: tuple[int, ...], tokens: int) -> RuntimeCacheR
 def _store_snapshot(
     manager: MbltRuntimeCacheManager,
     req_id: str,
-    blocks: tuple[int, ...],
+    blocks: tuple[int, ...] | list[int],
     tokens: int,
+    *,
     blobs: list[object] | None = None,
 ) -> None:
+    block_tuple = tuple(blocks)
+    block_ids = (list(block_tuple),)
     manager.store_snapshot(
         req_id=req_id,
         blobs=blobs if blobs is not None else [f"blob:{req_id}"],
-        block_ids=(list(blocks),),
-        first_seq_blocks=blocks,
+        block_ids=block_ids,
+        first_seq_blocks=first_seq_blocks(block_ids),
         num_tokens=tokens,
     )
 
 
 class TestRuntimeCacheBlockHelpers:
-    def test_normalize_block_ids_copies_sequences_and_append_preserves_layout(self) -> None:
-        source = ([1, 2], [3])
+    def test_normalize_and_append_block_ids_copy_inputs(self) -> None:
+        current = ([1, 2], [10])
+        new = ([3], [11, 12])
 
-        normalized = normalize_block_ids(source)
-        appended = append_block_ids(normalized, ([4], [5, 6]))
+        normalized = normalize_block_ids(current)
+        appended = append_block_ids(normalized, new)
 
-        source[0].append(99)
-        assert normalized == ([1, 2], [3])
-        assert appended == ([1, 2, 4], [3, 5, 6])
-        assert appended is not normalized
+        current[0].append(99)
+        new[0].append(99)
+        assert normalized == ([1, 2], [10])
+        assert normalized is not current
+        assert normalized[0] is not current[0]
+        assert appended == ([1, 2, 3], [10, 11, 12])
+        assert first_seq_blocks(appended) == (1, 2, 3)
 
     def test_append_initializes_empty_block_ids_from_new_layout(self) -> None:
         new_blocks = ([10], [20, 21])
@@ -53,16 +69,20 @@ class TestRuntimeCacheBlockHelpers:
         appended = append_block_ids((), new_blocks)
 
         new_blocks[0].append(99)
-
         assert appended == ([10], [20, 21])
 
-    def test_append_raises_for_block_layout_mismatch(self) -> None:
-        with pytest.raises(RuntimeError, match="layout mismatch"):
-            append_block_ids(([1], [2]), ([3],))
+    def test_append_block_ids_rejects_sequence_layout_mismatch(self) -> None:
+        with pytest.raises(RuntimeError, match="KV block_ids layout mismatch"):
+            append_block_ids(([1],), ([2], [3]))
 
-    def test_first_seq_blocks_extracts_first_sequence_or_empty_tuple(self) -> None:
-        assert first_seq_blocks(([1, 2], [3, 4])) == (1, 2)
-        assert first_seq_blocks(()) == ()
+    def test_required_blocks_and_prefix_compatible_tokens(self) -> None:
+        assert required_blocks(0, 4) == 0
+        assert required_blocks(1, 4) == 1
+        assert required_blocks(5, 4) == 2
+
+        assert prefix_compatible_tokens((1, 2, 3), 10, (1, 2, 9), 12, 4) == 8
+        assert prefix_compatible_tokens((1, 2), 6, (1, 2, 3), 12, 4) == 6
+        assert prefix_compatible_tokens((1, 2), 6, (9, 2), 8, 4) == 0
 
     @pytest.mark.parametrize(
         ("target_blocks", "target_tokens", "snapshot_blocks", "snapshot_tokens", "expected"),
@@ -87,7 +107,7 @@ class TestRuntimeCacheBlockHelpers:
 
 class TestMbltRuntimeCacheManagerSnapshots:
     def test_snapshot_index_lookup_uses_deepest_compatible_prefix(self) -> None:
-        manager = MbltRuntimeCacheManager(block_size=4)
+        manager = _make_manager(block_size=4)
         _store_snapshot(manager, "short", (1,), 4)
         _store_snapshot(manager, "long", (1, 2, 3), 12)
 
@@ -96,9 +116,10 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert match.req_id == "long"
         assert match.snapshot is manager.get_snapshot("long")
         assert match.matched_tokens == 8
+        assert not match.is_own_snapshot
 
     def test_own_snapshot_has_priority_when_fully_compatible(self) -> None:
-        manager = MbltRuntimeCacheManager(block_size=4)
+        manager = _make_manager(block_size=4)
         _store_snapshot(manager, "other", (1, 2, 3), 12)
         _store_snapshot(manager, "req", (1, 2), 8)
 
@@ -108,7 +129,7 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert matched_tokens == 8
 
     def test_shared_prefix_snapshot_reuse_when_own_snapshot_is_partial(self) -> None:
-        manager = MbltRuntimeCacheManager(block_size=4)
+        manager = _make_manager(block_size=4)
         _store_snapshot(manager, "req", (1,), 4)
         _store_snapshot(manager, "other", (1, 2, 3), 12)
 
@@ -118,7 +139,7 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert matched_tokens == 10
 
     def test_cache_miss_fallback_returns_no_snapshot_or_tokens(self) -> None:
-        manager = MbltRuntimeCacheManager(block_size=4)
+        manager = _make_manager(block_size=4)
         _store_snapshot(manager, "other", (1, 2), 8)
 
         snapshot, matched_tokens = manager.choose_snapshot(_request("req", (9, 2), 8))
@@ -127,7 +148,7 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert matched_tokens == 0
 
     def test_snapshot_update_and_removal_refresh_prefix_index(self) -> None:
-        manager = MbltRuntimeCacheManager(block_size=4)
+        manager = _make_manager(block_size=4)
         _store_snapshot(manager, "req", (1, 2), 8)
 
         assert manager.choose_prefix_snapshot(_request("new", (1, 2), 8)).req_id == "req"
@@ -138,11 +159,11 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert manager.remove_snapshot("req") is not None
         assert manager.choose_prefix_snapshot(_request("new", (5, 6), 8)).snapshot is None
 
-    def test_live_cache_reuse_for_same_request_is_tracked_without_snapshot_load(self) -> None:
-        manager = MbltRuntimeCacheManager(block_size=4)
+    def test_live_cache_reuse_policy_and_cache_miss_state(self) -> None:
+        manager = _make_manager(block_size=4)
 
+        assert manager.loaded_req_id is None
         manager.mark_loaded_request("req")
-
         assert manager.loaded_req_id == "req"
         manager.clear_loaded_request("other")
         assert manager.loaded_req_id == "req"
@@ -150,7 +171,7 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert manager.loaded_req_id is None
 
     def test_finished_snapshot_lru_eviction_removes_snapshot_index_and_live_owner(self) -> None:
-        manager = MbltRuntimeCacheManager(block_size=4, max_finished_snapshots=2)
+        manager = _make_manager(block_size=4, max_finished_snapshots=2)
         _store_snapshot(manager, "a", (1,), 4)
         _store_snapshot(manager, "b", (2,), 4)
         _store_snapshot(manager, "c", (3,), 4)
@@ -165,11 +186,28 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert manager.loaded_req_id is None
         assert list(manager.finished_snapshot_lru) == ["b", "c"]
         assert manager.choose_prefix_snapshot(_request("new", (1,), 4)).snapshot is None
+        assert manager.choose_prefix_snapshot(_request("new", (2,), 4)).req_id == "b"
+
+    def test_finished_snapshot_lru_touch_preserves_recent_snapshot(self) -> None:
+        manager = _make_manager(block_size=4, max_finished_snapshots=2)
+        _store_snapshot(manager, "a", (1,), 4)
+        _store_snapshot(manager, "b", (2,), 4)
+        _store_snapshot(manager, "c", (3,), 4)
+
+        manager.mark_snapshot_finished("a")
+        manager.mark_snapshot_finished("b")
+        manager.mark_snapshot_finished("a")
+        evicted = manager.mark_snapshot_finished("c")
+
+        assert evicted == ["b"]
+        assert list(manager.finished_snapshot_lru) == ["a", "c"]
+        assert manager.get_snapshot("a") is not None
+        assert manager.get_snapshot("b") is None
 
 
 class TestMbltRuntimeCacheManagerSlots:
     def test_batch_slot_allocation_release_and_reuse(self) -> None:
-        manager = MbltRuntimeCacheManager(max_batch_size=2, block_size=4)
+        manager = _make_manager(max_batch_size=2)
 
         assert manager.assign_slot("a") == 0
         assert manager.assign_slot("b") == 1
@@ -181,9 +219,10 @@ class TestMbltRuntimeCacheManagerSlots:
 
         assert manager.live_slot_owner(0) is None
         assert manager.assign_slot("c") == 0
+        assert manager.get_slot("c") == 0
 
     def test_slot_scoped_dump_and_load_pass_cache_id_to_injected_callables(self) -> None:
-        manager = MbltRuntimeCacheManager(max_batch_size=2, block_size=4)
+        manager = _make_manager(max_batch_size=2)
         dump_calls: list[dict[str, int]] = []
         load_calls: list[tuple[list[object], dict[str, int]]] = []
 
