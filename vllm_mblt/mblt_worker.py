@@ -2,7 +2,7 @@ import math
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
@@ -28,6 +28,16 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
+from vllm_mblt.runtime_cache import (
+    KVBlockIds,
+    RuntimeCacheSnapshot,
+    RuntimeCacheSnapshotIndexNode,
+    append_block_ids,
+    first_seq_blocks,
+    normalize_block_ids,
+    prefix_compatible_tokens,
+    required_blocks,
+)
 
 logger = init_logger(__name__)
 
@@ -96,7 +106,7 @@ class RequestState:
     output_token_ids: list[int]
     sampling_params: SamplingParams
     cached_sampling_state: "CachedSamplingState"
-    block_ids: tuple[list[int], ...]
+    block_ids: KVBlockIds
     first_seq_blocks: tuple[int, ...]
     num_computed_tokens: int
     num_output_tokens: int
@@ -109,12 +119,7 @@ class RequestState:
     vlm_session_id: Optional[str]
 
 
-@dataclass
-class CacheSnapshot:
-    blobs: list[Any]
-    block_ids: tuple[list[int], ...]
-    first_seq_blocks: tuple[int, ...]
-    num_tokens: int
+CacheSnapshot = RuntimeCacheSnapshot
 
 
 @dataclass
@@ -132,11 +137,7 @@ class CachedSamplingState:
     has_penalties: bool
 
 
-@dataclass
-class SnapshotIndexNode:
-    children: dict[int, "SnapshotIndexNode"] = field(default_factory=dict)
-    best_req_id: Optional[str] = None
-    best_num_tokens: int = 0
+SnapshotIndexNode = RuntimeCacheSnapshotIndexNode
 
 
 class MbltWorker(WorkerBase):
@@ -215,29 +216,18 @@ class MbltWorker(WorkerBase):
     def _num_blocks_per_request(self) -> int:
         return max(1, math.ceil(self.max_seq_len / self._kv_block_size()))
 
-    def _normalize_block_ids(self, block_ids: tuple[list[int], ...]) -> tuple[list[int], ...]:
-        return tuple(list(seq) for seq in block_ids)
+    def _normalize_block_ids(self, block_ids: KVBlockIds) -> KVBlockIds:
+        return normalize_block_ids(block_ids)
 
     def _append_block_ids(
         self,
-        current_block_ids: tuple[list[int], ...],
-        new_block_ids: tuple[list[int], ...],
-    ) -> tuple[list[int], ...]:
-        if not current_block_ids:
-            return self._normalize_block_ids(new_block_ids)
-        if len(current_block_ids) != len(new_block_ids):
-            raise RuntimeError(
-                f"KV block_ids layout mismatch: current={len(current_block_ids)} seqs, new={len(new_block_ids)} seqs"
-            )
-        merged_block_ids: list[list[int]] = []
-        for current_seq_blocks, new_seq_blocks in zip(current_block_ids, new_block_ids):
-            merged_block_ids.append(list(current_seq_blocks) + list(new_seq_blocks))
-        return tuple(merged_block_ids)
+        current_block_ids: KVBlockIds,
+        new_block_ids: KVBlockIds,
+    ) -> KVBlockIds:
+        return append_block_ids(current_block_ids, new_block_ids)
 
-    def _first_seq_blocks(self, block_ids: tuple[list[int], ...]) -> tuple[int, ...]:
-        if len(block_ids) == 0:
-            return ()
-        return tuple(block_ids[0])
+    def _first_seq_blocks(self, block_ids: KVBlockIds) -> tuple[int, ...]:
+        return first_seq_blocks(block_ids)
 
     def _get_cache_model(self) -> Any:
         if self.cache_model is None:
@@ -747,9 +737,7 @@ class MbltWorker(WorkerBase):
             print(f"[cache] req={loaded_req_id} dump-before-switch next={next_req_id}")
 
     def _required_blocks(self, num_tokens: int) -> int:
-        if num_tokens <= 0:
-            return 0
-        return math.ceil(num_tokens / self._kv_block_size())
+        return required_blocks(num_tokens, self._kv_block_size())
 
     def _prefix_compatible_tokens(
         self,
@@ -758,23 +746,13 @@ class MbltWorker(WorkerBase):
         snapshot_blocks: tuple[int, ...],
         snapshot_tokens: int,
     ) -> int:
-        if target_tokens <= 0 or snapshot_tokens <= 0:
-            return 0
-
-        needed_target_blocks = self._required_blocks(target_tokens)
-        common_blocks = 0
-        for i in range(min(needed_target_blocks, len(target_blocks), len(snapshot_blocks))):
-            if target_blocks[i] != snapshot_blocks[i]:
-                break
-            common_blocks += 1
-
-        if common_blocks == 0:
-            return 0
-
-        if common_blocks >= needed_target_blocks:
-            return min(target_tokens, snapshot_tokens)
-
-        return min(snapshot_tokens, common_blocks * self._kv_block_size(), target_tokens)
+        return prefix_compatible_tokens(
+            target_blocks,
+            target_tokens,
+            snapshot_blocks,
+            snapshot_tokens,
+            self._kv_block_size(),
+        )
 
     def _choose_snapshot(self, req_state: RequestState) -> tuple[Optional[CacheSnapshot], int]:
         target_tokens = req_state.num_computed_tokens
