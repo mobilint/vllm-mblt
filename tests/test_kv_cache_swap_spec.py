@@ -3,7 +3,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER_PATH = ROOT / "vllm_mblt" / "mblt_worker.py"
+RUNTIME_CACHE_PATH = ROOT / "vllm_mblt" / "runtime_cache.py"
 WORKER_CODE = WORKER_PATH.read_text(encoding="utf-8")
+RUNTIME_CACHE_CODE = RUNTIME_CACHE_PATH.read_text(encoding="utf-8")
 
 
 class TestKvCacheSwapSpec:
@@ -56,6 +58,9 @@ class TestKvCacheSwapSpec:
         assert "self._evict_old_finished_snapshots(" in WORKER_CODE, (
             "Expected eviction hook for finished-session snapshot LRU cap."
         )
+        assert "def evict_old_finished_snapshots(" in RUNTIME_CACHE_CODE, (
+            "Expected finished-session snapshot LRU implementation in runtime_cache.py."
+        )
 
     def test_dump_is_event_driven_not_unconditional(self) -> None:
         assert "def _should_dump_snapshot_after_step(" in WORKER_CODE, (
@@ -75,7 +80,7 @@ class TestKvCacheSwapSpec:
         )
 
     def test_live_request_avoids_immediate_block_boundary_dump(self) -> None:
-        assert "self.loaded_cache_req_id = req_id" in WORKER_CODE, (
+        assert "self.runtime_cache.mark_loaded_request(req_id)" in WORKER_CODE, (
             "Expected execute loop to track the live accelerator cache owner."
         )
         assert "req_state.num_computed_tokens = next_cache_size" in WORKER_CODE, (
@@ -83,7 +88,7 @@ class TestKvCacheSwapSpec:
         )
         immediate_dump_pattern = re.compile(
             r"req_state\.num_computed_tokens = next_cache_size.*?"
-            r"self\.loaded_cache_req_id = req_id.*?"
+            r"self\.runtime_cache\.mark_loaded_request\(req_id\).*?"
             r"self\._dump_snapshot\(",
             re.DOTALL,
         )
@@ -92,7 +97,7 @@ class TestKvCacheSwapSpec:
         )
 
     def test_live_cache_is_reused_for_same_request(self) -> None:
-        assert "if self.loaded_cache_req_id == req_id:" in WORKER_CODE, (
+        assert "if self.runtime_cache.loaded_req_id == req_id:" in WORKER_CODE, (
             "Expected same-request decode path to reuse live accelerator cache."
         )
         assert "return target_tokens" in WORKER_CODE, (
@@ -109,5 +114,5 @@ class TestKvCacheSwapSpec:
         )
         assert pattern.search(WORKER_CODE), (
             "Expected live cache owner to be dumped before zero-token requests clear "
-            "loaded_cache_req_id."
+            "runtime_cache.loaded_req_id."
         )
