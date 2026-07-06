@@ -40,6 +40,8 @@ def _make_worker(*, max_batch_size: int = 1, block_size: int = 4) -> MbltWorker:
         max_batch_size=max_batch_size,
         block_size=block_size,
         max_finished_snapshots=MbltWorker.MAX_FINISHED_CACHE_SNAPSHOTS,
+        dump_runtime_cache=worker._dump_runtime_cache,
+        load_runtime_cache=worker._load_runtime_cache,
     )
     return worker
 
@@ -169,9 +171,9 @@ class TestKvCacheSwapBehavior:
                 first_seq_blocks=(block_id,),
                 num_tokens=4,
             )
-            worker._touch_finished_snapshot(req_id)
+            worker.runtime_cache.touch_finished_snapshot(req_id)
 
-        worker._evict_old_finished_snapshots()
+        worker.runtime_cache.evict_old_finished_snapshots()
 
         assert worker.runtime_cache.get_snapshot("a") is None
         assert worker.runtime_cache.get_snapshot("b") is not None

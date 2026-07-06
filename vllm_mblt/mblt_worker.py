@@ -159,6 +159,8 @@ class MbltWorker(WorkerBase):
             max_batch_size=self.max_batch_size,
             block_size=self._kv_block_size(),
             max_finished_snapshots=self.MAX_FINISHED_CACHE_SNAPSHOTS,
+            dump_runtime_cache=self._dump_runtime_cache,
+            load_runtime_cache=self._load_runtime_cache,
         )
         self.sampler = Sampler(logprobs_mode="raw_logits")
         self.empty_logits_processors = LogitsProcessors(None)
@@ -188,6 +190,10 @@ class MbltWorker(WorkerBase):
         logger.info("[mblt-init] %s %s%s", stage, details, suffix)
 
     def _reset_cache_slots(self) -> None:
+        self.runtime_cache.set_io_adapters(
+            dump_runtime_cache=self._dump_runtime_cache,
+            load_runtime_cache=self._load_runtime_cache,
+        )
         self.runtime_cache.reset_slots(max_batch_size=self.max_batch_size)
 
     def _is_batch_model(self) -> bool:
@@ -624,24 +630,6 @@ class MbltWorker(WorkerBase):
 
         return merged_prompt_embeds, deepstack_prompt_embeds
 
-    def _touch_finished_snapshot(self, req_id: str) -> None:
-        self.runtime_cache.touch_finished_snapshot(req_id)
-
-    def _rebuild_snapshot_index(self) -> None:
-        self.runtime_cache.rebuild_snapshot_index()
-
-    def _evict_old_finished_snapshots(self, print_debug: bool = False) -> None:
-        for evicted_req_id in self.runtime_cache.evict_old_finished_snapshots():
-            if print_debug:
-                print(f"[cache] evict-finished req={evicted_req_id} reason=lru-cap")
-
-    def _should_dump_snapshot_after_step(
-        self,
-        req_id: str,
-        next_num_tokens: int,
-    ) -> bool:
-        return self.runtime_cache.should_dump_snapshot_after_step(req_id, next_num_tokens)
-
     def _dump_loaded_request_before_switch(
         self,
         next_req_id: str,
@@ -653,7 +641,7 @@ class MbltWorker(WorkerBase):
         loaded_req_state = self.req_states.get(loaded_req_id)
         if loaded_req_state is None:
             return
-        if not self._should_dump_snapshot_after_step(
+        if not self.runtime_cache.should_dump_snapshot_after_step(
             loaded_req_id,
             loaded_req_state.num_computed_tokens,
         ):
@@ -666,34 +654,6 @@ class MbltWorker(WorkerBase):
         )
         if print_debug:
             print(f"[cache] req={loaded_req_id} dump-before-switch next={next_req_id}")
-
-    def _required_blocks(self, num_tokens: int) -> int:
-        return required_blocks(num_tokens, self._kv_block_size())
-
-    def _prefix_compatible_tokens(
-        self,
-        target_blocks: tuple[int, ...],
-        target_tokens: int,
-        snapshot_blocks: tuple[int, ...],
-        snapshot_tokens: int,
-    ) -> int:
-        return self.runtime_cache.compatible_tokens(
-            target_blocks=target_blocks,
-            target_tokens=target_tokens,
-            snapshot_blocks=snapshot_blocks,
-            snapshot_tokens=snapshot_tokens,
-        )
-
-    def _choose_snapshot(self, req_state: RequestState):
-        return self.runtime_cache.choose_snapshot(
-            RuntimeCacheRequest(
-                req_id="",
-                block_ids=getattr(req_state, "block_ids", ()),
-                first_seq_blocks=req_state.first_seq_blocks,
-                num_computed_tokens=req_state.num_computed_tokens,
-                cache_slot_id=getattr(req_state, "cache_slot_id", None),
-            )
-        )
 
     def _build_input_embeds(
         self,
@@ -1002,59 +962,33 @@ class MbltWorker(WorkerBase):
                 print_debug=print_debug,
             )
 
-        target_tokens = req_state.num_computed_tokens
         self._dump_loaded_request_before_switch(
             next_req_id=req_id,
             print_debug=print_debug,
         )
 
-        if target_tokens <= 0:
-            self.runtime_cache.clear_loaded_request()
-            if print_debug:
-                print(f"[cache] req={req_id} skip-load target_tokens=0")
-            return 0
-
-        # If the active accelerator cache already belongs to this request,
-        # it already contains the up-to-date KV state from previous steps.
-        if self.runtime_cache.loaded_req_id == req_id:
-            if print_debug:
-                print(f"[cache] req={req_id} reuse-live-cache matched={target_tokens}/{target_tokens}")
-            return target_tokens
-
-        own_snapshot = self.runtime_cache.get_snapshot(req_id)
-        if own_snapshot is not None:
-            matched_tokens = self._prefix_compatible_tokens(
-                target_blocks=req_state.first_seq_blocks,
-                target_tokens=target_tokens,
-                snapshot_blocks=own_snapshot.first_seq_blocks,
-                snapshot_tokens=own_snapshot.num_tokens,
+        target_tokens = req_state.num_computed_tokens
+        result = self.runtime_cache.load_for_request(
+            RuntimeCacheRequest(
+                req_id=req_id,
+                block_ids=req_state.block_ids,
+                first_seq_blocks=req_state.first_seq_blocks,
+                num_computed_tokens=target_tokens,
+                cache_slot_id=slot_id,
             )
-            if matched_tokens >= target_tokens:
-                if self.runtime_cache.loaded_req_id != req_id:
-                    cache_model = self._get_cache_model()
-                    # load_cache_memory(...) must happen before infer(..., cache_size=...)
-                    cache_model.load_cache_memory(own_snapshot.blobs)
-                    self.runtime_cache.mark_loaded_request(req_id)
-                    if print_debug:
-                        print(f"[cache] req={req_id} load-own matched={matched_tokens}/{target_tokens}")
-                elif print_debug:
-                    print(f"[cache] req={req_id} reuse-loaded-own matched={matched_tokens}/{target_tokens}")
-                return target_tokens
-
-        snapshot, matched_tokens = self._choose_snapshot(req_state)
-        if snapshot is None or matched_tokens <= 0:
-            self.runtime_cache.clear_loaded_request()
-            if print_debug:
-                print(f"[cache] req={req_id} cache-miss fallback matched=0/{target_tokens}")
-            return 0
-
-        cache_model = self._get_cache_model()
-        # load_cache_memory(...) must happen before infer(..., cache_size=...)
-        cache_model.load_cache_memory(snapshot.blobs)
-        self.runtime_cache.mark_loaded_request(req_id)
+        )
         if print_debug:
-            print(f"[cache] req={req_id} load-shared matched={matched_tokens}/{target_tokens}")
-        return matched_tokens
+            if result.action == "skip-empty":
+                print(f"[cache] req={req_id} skip-load target_tokens=0")
+            elif result.action == "reuse-live":
+                print(f"[cache] req={req_id} reuse-live-cache matched={target_tokens}/{target_tokens}")
+            elif result.action == "load-own":
+                print(f"[cache] req={req_id} load-own matched={result.matched_tokens}/{target_tokens}")
+            elif result.action == "load-shared":
+                print(f"[cache] req={req_id} load-shared matched={result.matched_tokens}/{target_tokens}")
+            else:
+                print(f"[cache] req={req_id} cache-miss fallback matched=0/{target_tokens}")
+        return result.matched_tokens
 
     def _load_snapshot_for_batch_slot(
         self,
@@ -1067,42 +1001,26 @@ class MbltWorker(WorkerBase):
             raise RuntimeError(f"Batch execution requires a cache slot for req_id={req_id}.")
 
         target_tokens = req_state.num_computed_tokens
-        if target_tokens <= 0:
-            return 0
-
-        live_owner = self.runtime_cache.live_slot_owner(slot_id)
-        if live_owner == req_id:
-            if print_debug:
-                print(f"[cache] req={req_id} slot={slot_id} reuse-live-cache matched={target_tokens}/{target_tokens}")
-            return target_tokens
-
-        own_snapshot = self.runtime_cache.get_snapshot(req_id)
-        if own_snapshot is not None:
-            matched_tokens = self._prefix_compatible_tokens(
-                target_blocks=req_state.first_seq_blocks,
-                target_tokens=target_tokens,
-                snapshot_blocks=own_snapshot.first_seq_blocks,
-                snapshot_tokens=own_snapshot.num_tokens,
-            )
-            if matched_tokens >= target_tokens:
-                if self._load_runtime_cache(own_snapshot.blobs, slot_id=slot_id):
-                    self.runtime_cache.mark_slot_owner(slot_id, req_id)
-                    if print_debug:
-                        print(f"[cache] req={req_id} slot={slot_id} load-own matched={matched_tokens}/{target_tokens}")
-                    return target_tokens
-
-        snapshot, matched_tokens = self._choose_snapshot(req_state)
-        if snapshot is not None and matched_tokens > 0:
-            if self._load_runtime_cache(snapshot.blobs, slot_id=slot_id):
-                self.runtime_cache.mark_slot_owner(slot_id, req_id)
-                if print_debug:
-                    print(f"[cache] req={req_id} slot={slot_id} load-shared matched={matched_tokens}/{target_tokens}")
-                return matched_tokens
-
-        self.runtime_cache.mark_slot_owner(slot_id, req_id)
+        result = self.runtime_cache.load_for_slot(
+            RuntimeCacheRequest(
+                req_id=req_id,
+                block_ids=req_state.block_ids,
+                first_seq_blocks=req_state.first_seq_blocks,
+                num_computed_tokens=target_tokens,
+                cache_slot_id=slot_id,
+            ),
+            slot_id=slot_id,
+        )
         if print_debug:
-            print(f"[cache] req={req_id} slot={slot_id} cache-miss fallback matched=0/{target_tokens}")
-        return 0
+            if result.action == "reuse-live":
+                print(f"[cache] req={req_id} slot={slot_id} reuse-live-cache matched={target_tokens}/{target_tokens}")
+            elif result.action == "load-own":
+                print(f"[cache] req={req_id} slot={slot_id} load-own matched={result.matched_tokens}/{target_tokens}")
+            elif result.action == "load-shared":
+                print(f"[cache] req={req_id} slot={slot_id} load-shared matched={result.matched_tokens}/{target_tokens}")
+            else:
+                print(f"[cache] req={req_id} slot={slot_id} cache-miss fallback matched=0/{target_tokens}")
+        return result.matched_tokens
 
     def _dump_snapshot(
         self,
@@ -1112,8 +1030,14 @@ class MbltWorker(WorkerBase):
         slot_id: Optional[int] = None,
         print_debug: bool = False,
     ) -> bool:
-        blobs = self._dump_runtime_cache(slot_id=slot_id)
-        if blobs is None:
+        snapshot = self.runtime_cache.dump_and_store_snapshot(
+            req_id=req_id,
+            block_ids=req_state.block_ids,
+            first_seq_blocks=req_state.first_seq_blocks,
+            num_tokens=next_num_tokens,
+            slot_id=slot_id,
+        )
+        if snapshot is None:
             if self._is_batch_model() and not self._warned_batch_cache_snapshot_unsupported:
                 logger.warning(
                     "Batch cache runtime does not expose slot-scoped dump/load APIs. "
@@ -1121,13 +1045,6 @@ class MbltWorker(WorkerBase):
                 )
                 self._warned_batch_cache_snapshot_unsupported = True
             return False
-        self.runtime_cache.store_snapshot(
-            req_id=req_id,
-            blobs=blobs,
-            block_ids=req_state.block_ids,
-            first_seq_blocks=req_state.first_seq_blocks,
-            num_tokens=next_num_tokens,
-        )
         if print_debug:
             num_blocks = len(req_state.first_seq_blocks)
             print(
@@ -1144,7 +1061,7 @@ class MbltWorker(WorkerBase):
         finished_req_state = self.req_states.pop(req_id, None)
         finished_slot_id = finished_req_state.cache_slot_id if finished_req_state is not None else None
         if finished_req_state is not None:
-            should_dump = self._should_dump_snapshot_after_step(
+            should_dump = self.runtime_cache.should_dump_snapshot_after_step(
                 req_id,
                 finished_req_state.num_computed_tokens,
             )
@@ -1173,9 +1090,9 @@ class MbltWorker(WorkerBase):
                 and print_debug
             ):
                 print(f"[cache] req={req_id} dump-on-finish")
-        if self.runtime_cache.has_snapshot(req_id):
-            self._touch_finished_snapshot(req_id)
-        self._evict_old_finished_snapshots(print_debug=print_debug)
+        for evicted_req_id in self.runtime_cache.mark_snapshot_finished(req_id):
+            if print_debug:
+                print(f"[cache] evict-finished req={evicted_req_id} reason=lru-cap")
         self.runtime_cache.clear_loaded_request(req_id)
         if self._is_batch_model():
             self._release_cache_slot(req_id)

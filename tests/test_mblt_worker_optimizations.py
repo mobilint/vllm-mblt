@@ -12,7 +12,7 @@ from vllm_mblt.mblt_worker import (
     _is_multimodal_hf_config,
     _is_qwen3_vl_hf_config,
 )
-from vllm_mblt.runtime_cache import MbltRuntimeCacheManager
+from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest, RuntimeCacheSnapshot
 
 
 class TestMbltWorkerOptimizations:
@@ -191,7 +191,15 @@ class TestMbltWorkerOptimizations:
             num_tokens=100,
         )
         req_state = SimpleNamespace(num_computed_tokens=300, first_seq_blocks=(1, 2, 3, 9))
-        snapshot, matched_tokens = worker._choose_snapshot(req_state)
+        match = worker.runtime_cache.choose_snapshot(
+            RuntimeCacheRequest(
+                req_id="",
+                block_ids=(),
+                first_seq_blocks=req_state.first_seq_blocks,
+                num_computed_tokens=req_state.num_computed_tokens,
+            )
+        )
+        snapshot, matched_tokens = match
         assert snapshot is short_shared
         assert matched_tokens == 256
 
