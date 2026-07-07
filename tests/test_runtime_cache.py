@@ -19,12 +19,19 @@ def _make_manager(*, block_size: int = 4, max_batch_size: int = 2, max_finished_
     )
 
 
-def _request(req_id: str, blocks: tuple[int, ...], tokens: int) -> RuntimeCacheRequest:
+def _request(
+    req_id: str,
+    blocks: tuple[int, ...],
+    tokens: int,
+    *,
+    cache_slot_id: int | None = None,
+) -> RuntimeCacheRequest:
     return RuntimeCacheRequest(
         req_id=req_id,
         block_ids=(list(blocks),),
         first_seq_blocks=blocks,
         num_computed_tokens=tokens,
+        cache_slot_id=cache_slot_id,
     )
 
 
@@ -205,6 +212,112 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert manager.get_snapshot("b") is None
 
 
+class TestMbltRuntimeCacheManagerRuntimeDecisions:
+    def test_single_cache_reuses_live_owner_without_loading(self) -> None:
+        manager = _make_manager(block_size=4)
+        manager.mark_loaded_request("req")
+        load_calls = []
+
+        result = manager.load_snapshot_for_request(
+            _request("req", (1, 2), 8),
+            lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+
+        assert result.matched_tokens == 8
+        assert result.reused_live_cache
+        assert not result.loaded
+        assert load_calls == []
+        assert manager.loaded_req_id == "req"
+
+    def test_single_cache_loads_fully_compatible_own_snapshot(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "req", (1, 2), 8)
+        load_calls = []
+
+        result = manager.load_snapshot_for_request(
+            _request("req", (1, 2), 8),
+            lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+
+        assert result.matched_tokens == 8
+        assert result.loaded
+        assert result.is_own_snapshot
+        assert result.loaded_snapshot_req_id == "req"
+        assert load_calls == [(["blob:req"], None)]
+        assert manager.loaded_req_id == "req"
+
+    def test_single_cache_loads_useful_shared_prefix_snapshot(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "shared", (1, 2, 3), 12)
+        load_calls = []
+
+        result = manager.load_snapshot_for_request(
+            _request("req", (1, 2, 9), 10),
+            lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+
+        assert result.matched_tokens == 8
+        assert result.loaded
+        assert not result.is_own_snapshot
+        assert result.loaded_snapshot_req_id == "shared"
+        assert load_calls == [(["blob:shared"], None)]
+        assert manager.loaded_req_id == "req"
+
+    def test_single_cache_miss_clears_live_owner(self) -> None:
+        manager = _make_manager(block_size=4)
+        manager.mark_loaded_request("other")
+
+        result = manager.load_snapshot_for_request(_request("req", (9,), 4), lambda blobs, slot_id: True)
+
+        assert result.matched_tokens == 0
+        assert result.cache_miss
+        assert manager.loaded_req_id is None
+
+    def test_dump_snapshot_if_needed_uses_injected_callable_and_block_boundary_policy(self) -> None:
+        manager = _make_manager(block_size=4)
+        dump_calls = []
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1,), 4),
+            lambda slot_id: dump_calls.append(slot_id) or ["blob:req:4"],
+        )
+
+        assert dumped
+        assert dump_calls == [None]
+        assert manager.get_snapshot("req").blobs == ["blob:req:4"]
+
+        block_growth_dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1, 2), 5),
+            lambda slot_id: dump_calls.append(slot_id) or ["blob:req:5"],
+        )
+
+        assert block_growth_dumped
+        assert dump_calls == [None, None]
+        assert manager.get_snapshot("req").blobs == ["blob:req:5"]
+
+        not_dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1, 2), 6),
+            lambda slot_id: dump_calls.append(slot_id) or ["blob:req:6"],
+        )
+
+        assert not not_dumped
+        assert dump_calls == [None, None]
+        assert manager.get_snapshot("req").blobs == ["blob:req:5"]
+
+    def test_dump_live_request_before_switch_dumps_current_owner_when_needed(self) -> None:
+        manager = _make_manager(block_size=4)
+        manager.mark_loaded_request("old")
+
+        dumped = manager.dump_live_request_before_switch(
+            next_req_id="new",
+            live_request=_request("old", (1, 2), 8),
+            dump_runtime_cache=lambda slot_id: ["blob:old"],
+        )
+
+        assert dumped
+        assert manager.get_snapshot("old").num_tokens == 8
+
+
 class TestMbltRuntimeCacheManagerSlots:
     def test_batch_slot_allocation_release_and_reuse(self) -> None:
         manager = _make_manager(max_batch_size=2)
@@ -212,12 +325,18 @@ class TestMbltRuntimeCacheManagerSlots:
         assert manager.assign_slot("a") == 0
         assert manager.assign_slot("b") == 1
         assert manager.assign_slot("a") == 0
+        assert manager.req_to_cache_slot == {"a": 0, "b": 1}
+        assert manager.cache_slot_to_req == {0: "a", 1: "b"}
+        assert manager.free_cache_slots == []
         with pytest.raises(RuntimeError, match="No free accelerator cache slots"):
             manager.assign_slot("c")
 
         manager.release_slot("a")
 
         assert manager.live_slot_owner(0) is None
+        assert manager.req_to_cache_slot == {"b": 1}
+        assert manager.cache_slot_to_req == {1: "b"}
+        assert manager.free_cache_slots == [0]
         assert manager.assign_slot("c") == 0
         assert manager.get_slot("c") == 0
 
@@ -240,3 +359,57 @@ class TestMbltRuntimeCacheManagerSlots:
 
         assert dump_calls == [{}, {"cache_id": 1}]
         assert load_calls == [(["blob"], {}), (["slot-blob"], {"cache_id": 1})]
+
+    def test_slot_load_reuses_live_owner_and_uses_slot_scoped_loads(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req")
+        load_calls = []
+
+        reused = manager.load_snapshot_for_slot(
+            _request("req", (1,), 4, cache_slot_id=slot_id),
+            lambda blobs, load_slot_id: load_calls.append((blobs, load_slot_id)) or True,
+        )
+
+        assert reused.reused_live_cache
+        assert reused.matched_tokens == 4
+        assert load_calls == []
+
+        _store_snapshot(manager, "other", (7, 8), 8)
+        loaded = manager.load_snapshot_for_slot(
+            _request("new", (7, 9), 8, cache_slot_id=slot_id),
+            lambda blobs, load_slot_id: load_calls.append((blobs, load_slot_id)) or True,
+        )
+
+        assert loaded.loaded
+        assert loaded.matched_tokens == 4
+        assert loaded.loaded_snapshot_req_id == "other"
+        assert load_calls == [(["blob:other"], slot_id)]
+        assert manager.live_slot_owner(slot_id) == "new"
+
+    def test_slot_cache_miss_marks_slot_owner_for_rebuild(self) -> None:
+        manager = _make_manager(max_batch_size=1, block_size=4)
+        slot_id = manager.assign_slot("req")
+
+        result = manager.load_snapshot_for_slot(
+            _request("req", (99,), 4, cache_slot_id=slot_id),
+            lambda blobs, load_slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+        assert manager.live_slot_owner(slot_id) == "req"
+
+    def test_slot_scoped_dump_passes_cache_slot_to_injected_callable(self) -> None:
+        manager = _make_manager(max_batch_size=1, block_size=4)
+        slot_id = manager.assign_slot("req")
+        dump_calls = []
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1,), 4, cache_slot_id=slot_id),
+            lambda dump_slot_id: dump_calls.append(dump_slot_id) or ["slot-blob"],
+        )
+
+        assert dumped
+        assert dump_calls == [slot_id]
+        assert manager.get_snapshot("req").blobs == ["slot-blob"]
