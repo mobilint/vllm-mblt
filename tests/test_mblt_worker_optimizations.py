@@ -12,7 +12,7 @@ from vllm_mblt.mblt_worker import (
     _is_multimodal_hf_config,
     _is_qwen3_vl_hf_config,
 )
-from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest, RuntimeCacheSnapshot
+from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest
 
 
 class TestMbltWorkerOptimizations:

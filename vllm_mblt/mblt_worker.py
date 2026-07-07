@@ -34,7 +34,6 @@ from vllm_mblt.runtime_cache import (
     append_block_ids,
     first_seq_blocks,
     normalize_block_ids,
-    required_blocks,
 )
 
 logger = init_logger(__name__)
@@ -1017,7 +1016,10 @@ class MbltWorker(WorkerBase):
             elif result.action == "load-own":
                 print(f"[cache] req={req_id} slot={slot_id} load-own matched={result.matched_tokens}/{target_tokens}")
             elif result.action == "load-shared":
-                print(f"[cache] req={req_id} slot={slot_id} load-shared matched={result.matched_tokens}/{target_tokens}")
+                print(
+                    f"[cache] req={req_id} slot={slot_id} "
+                    f"load-shared matched={result.matched_tokens}/{target_tokens}"
+                )
             else:
                 print(f"[cache] req={req_id} slot={slot_id} cache-miss fallback matched=0/{target_tokens}")
         return result.matched_tokens
