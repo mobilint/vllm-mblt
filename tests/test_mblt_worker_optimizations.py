@@ -7,13 +7,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
 from vllm_mblt.mblt_worker import (
-    CacheSnapshot,
     MbltWorker,
     RequestState,
-    SnapshotIndexNode,
     _is_multimodal_hf_config,
     _is_qwen3_vl_hf_config,
 )
+from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest
 
 
 class TestMbltWorkerOptimizations:
@@ -136,8 +135,7 @@ class TestMbltWorkerOptimizations:
         worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32000))
         worker.empty_logits_processors = LogitsProcessors(None)
         worker.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
-        worker.snapshot_index_root = SnapshotIndexNode()
-        worker.cache_snapshots = {}
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker._vlm_image_positions_by_session = {}
         return worker
 
@@ -176,14 +174,32 @@ class TestMbltWorkerOptimizations:
 
     def test_snapshot_index_can_prefer_shallower_prefix_with_more_tokens(self) -> None:
         worker = self._make_worker()
-        short_shared = CacheSnapshot(blobs=[], block_ids=([1, 2, 8],), first_seq_blocks=(1, 2, 8), num_tokens=384)
-        deep_but_short = CacheSnapshot(
-            blobs=[], block_ids=([1, 2, 3, 7],), first_seq_blocks=(1, 2, 3, 7), num_tokens=100
+        worker.runtime_cache.store_snapshot(
+            req_id="short_shared",
+            blobs=[],
+            block_ids=([1, 2, 8],),
+            first_seq_blocks=(1, 2, 8),
+            num_tokens=384,
         )
-        worker.cache_snapshots = {"short_shared": short_shared, "deep_but_short": deep_but_short}
-        worker._rebuild_snapshot_index()
+        short_shared = worker.runtime_cache.get_snapshot("short_shared")
+        assert short_shared is not None
+        worker.runtime_cache.store_snapshot(
+            req_id="deep_but_short",
+            blobs=[],
+            block_ids=([1, 2, 3, 7],),
+            first_seq_blocks=(1, 2, 3, 7),
+            num_tokens=100,
+        )
         req_state = SimpleNamespace(num_computed_tokens=300, first_seq_blocks=(1, 2, 3, 9))
-        snapshot, matched_tokens = worker._choose_snapshot(req_state)
+        match = worker.runtime_cache.choose_snapshot(
+            RuntimeCacheRequest(
+                req_id="",
+                block_ids=(),
+                first_seq_blocks=req_state.first_seq_blocks,
+                num_computed_tokens=req_state.num_computed_tokens,
+            )
+        )
+        snapshot, matched_tokens = match
         assert snapshot is short_shared
         assert matched_tokens == 256
 
@@ -479,7 +495,7 @@ class TestMbltWorkerOptimizations:
         worker = MbltWorker(config, local_rank=0, rank=0, distributed_init_method="env://")
 
         assert worker.max_batch_size == 4
-        assert worker.free_cache_slots == [0, 1, 2, 3]
+        assert worker.runtime_cache.free_slots == [0, 1, 2, 3]
 
     def test_init_uses_shared_text_only_max_batch_size_for_cache_slots(self, monkeypatch) -> None:
         def worker_base_init(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False):
@@ -500,7 +516,7 @@ class TestMbltWorkerOptimizations:
         worker = MbltWorker(config, local_rank=0, rank=0, distributed_init_method="env://")
 
         assert worker.max_batch_size == 16
-        assert worker.free_cache_slots == list(range(16))
+        assert worker.runtime_cache.free_slots == list(range(16))
 
     def test_load_model_passes_text_runtime_layout_kwargs_to_from_pretrained(self, monkeypatch) -> None:
         worker = MbltWorker.__new__(MbltWorker)
@@ -510,9 +526,7 @@ class TestMbltWorkerOptimizations:
         worker.cache_model = None
         worker._infer_output_buffers = None
         worker.max_batch_size = 1
-        worker.req_to_cache_slot = {}
-        worker.cache_slot_to_req = {}
-        worker.free_cache_slots = []
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker.load_config = SimpleNamespace(
             model_loader_extra_config={
                 "dev_no": 2,
@@ -580,9 +594,7 @@ class TestMbltWorkerOptimizations:
         worker.cache_model = None
         worker._infer_output_buffers = None
         worker.max_batch_size = 1
-        worker.req_to_cache_slot = {}
-        worker.cache_slot_to_req = {}
-        worker.free_cache_slots = []
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker.load_config = SimpleNamespace(
             model_loader_extra_config={
                 "dev_no": 0,
