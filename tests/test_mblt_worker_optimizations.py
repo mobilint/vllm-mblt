@@ -3,8 +3,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+from vllm.logprobs import Logprob
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_mblt.mblt_worker import (
     MbltWorker,
@@ -135,6 +139,7 @@ class TestMbltWorkerOptimizations:
         worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32000))
         worker.empty_logits_processors = LogitsProcessors(None)
         worker.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
+        worker.sampler = Sampler(logprobs_mode="raw_logits")
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker._vlm_image_positions_by_session = {}
         return worker
@@ -222,6 +227,57 @@ class TestMbltWorkerOptimizations:
         metadata = worker._make_sampling_metadata([req_state])
         assert metadata.no_penalties
         assert metadata.prompt_token_ids is None
+
+    @pytest.mark.parametrize("prompt_token_ids", ([15339, 1917], [128000, 15339, 1917]))
+    def test_prompt_logprobs_for_echo_start_after_first_prompt_token(self, prompt_token_ids: list[int]) -> None:
+        worker = self._make_worker()
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+
+        vocab_size = max(prompt_token_ids + [42]) + 1
+        sequence_logits = np.full((len(prompt_token_ids), vocab_size), -10.0, dtype=np.float32)
+        for prompt_pos, token_id in enumerate(prompt_token_ids[1:], start=1):
+            sequence_logits[prompt_pos - 1, token_id] = 10.0
+
+        prompt_logprobs_tensors = worker._get_prompt_logprobs_tensors(
+            req_state=req_state,
+            sequence_logits=sequence_logits,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+        assert prompt_logprobs_tensors is not None
+        assert prompt_logprobs_tensors.logprob_token_ids.shape[0] == len(prompt_token_ids) - 1
+
+        processor = LogprobsProcessor(
+            tokenizer=None,
+            logprobs=[],
+            prompt_logprobs=[None],
+            cumulative_logprob=0.0,
+            num_logprobs=1,
+            num_prompt_logprobs=1,
+        )
+        processor.update_from_output(
+            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors)
+        )
+        assert processor.prompt_logprobs is not None
+        assert len(processor.prompt_logprobs) == len(prompt_token_ids)
+        assert processor.prompt_logprobs[0] is None
+        for prompt_pos, token_id in enumerate(prompt_token_ids[1:], start=1):
+            assert token_id in processor.prompt_logprobs[prompt_pos]
+
+        generated_token_id = 42
+        generated_logprobs = {generated_token_id: Logprob(logprob=-0.5, rank=1, decoded_token=None)}
+        completion_logprobs = OpenAIServingCompletion._create_completion_logprobs(
+            OpenAIServingCompletion.__new__(OpenAIServingCompletion),
+            token_ids=[*prompt_token_ids, generated_token_id],
+            top_logprobs=[*processor.prompt_logprobs, generated_logprobs],
+            num_output_top_logprobs=1,
+            tokenizer=SimpleNamespace(decode=lambda token_id: f"token:{token_id}"),
+            return_as_token_id=True,
+        )
+        assert completion_logprobs.token_logprobs[0] is None
+        assert completion_logprobs.token_logprobs[1] is not None
+        assert completion_logprobs.token_logprobs[-1] == -0.5
 
     def test_sampling_penalties_can_be_forced_off_for_non_cuda_runtime(self) -> None:
         worker = self._make_worker()

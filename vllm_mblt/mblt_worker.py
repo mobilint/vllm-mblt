@@ -130,6 +130,12 @@ class CachedSamplingState:
     prompt_token_ids: torch.Tensor
     has_penalties: bool
 
+
+@dataclass
+class InferenceLogits:
+    last_token_logits: np.ndarray
+    full_sequence_logits: Optional[np.ndarray]
+
 class MbltWorker(WorkerBase):
     MAX_FINISHED_CACHE_SNAPSHOTS = 16
 
@@ -828,6 +834,17 @@ class MbltWorker(WorkerBase):
         return logits
 
     @staticmethod
+    def _normalize_sequence_logits(logits: np.ndarray) -> Optional[np.ndarray]:
+        logits = np.asarray(logits)
+        if logits.ndim == 3:
+            if logits.shape[0] != 1:
+                return None
+            return logits[0]
+        if logits.ndim == 2:
+            return logits
+        return None
+
+    @staticmethod
     def _can_reuse_output_buffers(
         cache_model: Any,
         output_buffers: list[np.ndarray],
@@ -886,6 +903,40 @@ class MbltWorker(WorkerBase):
         self._infer_output_buffers = [np.empty_like(logits)]
         return self._last_token_logits(logits)
 
+    def _infer_logits_with_sequence(
+        self,
+        input_embeds: np.ndarray,
+        deepstack_embeds: Optional[np.ndarray],
+        cache_size: int,
+    ) -> InferenceLogits:
+        cache_model = self._get_cache_model()
+        infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds)
+        output_buffers = self._infer_output_buffers
+
+        if output_buffers is not None and self._can_reuse_output_buffers(
+            cache_model,
+            output_buffers,
+            input_seq_len=int(input_embeds.shape[0]),
+        ):
+            infer_output = cache_model.infer(
+                infer_inputs,
+                outputs=output_buffers,
+                cache_size=cache_size,
+            )
+            logits = output_buffers[0] if infer_output is None else infer_output[0]
+        else:
+            infer_output = cache_model.infer(infer_inputs, cache_size=cache_size)
+            if infer_output is None:
+                raise RuntimeError("mxq infer result is None!")
+            logits = infer_output[0]
+            self._infer_output_buffers = [np.empty_like(logits)]
+
+        logits_np = np.asarray(logits)
+        return InferenceLogits(
+            last_token_logits=self._last_token_logits(logits_np),
+            full_sequence_logits=self._normalize_sequence_logits(logits_np),
+        )
+
     def _infer_logits_batch(
         self,
         input_embeds_batch: list[np.ndarray],
@@ -935,6 +986,131 @@ class MbltWorker(WorkerBase):
             )
         logits_np = logits_np.reshape(batch_size, -1)
         return [logits_np[i] for i in range(batch_size)]
+
+    def _infer_logits_batch_with_sequence(
+        self,
+        input_embeds_batch: list[np.ndarray],
+        cache_sizes: list[int],
+        cache_ids: list[int],
+    ) -> list[InferenceLogits]:
+        if not input_embeds_batch:
+            return []
+
+        cache_model = self._get_cache_model()
+        batch_size = len(input_embeds_batch)
+        params = self._make_batch_params(
+            sequence_lengths=[int(input_embeds.shape[0]) for input_embeds in input_embeds_batch],
+            cache_sizes=cache_sizes,
+            cache_ids=cache_ids,
+        )
+
+        concat_input = np.concatenate(input_embeds_batch, axis=0).astype(
+            np.float32,
+            copy=False,
+        )
+        while concat_input.ndim < 4:
+            concat_input = np.expand_dims(concat_input, axis=0)
+
+        infer_output = cache_model.infer([concat_input], params=params)
+        logits = infer_output[0] if isinstance(infer_output, (list, tuple)) else infer_output
+        logits_np = np.asarray(logits)
+        if logits_np.ndim == 3:
+            offset = 0
+            outputs: list[InferenceLogits] = []
+            for input_embeds in input_embeds_batch:
+                seq_len = int(input_embeds.shape[0])
+                if seq_len <= 0:
+                    raise RuntimeError("Batched infer received an empty input embedding slice.")
+                sequence_logits = logits_np[0, offset : offset + seq_len, :]
+                outputs.append(
+                    InferenceLogits(
+                        last_token_logits=sequence_logits[-1, :],
+                        full_sequence_logits=sequence_logits,
+                    )
+                )
+                offset += seq_len
+            if offset != logits_np.shape[1]:
+                raise RuntimeError(
+                    "Batched infer returned logits with unexpected sequence length: "
+                    f"shape={logits_np.shape}, expected_tokens={offset}"
+                )
+            return outputs
+
+        if logits_np.size % batch_size != 0:
+            raise RuntimeError(
+                f"Batched infer returned logits with unexpected shape: shape={logits_np.shape}, batch_size={batch_size}"
+            )
+        logits_np = logits_np.reshape(batch_size, -1)
+        return [InferenceLogits(last_token_logits=logits_np[i], full_sequence_logits=None) for i in range(batch_size)]
+
+    def _num_prompt_logprobs(self, sampling_params: SamplingParams) -> Optional[int]:
+        num_prompt_logprobs = sampling_params.prompt_logprobs
+        if num_prompt_logprobs is None:
+            return None
+        if num_prompt_logprobs == -1:
+            if self.model is None:
+                raise RuntimeError("Model is not initialized.")
+            return int(self.model.config.vocab_size)
+        return int(num_prompt_logprobs)
+
+    def _get_prompt_logprobs_tensors(
+        self,
+        req_state: RequestState,
+        sequence_logits: Optional[np.ndarray],
+        start_idx: int,
+        scheduled_end: int,
+    ):
+        num_prompt_logprobs = self._num_prompt_logprobs(req_state.sampling_params)
+        if num_prompt_logprobs is None:
+            return None
+
+        prompt_token_ids = req_state.prompt_token_ids
+        num_prompt_tokens = len(prompt_token_ids)
+        if num_prompt_tokens <= 1:
+            from vllm.v1.outputs import LogprobsTensors
+
+            return LogprobsTensors.empty_cpu(0, num_prompt_logprobs + 1)
+
+        if sequence_logits is None:
+            logger.warning_once(
+                "Prompt logprobs were requested, but the MBLT runtime returned only last-token logits. "
+                "Prompt token logprobs will be omitted for this request."
+            )
+            return None
+
+        sequence_logits = np.asarray(sequence_logits)
+        if sequence_logits.ndim != 2:
+            logger.warning_once(
+                "Prompt logprobs were requested, but MBLT logits have unsupported shape %s. "
+                "Prompt token logprobs will be omitted for this request.",
+                sequence_logits.shape,
+            )
+            return None
+
+        prompt_end = min(scheduled_end, num_prompt_tokens)
+        # For prompt position i > 0, use logits produced while processing token
+        # i - 1. There is intentionally no logprob for prompt token 0; vLLM's
+        # LogprobsProcessor seeds prompt_logprobs with a leading None.
+        first_prompt_pos = max(1, start_idx + 1)
+        if prompt_end <= first_prompt_pos:
+            return None
+
+        logits_start = first_prompt_pos - start_idx - 1
+        logits_end = logits_start + (prompt_end - first_prompt_pos)
+        if logits_start < 0 or logits_end > sequence_logits.shape[0]:
+            logger.warning_once(
+                "Prompt logprobs were requested, but MBLT logits shape %s does not cover prompt positions "
+                "[%s, %s). Prompt token logprobs will be omitted for this request.",
+                sequence_logits.shape,
+                first_prompt_pos,
+                prompt_end,
+            )
+            return None
+
+        prompt_logits = torch.from_numpy(sequence_logits[logits_start:logits_end]).to(dtype=torch.float32)
+        target_token_ids = torch.as_tensor(prompt_token_ids[first_prompt_pos:prompt_end], dtype=torch.int64)
+        logprobs = self.sampler.compute_logprobs(prompt_logits)
+        return self.sampler.gather_logprobs(logprobs, num_prompt_logprobs, target_token_ids)
 
     @staticmethod
     def _should_sample_after_step(
@@ -1418,6 +1594,7 @@ class MbltWorker(WorkerBase):
         logits_batch: list[torch.Tensor] = []
         req_states_for_sampling: list[RequestState] = []
         sampling_req_ids: list[str] = []
+        prompt_logprobs_dict = {}
 
         if self._is_batch_model():
             if batch_size > self.max_batch_size:
@@ -1460,7 +1637,7 @@ class MbltWorker(WorkerBase):
                 cache_sizes.append(cache_size)
                 cache_ids.append(slot_id)
 
-            batched_logits = self._infer_logits_batch(
+            batched_logits = self._infer_logits_batch_with_sequence(
                 input_embeds_batch=input_embeds_batch,
                 cache_sizes=cache_sizes,
                 cache_ids=cache_ids,
@@ -1468,6 +1645,14 @@ class MbltWorker(WorkerBase):
 
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
+                prompt_logprobs_tensors = self._get_prompt_logprobs_tensors(
+                    req_state=req_state,
+                    sequence_logits=batched_logits[i].full_sequence_logits,
+                    start_idx=cache_sizes[i],
+                    scheduled_end=scheduled_end_positions[i],
+                )
+                if prompt_logprobs_tensors is not None:
+                    prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                 req_state.num_computed_tokens = next_cache_sizes[i]
                 self.runtime_cache.mark_slot_owner(cache_ids[i], req_id)
                 if self._should_sample_after_step(
@@ -1475,7 +1660,7 @@ class MbltWorker(WorkerBase):
                     scheduled_end_positions[i],
                     sequence_lengths[i],
                 ):
-                    logits_batch.append(torch.from_numpy(batched_logits[i]).reshape(1, -1))
+                    logits_batch.append(torch.from_numpy(batched_logits[i].last_token_logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
         else:
@@ -1508,11 +1693,19 @@ class MbltWorker(WorkerBase):
                 next_cache_sizes.append(next_cache_size)
                 sequence_lengths.append(sequence_length)
 
-                logits = self._infer_logits(
+                inference_logits = self._infer_logits_with_sequence(
                     input_embeds,
                     deepstack_embeds,
                     cache_size=cache_size,
                 )
+                prompt_logprobs_tensors = self._get_prompt_logprobs_tensors(
+                    req_state=req_state,
+                    sequence_logits=inference_logits.full_sequence_logits,
+                    start_idx=cache_size,
+                    scheduled_end=scheduled_end,
+                )
+                if prompt_logprobs_tensors is not None:
+                    prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                 # The live accelerator KV now belongs to this request at
                 # next_cache_size tokens, so later same-request decode can reuse it
                 # without forcing a block-boundary snapshot dump.
@@ -1523,7 +1716,7 @@ class MbltWorker(WorkerBase):
                     scheduled_end,
                     sequence_length,
                 ):
-                    logits_batch.append(torch.from_numpy(logits).reshape(1, -1))
+                    logits_batch.append(torch.from_numpy(inference_logits.last_token_logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
 
@@ -1554,7 +1747,7 @@ class MbltWorker(WorkerBase):
             req_id_to_index=req_id_to_index,
             sampled_token_ids=sampled_token_ids,
             logprobs=logprobs,
-            prompt_logprobs_dict={},
+            prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
         )
 
