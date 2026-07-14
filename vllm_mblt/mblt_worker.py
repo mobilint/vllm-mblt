@@ -939,7 +939,9 @@ class MbltWorker(WorkerBase):
         logits_np = np.asarray(logits)
         return InferenceLogits(
             last_token_logits=self._last_token_logits(logits_np),
-            full_sequence_logits=self._normalize_sequence_logits(logits_np, expected_seq_len=int(input_embeds.shape[0])),
+            full_sequence_logits=self._normalize_sequence_logits(
+                logits_np, expected_seq_len=int(input_embeds.shape[0])
+            ),
         )
 
     def _infer_logits_batch(
@@ -1062,6 +1064,7 @@ class MbltWorker(WorkerBase):
         return (
             self._num_prompt_logprobs(req_state.sampling_params) is not None
             and req_state.next_prompt_logprob_pos <= 1
+            and req_state.next_prompt_logprob_pos < len(req_state.prompt_token_ids)
             and req_state.num_computed_tokens > 0
         )
 
@@ -1079,6 +1082,7 @@ class MbltWorker(WorkerBase):
         prompt_token_ids = req_state.prompt_token_ids
         num_prompt_tokens = len(prompt_token_ids)
         if num_prompt_tokens <= 1:
+            req_state.next_prompt_logprob_pos = num_prompt_tokens
             from vllm.v1.outputs import LogprobsTensors
 
             return LogprobsTensors.empty_cpu(0, num_prompt_logprobs + 1)
@@ -1088,6 +1092,7 @@ class MbltWorker(WorkerBase):
                 "Prompt logprobs were requested, but the MBLT runtime returned only last-token logits. "
                 "Prompt token logprobs will be omitted for this request."
             )
+            req_state.next_prompt_logprob_pos = num_prompt_tokens
             return None
 
         sequence_logits = np.asarray(sequence_logits)
@@ -1097,6 +1102,7 @@ class MbltWorker(WorkerBase):
                 "Prompt token logprobs will be omitted for this request.",
                 sequence_logits.shape,
             )
+            req_state.next_prompt_logprob_pos = num_prompt_tokens
             return None
 
         prompt_end = min(scheduled_end + 1, num_prompt_tokens)
@@ -1117,6 +1123,7 @@ class MbltWorker(WorkerBase):
                 first_prompt_pos,
                 prompt_end,
             )
+            req_state.next_prompt_logprob_pos = num_prompt_tokens
             return None
 
         prompt_logits = torch.from_numpy(sequence_logits[logits_start:logits_end]).to(dtype=torch.float32)
