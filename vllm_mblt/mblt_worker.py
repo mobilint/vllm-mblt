@@ -2020,6 +2020,7 @@ class MbltWorker(WorkerBase):
                 ]
             )
             restore_indices: list[int] = []
+            restore_start_positions: dict[int, int] = {}
 
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
@@ -2027,7 +2028,18 @@ class MbltWorker(WorkerBase):
                 if sequence_logits is None:
                     sequence_logits = fallback_sequence_logits.get(i)
                     if sequence_logits is not None:
-                        restore_indices.append(i)
+                        prompt_end = min(scheduled_end_positions[i] + 1, req_state.prompt_len)
+                        restore_start = max(0, prompt_end - 1)
+                        if restore_start >= scheduled_end_positions[i]:
+                            batched_logits[i] = InferenceLogits(
+                                last_token_logits=np.asarray(sequence_logits)[-1, :],
+                                full_sequence_logits=sequence_logits,
+                            )
+                            sequence_lengths[i] = max(1, restore_start)
+                            next_cache_sizes[i] = restore_start
+                        else:
+                            restore_indices.append(i)
+                            restore_start_positions[i] = restore_start
                 self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
                     sequence_logits=sequence_logits,
@@ -2042,14 +2054,14 @@ class MbltWorker(WorkerBase):
                 restore_input_embeds_batch = [
                     self._build_input_embeds(
                         self.req_states[req_ids[i]],
-                        0,
+                        restore_start_positions[i],
                         scheduled_end_positions[i],
                     )
                     for i in restore_batch
                 ]
                 restored_logits = self._infer_logits_batch_with_sequence(
                     input_embeds_batch=restore_input_embeds_batch,
-                    cache_sizes=[0 for _ in restore_batch],
+                    cache_sizes=[restore_start_positions[i] for i in restore_batch],
                     cache_ids=[cache_ids[i] for i in restore_batch],
                 )
                 for i, input_embeds, inference_logits in zip(
@@ -2059,7 +2071,7 @@ class MbltWorker(WorkerBase):
                 ):
                     batched_logits[i] = inference_logits
                     sequence_lengths[i] = int(input_embeds.shape[0])
-                    next_cache_sizes[i] = sequence_lengths[i]
+                    next_cache_sizes[i] = restore_start_positions[i] + sequence_lengths[i]
 
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
