@@ -1169,9 +1169,12 @@ class MbltWorker(WorkerBase):
             return None
 
         # _get_prompt_logprobs_tensors maps prompt position i to row
-        # i - start_idx - 1.  Recompute the full scheduled prefix span so row
-        # indexing stays identical even if some prompt positions were emitted
-        # by an earlier chunk/replay.
+        # i - start_idx - 1.  Therefore the fallback sequence logits must start
+        # at prompt position start_idx + 1, not first_prompt_pos.  Some prompt
+        # positions in that span may already have been emitted by an earlier
+        # chunk/replay, but we still include their rows so the tensor layout is
+        # identical to full-sequence runtime output.  _get_prompt_logprobs_tensors
+        # will slice away already-emitted positions using next_prompt_logprob_pos.
         rows: list[np.ndarray] = []
         for prompt_pos in range(start_idx + 1, prompt_end):
             prefix_embeds = req_state.prompt_embeds[:prompt_pos]
