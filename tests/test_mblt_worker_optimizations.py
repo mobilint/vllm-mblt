@@ -488,6 +488,42 @@ class TestMbltWorkerOptimizations:
             assert processor.prompt_logprobs[prompt_pos] is not None
             assert token_id in processor.prompt_logprobs[prompt_pos]
 
+    def test_completed_prompt_logprobs_wait_for_scheduler_emitted_output(self) -> None:
+        worker = self._make_worker()
+        prompt_token_ids = [101, 102, 103, 104]
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        vocab_size = max(prompt_token_ids) + 1
+
+        logits = np.full((len(prompt_token_ids) - 1, vocab_size), -10.0, dtype=np.float32)
+        for row, token_id in enumerate(prompt_token_ids[1:]):
+            logits[row, token_id] = 10.0
+
+        non_emitting_step_prompt_logprobs = worker._get_completed_prompt_logprobs_tensors_for_scheduler(
+            req_state=req_state,
+            sequence_logits=logits,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+            can_emit_output=False,
+        )
+
+        assert non_emitting_step_prompt_logprobs is None
+        assert req_state.in_progress_prompt_logprobs is not None
+        assert req_state.next_prompt_logprob_pos == len(prompt_token_ids)
+
+        emitting_step_prompt_logprobs = worker._get_completed_prompt_logprobs_tensors_for_scheduler(
+            req_state=req_state,
+            sequence_logits=None,
+            start_idx=len(prompt_token_ids),
+            scheduled_end=len(prompt_token_ids) + 1,
+            can_emit_output=True,
+        )
+
+        assert emitting_step_prompt_logprobs is not None
+        assert emitting_step_prompt_logprobs.logprob_token_ids.shape[0] == len(prompt_token_ids) - 1
+        assert req_state.in_progress_prompt_logprobs is None
+
     def test_prompt_logprobs_replay_does_not_duplicate_emitted_positions(self) -> None:
         worker = self._make_worker()
         prompt_token_ids = [101, 102, 103, 104]

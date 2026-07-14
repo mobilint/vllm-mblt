@@ -1289,6 +1289,7 @@ class MbltWorker(WorkerBase):
         start_idx: int,
         scheduled_end: int,
         cache_id: Optional[int] = None,
+        can_emit_output: bool = True,
     ) -> Optional[LogprobsTensors]:
         num_prompt_logprobs = self._num_prompt_logprobs(req_state.sampling_params)
         if num_prompt_logprobs is None:
@@ -1310,9 +1311,23 @@ class MbltWorker(WorkerBase):
 
         if scheduled_end < req_state.prompt_len:
             return None
+
+        return self._pop_completed_prompt_logprobs_tensors_for_scheduler(
+            req_state=req_state,
+            can_emit_output=can_emit_output,
+        )
+
+    def _pop_completed_prompt_logprobs_tensors_for_scheduler(
+        self,
+        req_state: RequestState,
+        can_emit_output: bool,
+    ) -> Optional[LogprobsTensors]:
+        if not can_emit_output:
+            return None
+        if self._num_prompt_logprobs(req_state.sampling_params) is None:
+            return None
         if req_state.next_prompt_logprob_pos < len(req_state.prompt_token_ids):
             return None
-
         completed_prompt_logprobs = req_state.in_progress_prompt_logprobs
         req_state.in_progress_prompt_logprobs = None
         return completed_prompt_logprobs
@@ -1875,12 +1890,13 @@ class MbltWorker(WorkerBase):
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
                 prompt_logprob_pos_before = req_state.next_prompt_logprob_pos
-                prompt_logprobs_tensors = self._get_completed_prompt_logprobs_tensors_for_scheduler(
+                self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
                     sequence_logits=batched_logits[i].full_sequence_logits,
                     start_idx=cache_sizes[i],
                     scheduled_end=scheduled_end_positions[i],
                     cache_id=cache_ids[i],
+                    can_emit_output=False,
                 )
                 prompt_logprob_fallback_replayed = (
                     batched_logits[i].full_sequence_logits is None
@@ -1898,8 +1914,6 @@ class MbltWorker(WorkerBase):
                     )[0]
                     sequence_lengths[i] = int(input_embeds.shape[0])
                     next_cache_sizes[i] = sequence_lengths[i]
-                if prompt_logprobs_tensors is not None:
-                    prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                 req_state.num_computed_tokens = next_cache_sizes[i]
                 self.runtime_cache.mark_slot_owner(cache_ids[i], req_id)
                 if self._should_sample_after_step(
@@ -1907,6 +1921,12 @@ class MbltWorker(WorkerBase):
                     scheduled_end_positions[i],
                     sequence_lengths[i],
                 ):
+                    prompt_logprobs_tensors = self._pop_completed_prompt_logprobs_tensors_for_scheduler(
+                        req_state=req_state,
+                        can_emit_output=True,
+                    )
+                    if prompt_logprobs_tensors is not None:
+                        prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                     logits_batch.append(torch.from_numpy(batched_logits[i].last_token_logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
@@ -1946,11 +1966,12 @@ class MbltWorker(WorkerBase):
                     cache_size=cache_size,
                 )
                 prompt_logprob_pos_before = req_state.next_prompt_logprob_pos
-                prompt_logprobs_tensors = self._get_completed_prompt_logprobs_tensors_for_scheduler(
+                self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
                     sequence_logits=inference_logits.full_sequence_logits,
                     start_idx=cache_size,
                     scheduled_end=scheduled_end,
+                    can_emit_output=False,
                 )
                 prompt_logprob_fallback_replayed = (
                     inference_logits.full_sequence_logits is None
@@ -1977,8 +1998,6 @@ class MbltWorker(WorkerBase):
                         deepstack_embeds,
                         cache_size=0,
                     )
-                if prompt_logprobs_tensors is not None:
-                    prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                 # The live accelerator KV now belongs to this request at
                 # next_cache_size tokens, so later same-request decode can reuse it
                 # without forcing a block-boundary snapshot dump.
@@ -1989,6 +2008,12 @@ class MbltWorker(WorkerBase):
                     scheduled_end,
                     sequence_length,
                 ):
+                    prompt_logprobs_tensors = self._pop_completed_prompt_logprobs_tensors_for_scheduler(
+                        req_state=req_state,
+                        can_emit_output=True,
+                    )
+                    if prompt_logprobs_tensors is not None:
+                        prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                     logits_batch.append(torch.from_numpy(inference_logits.last_token_logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
