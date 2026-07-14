@@ -1087,7 +1087,7 @@ class MbltWorker(WorkerBase):
             )
             return None
 
-        prompt_end = min(scheduled_end, num_prompt_tokens)
+        prompt_end = min(scheduled_end + 1, num_prompt_tokens)
         # For prompt position i > 0, use logits produced while processing token
         # i - 1. There is intentionally no logprob for prompt token 0; vLLM's
         # LogprobsProcessor seeds prompt_logprobs with a leading None.
