@@ -635,6 +635,105 @@ class TestMbltWorkerOptimizations:
         assert all(logprob is not None for logprob in completion_logprobs.token_logprobs[1:])
         assert completion_logprobs.token_logprobs[-1] == -0.25
 
+    @pytest.mark.parametrize("prompt_token_ids", ([], [15339]))
+    def test_prompt_logprobs_fallback_returns_none_for_empty_or_one_token_prompt(
+        self, prompt_token_ids: list[int]
+    ) -> None:
+        worker = self._make_worker()
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+
+        def infer_logits(input_embeds, deepstack_embeds, cache_size):
+            raise AssertionError("short prompts have no prompt positions that require fallback replay")
+
+        worker._infer_logits = infer_logits
+
+        fallback_logits = worker._compute_prompt_logprobs_sequence_logits_fallback(
+            req_state=req_state,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+        prompt_logprobs_tensors = worker._get_prompt_logprobs_tensors_with_fallback(
+            req_state=req_state,
+            sequence_logits=None,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+
+        assert fallback_logits is None
+        assert prompt_logprobs_tensors is None
+
+    def test_prompt_logprobs_fallback_returns_none_after_all_prompt_positions_emitted(self) -> None:
+        worker = self._make_worker()
+        prompt_token_ids = [101, 102, 103]
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        req_state.next_prompt_logprob_pos = len(prompt_token_ids)
+        req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+
+        def infer_logits(input_embeds, deepstack_embeds, cache_size):
+            raise AssertionError("completed prompt logprobs should not trigger fallback replay")
+
+        worker._infer_logits = infer_logits
+
+        fallback_logits = worker._compute_prompt_logprobs_sequence_logits_fallback(
+            req_state=req_state,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+        prompt_logprobs_tensors = worker._get_prompt_logprobs_tensors_with_fallback(
+            req_state=req_state,
+            sequence_logits=None,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+
+        assert fallback_logits is None
+        assert prompt_logprobs_tensors is None
+
+    def test_prompt_logprobs_fallback_preserves_multitoken_rows_for_needed_positions(self) -> None:
+        worker = self._make_worker()
+        prompt_token_ids = [101, 102, 103]
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+
+        vocab_size = max(prompt_token_ids) + 1
+        calls: list[tuple[int, int]] = []
+
+        def infer_logits(input_embeds, deepstack_embeds, cache_size):
+            assert deepstack_embeds is None
+            calls.append((int(input_embeds.shape[0]), int(cache_size)))
+            prompt_pos = int(input_embeds.shape[0])
+            logits = np.full((1, vocab_size), -10.0, dtype=np.float32)
+            logits[0, prompt_token_ids[prompt_pos]] = 10.0
+            return logits
+
+        worker._infer_logits = infer_logits
+
+        fallback_logits = worker._compute_prompt_logprobs_sequence_logits_fallback(
+            req_state=req_state,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+        assert fallback_logits is not None
+        assert fallback_logits.shape == (len(prompt_token_ids) - 1, vocab_size)
+        assert calls == [(prompt_pos, 0) for prompt_pos in range(1, len(prompt_token_ids))]
+
+        prompt_logprobs_tensors = worker._get_prompt_logprobs_tensors(
+            req_state=req_state,
+            sequence_logits=fallback_logits,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+        assert prompt_logprobs_tensors is not None
+        assert prompt_logprobs_tensors.logprob_token_ids.shape[0] == len(prompt_token_ids) - 1
+        assert req_state.next_prompt_logprob_pos == len(prompt_token_ids)
+
     def test_prompt_logprobs_unsupported_logits_shape_terminal_during_decode(self) -> None:
         worker = self._make_worker()
         prompt_token_ids = [101, 102, 103]

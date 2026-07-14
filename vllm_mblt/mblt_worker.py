@@ -1160,8 +1160,10 @@ class MbltWorker(WorkerBase):
 
         prompt_token_ids = req_state.prompt_token_ids
         num_prompt_tokens = len(prompt_token_ids)
+        if req_state.next_prompt_logprob_pos >= num_prompt_tokens:
+            return None
         if num_prompt_tokens <= 1:
-            return np.empty((0, int(getattr(self.model.config, "vocab_size", 0))), dtype=np.float32)
+            return None
 
         prompt_end = min(scheduled_end + 1, num_prompt_tokens)
         first_prompt_pos = max(1, start_idx + 1, req_state.next_prompt_logprob_pos)
