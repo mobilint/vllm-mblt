@@ -20,7 +20,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MLAAttentionSpec
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -115,6 +115,7 @@ class RequestState:
     cache_slot_id: Optional[int]
     vlm_session_id: Optional[str]
     next_prompt_logprob_pos: int = 1
+    in_progress_prompt_logprobs: Optional[LogprobsTensors] = None
 
 
 @dataclass
@@ -1252,6 +1253,70 @@ class MbltWorker(WorkerBase):
         )
         return prompt_logprobs_tensors
 
+    def _accumulate_prompt_logprobs_tensors(
+        self,
+        req_state: RequestState,
+        prompt_logprobs_tensors: Optional[LogprobsTensors],
+        first_prompt_pos: int,
+    ) -> None:
+        if prompt_logprobs_tensors is None:
+            return
+
+        num_prompt_logprobs = self._num_prompt_logprobs(req_state.sampling_params)
+        if num_prompt_logprobs is None:
+            return
+
+        num_rows = int(prompt_logprobs_tensors.logprob_token_ids.shape[0])
+        if req_state.in_progress_prompt_logprobs is None:
+            req_state.in_progress_prompt_logprobs = LogprobsTensors.empty_cpu(
+                max(0, len(req_state.prompt_token_ids) - 1),
+                num_prompt_logprobs + 1,
+            )
+        if num_rows <= 0:
+            return
+
+        dst_start = first_prompt_pos - 1
+        dst_end = dst_start + num_rows
+        in_progress = req_state.in_progress_prompt_logprobs
+        in_progress.logprob_token_ids[dst_start:dst_end].copy_(prompt_logprobs_tensors.logprob_token_ids)
+        in_progress.logprobs[dst_start:dst_end].copy_(prompt_logprobs_tensors.logprobs)
+        in_progress.selected_token_ranks[dst_start:dst_end].copy_(prompt_logprobs_tensors.selected_token_ranks)
+
+    def _get_completed_prompt_logprobs_tensors_for_scheduler(
+        self,
+        req_state: RequestState,
+        sequence_logits: Optional[np.ndarray],
+        start_idx: int,
+        scheduled_end: int,
+        cache_id: Optional[int] = None,
+    ) -> Optional[LogprobsTensors]:
+        num_prompt_logprobs = self._num_prompt_logprobs(req_state.sampling_params)
+        if num_prompt_logprobs is None:
+            return None
+
+        first_prompt_pos = max(1, start_idx + 1, req_state.next_prompt_logprob_pos)
+        prompt_logprobs_tensors = self._get_prompt_logprobs_tensors_with_fallback(
+            req_state=req_state,
+            sequence_logits=sequence_logits,
+            start_idx=start_idx,
+            scheduled_end=scheduled_end,
+            cache_id=cache_id,
+        )
+        self._accumulate_prompt_logprobs_tensors(
+            req_state=req_state,
+            prompt_logprobs_tensors=prompt_logprobs_tensors,
+            first_prompt_pos=first_prompt_pos,
+        )
+
+        if scheduled_end < req_state.prompt_len:
+            return None
+        if req_state.next_prompt_logprob_pos < len(req_state.prompt_token_ids):
+            return None
+
+        completed_prompt_logprobs = req_state.in_progress_prompt_logprobs
+        req_state.in_progress_prompt_logprobs = None
+        return completed_prompt_logprobs
+
     @staticmethod
     def _should_sample_after_step(
         req_state: RequestState,
@@ -1809,14 +1874,19 @@ class MbltWorker(WorkerBase):
 
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
-                prompt_logprobs_tensors = self._get_prompt_logprobs_tensors_with_fallback(
+                prompt_logprob_pos_before = req_state.next_prompt_logprob_pos
+                prompt_logprobs_tensors = self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
                     sequence_logits=batched_logits[i].full_sequence_logits,
                     start_idx=cache_sizes[i],
                     scheduled_end=scheduled_end_positions[i],
                     cache_id=cache_ids[i],
                 )
-                if batched_logits[i].full_sequence_logits is None and prompt_logprobs_tensors is not None:
+                prompt_logprob_fallback_replayed = (
+                    batched_logits[i].full_sequence_logits is None
+                    and req_state.next_prompt_logprob_pos > prompt_logprob_pos_before
+                )
+                if prompt_logprob_fallback_replayed:
                     # The fallback replays prompt prefixes in this cache slot. Replay the
                     # scheduled request from the beginning so the slot's live KV state and
                     # generated-token logits match the actual request before sampling.
@@ -1875,13 +1945,18 @@ class MbltWorker(WorkerBase):
                     deepstack_embeds,
                     cache_size=cache_size,
                 )
-                prompt_logprobs_tensors = self._get_prompt_logprobs_tensors_with_fallback(
+                prompt_logprob_pos_before = req_state.next_prompt_logprob_pos
+                prompt_logprobs_tensors = self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
                     sequence_logits=inference_logits.full_sequence_logits,
                     start_idx=cache_size,
                     scheduled_end=scheduled_end,
                 )
-                if inference_logits.full_sequence_logits is None and prompt_logprobs_tensors is not None:
+                prompt_logprob_fallback_replayed = (
+                    inference_logits.full_sequence_logits is None
+                    and req_state.next_prompt_logprob_pos > prompt_logprob_pos_before
+                )
+                if prompt_logprob_fallback_replayed:
                     # Last-token-only prompt-logprob fallback replays prompt prefixes from
                     # an empty runtime cache.  Re-run this request from the beginning of
                     # the scheduled prefix afterwards so live KV state and generated-token
