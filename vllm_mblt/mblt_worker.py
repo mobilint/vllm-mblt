@@ -1145,9 +1145,9 @@ class MbltWorker(WorkerBase):
         log P(t_i | t_0...t_{i-1}) for prompt tokens as well as generated
         tokens.  Some MBLT artifacts return only the last-token logits for an
         inference call, so a normal full-prompt prefill cannot directly provide
-        all prompt positions.  This correctness-first fallback replays prompt
-        prefixes from an empty runtime cache and uses each prefix's last-token
-        logits as the distribution for the next prompt token.
+        all prompt positions.  This correctness-first fallback incrementally
+        replays the prompt in an empty/isolated fallback cache and uses each
+        step's last-token logits as the distribution for the next prompt token.
 
         The caller still runs the scheduled prefill/decode afterwards, so the
         generation cache and generated-token logits are kept on the existing
@@ -1177,25 +1177,44 @@ class MbltWorker(WorkerBase):
         # chunk/replay, but we still include their rows so the tensor layout is
         # identical to full-sequence runtime output.  _get_prompt_logprobs_tensors
         # will slice away already-emitted positions using next_prompt_logprob_pos.
+        #
+        # Feed only new embeddings after the first fallback step and advance the
+        # runtime cache size.  This computes log P(t_i | t_0...t_{i-1}) with
+        # O(N) submitted embeddings instead of replaying every full prefix.
         rows: list[np.ndarray] = []
+        fallback_cache_size = 0
         for prompt_pos in range(start_idx + 1, prompt_end):
-            prefix_embeds = req_state.prompt_embeds[:prompt_pos]
-            prefix_deepstack = (
-                req_state.prompt_deepstack_embeds[:, :prompt_pos, :]
+            if fallback_cache_size == 0:
+                # Prime the fallback cache with the prefix that predicts
+                # prompt_token_ids[prompt_pos].  For the common start_idx == 0
+                # case this is exactly one token; for a nonzero start_idx it is
+                # one linear prefix-fill call, not one call per prefix length.
+                input_start = 0
+                input_end = prompt_pos
+            else:
+                # The fallback cache already contains prompt_pos - 1 tokens;
+                # feed only the next new token to obtain logits for prompt_pos.
+                input_start = prompt_pos - 1
+                input_end = prompt_pos
+
+            input_embeds = req_state.prompt_embeds[input_start:input_end]
+            input_deepstack = (
+                req_state.prompt_deepstack_embeds[:, input_start:input_end, :]
                 if req_state.prompt_deepstack_embeds is not None
                 else None
             )
             if cache_id is not None:
-                if prefix_deepstack is not None:
+                if input_deepstack is not None:
                     raise RuntimeError("Batch prompt-logprob fallback does not support deepstack embeddings.")
                 logits = self._infer_logits_batch(
-                    input_embeds_batch=[prefix_embeds],
-                    cache_sizes=[0],
+                    input_embeds_batch=[input_embeds],
+                    cache_sizes=[fallback_cache_size],
                     cache_ids=[cache_id],
                 )[0]
             else:
-                logits = self._infer_logits(prefix_embeds, prefix_deepstack, cache_size=0)
+                logits = self._infer_logits(input_embeds, input_deepstack, cache_size=fallback_cache_size)
             rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1)[None, :][0])
+            fallback_cache_size += int(input_embeds.shape[0])
 
         if not rows:
             return None
