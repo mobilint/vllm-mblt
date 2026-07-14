@@ -20,7 +20,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MLAAttentionSpec
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -115,6 +115,7 @@ class RequestState:
     cache_slot_id: Optional[int]
     vlm_session_id: Optional[str]
     next_prompt_logprob_pos: int = 1
+    in_progress_prompt_logprobs: Optional[LogprobsTensors] = None
 
 
 @dataclass
@@ -136,6 +137,19 @@ class CachedSamplingState:
 class InferenceLogits:
     last_token_logits: np.ndarray
     full_sequence_logits: Optional[np.ndarray]
+
+
+@dataclass
+class PromptLogprobFallbackReplayState:
+    output_index: int
+    req_state: RequestState
+    start_idx: int
+    prompt_end: int
+    cache_id: int
+    current_prompt_pos: int
+    fallback_cache_size: int
+    rows: list[np.ndarray]
+
 
 class MbltWorker(WorkerBase):
     MAX_FINISHED_CACHE_SNAPSHOTS = 16
@@ -1220,6 +1234,112 @@ class MbltWorker(WorkerBase):
             return None
         return np.stack(rows, axis=0)
 
+    def _make_prompt_logprobs_fallback_replay_state(
+        self,
+        output_index: int,
+        req_state: RequestState,
+        start_idx: int,
+        scheduled_end: int,
+        cache_id: int,
+    ) -> Optional[PromptLogprobFallbackReplayState]:
+        if self._num_prompt_logprobs(req_state.sampling_params) is None:
+            return None
+
+        prompt_token_ids = req_state.prompt_token_ids
+        num_prompt_tokens = len(prompt_token_ids)
+        if req_state.next_prompt_logprob_pos >= num_prompt_tokens:
+            return None
+        if num_prompt_tokens <= 1:
+            return None
+
+        prompt_end = min(scheduled_end + 1, num_prompt_tokens)
+        first_prompt_pos = max(1, start_idx + 1, req_state.next_prompt_logprob_pos)
+        if prompt_end <= first_prompt_pos:
+            return None
+        if req_state.prompt_deepstack_embeds is not None:
+            raise RuntimeError("Batch prompt-logprob fallback does not support deepstack embeddings.")
+
+        return PromptLogprobFallbackReplayState(
+            output_index=output_index,
+            req_state=req_state,
+            start_idx=start_idx,
+            prompt_end=prompt_end,
+            cache_id=cache_id,
+            current_prompt_pos=start_idx + 1,
+            fallback_cache_size=0,
+            rows=[],
+        )
+
+    def _compute_prompt_logprobs_sequence_logits_fallback_batch(
+        self,
+        requests: list[tuple[int, RequestState, int, int, int]],
+    ) -> dict[int, np.ndarray]:
+        """Batch prompt-logprob fallback replay across requests.
+
+        Each active request owns an isolated qbruntime cache_id.  The replay
+        cache starts empty and advances one prompt position at a time, but the
+        work for different requests is submitted together through BatchParam.
+        """
+
+        states = [
+            state
+            for output_index, req_state, start_idx, scheduled_end, cache_id in requests
+            if (
+                state := self._make_prompt_logprobs_fallback_replay_state(
+                    output_index=output_index,
+                    req_state=req_state,
+                    start_idx=start_idx,
+                    scheduled_end=scheduled_end,
+                    cache_id=cache_id,
+                )
+            )
+            is not None
+        ]
+        if not states:
+            return {}
+
+        while True:
+            active_states = [state for state in states if state.current_prompt_pos < state.prompt_end]
+            if not active_states:
+                break
+
+            for batch_start in range(0, len(active_states), self.max_batch_size):
+                batch_states = active_states[batch_start : batch_start + self.max_batch_size]
+                input_embeds_batch: list[np.ndarray] = []
+                cache_sizes: list[int] = []
+                cache_ids: list[int] = []
+
+                for state in batch_states:
+                    prompt_pos = state.current_prompt_pos
+                    if state.fallback_cache_size == 0:
+                        input_start = 0
+                        input_end = prompt_pos
+                    else:
+                        input_start = prompt_pos - 1
+                        input_end = prompt_pos
+
+                    input_embeds = state.req_state.prompt_embeds[input_start:input_end]
+                    input_embeds_batch.append(input_embeds)
+                    cache_sizes.append(state.fallback_cache_size)
+                    cache_ids.append(state.cache_id)
+
+                logits_batch = self._infer_logits_batch(
+                    input_embeds_batch=input_embeds_batch,
+                    cache_sizes=cache_sizes,
+                    cache_ids=cache_ids,
+                )
+
+                for state, input_embeds, logits in zip(batch_states, input_embeds_batch, logits_batch):
+                    state.rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1))
+                    state.fallback_cache_size += int(input_embeds.shape[0])
+                    state.current_prompt_pos += 1
+
+        return {
+            state.output_index: np.stack(state.rows, axis=0)
+            for state in states
+            if state.rows
+        }
+
     def _get_prompt_logprobs_tensors_with_fallback(
         self,
         req_state: RequestState,
@@ -1251,6 +1371,85 @@ class MbltWorker(WorkerBase):
             scheduled_end=scheduled_end,
         )
         return prompt_logprobs_tensors
+
+    def _accumulate_prompt_logprobs_tensors(
+        self,
+        req_state: RequestState,
+        prompt_logprobs_tensors: Optional[LogprobsTensors],
+        first_prompt_pos: int,
+    ) -> None:
+        if prompt_logprobs_tensors is None:
+            return
+
+        num_prompt_logprobs = self._num_prompt_logprobs(req_state.sampling_params)
+        if num_prompt_logprobs is None:
+            return
+
+        num_rows = int(prompt_logprobs_tensors.logprob_token_ids.shape[0])
+        if req_state.in_progress_prompt_logprobs is None:
+            req_state.in_progress_prompt_logprobs = LogprobsTensors.empty_cpu(
+                max(0, len(req_state.prompt_token_ids) - 1),
+                num_prompt_logprobs + 1,
+            )
+        if num_rows <= 0:
+            return
+
+        dst_start = first_prompt_pos - 1
+        dst_end = dst_start + num_rows
+        in_progress = req_state.in_progress_prompt_logprobs
+        in_progress.logprob_token_ids[dst_start:dst_end].copy_(prompt_logprobs_tensors.logprob_token_ids)
+        in_progress.logprobs[dst_start:dst_end].copy_(prompt_logprobs_tensors.logprobs)
+        in_progress.selected_token_ranks[dst_start:dst_end].copy_(prompt_logprobs_tensors.selected_token_ranks)
+
+    def _get_completed_prompt_logprobs_tensors_for_scheduler(
+        self,
+        req_state: RequestState,
+        sequence_logits: Optional[np.ndarray],
+        start_idx: int,
+        scheduled_end: int,
+        cache_id: Optional[int] = None,
+        can_emit_output: bool = True,
+    ) -> Optional[LogprobsTensors]:
+        num_prompt_logprobs = self._num_prompt_logprobs(req_state.sampling_params)
+        if num_prompt_logprobs is None:
+            return None
+
+        first_prompt_pos = max(1, start_idx + 1, req_state.next_prompt_logprob_pos)
+        prompt_logprobs_tensors = self._get_prompt_logprobs_tensors_with_fallback(
+            req_state=req_state,
+            sequence_logits=sequence_logits,
+            start_idx=start_idx,
+            scheduled_end=scheduled_end,
+            cache_id=cache_id,
+        )
+        self._accumulate_prompt_logprobs_tensors(
+            req_state=req_state,
+            prompt_logprobs_tensors=prompt_logprobs_tensors,
+            first_prompt_pos=first_prompt_pos,
+        )
+
+        if scheduled_end < req_state.prompt_len:
+            return None
+
+        return self._pop_completed_prompt_logprobs_tensors_for_scheduler(
+            req_state=req_state,
+            can_emit_output=can_emit_output,
+        )
+
+    def _pop_completed_prompt_logprobs_tensors_for_scheduler(
+        self,
+        req_state: RequestState,
+        can_emit_output: bool,
+    ) -> Optional[LogprobsTensors]:
+        if not can_emit_output:
+            return None
+        if self._num_prompt_logprobs(req_state.sampling_params) is None:
+            return None
+        if req_state.next_prompt_logprob_pos < len(req_state.prompt_token_ids):
+            return None
+        completed_prompt_logprobs = req_state.in_progress_prompt_logprobs
+        req_state.in_progress_prompt_logprobs = None
+        return completed_prompt_logprobs
 
     @staticmethod
     def _should_sample_after_step(
@@ -1807,29 +2006,75 @@ class MbltWorker(WorkerBase):
                 cache_ids=cache_ids,
             )
 
+            fallback_sequence_logits = self._compute_prompt_logprobs_sequence_logits_fallback_batch(
+                [
+                    (
+                        i,
+                        self.req_states[req_id],
+                        cache_sizes[i],
+                        scheduled_end_positions[i],
+                        cache_ids[i],
+                    )
+                    for i, req_id in enumerate(req_ids)
+                    if batched_logits[i].full_sequence_logits is None
+                ]
+            )
+            restore_indices: list[int] = []
+            restore_start_positions: dict[int, int] = {}
+
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
-                prompt_logprobs_tensors = self._get_prompt_logprobs_tensors_with_fallback(
+                sequence_logits = batched_logits[i].full_sequence_logits
+                if sequence_logits is None:
+                    sequence_logits = fallback_sequence_logits.get(i)
+                    if sequence_logits is not None:
+                        prompt_end = min(scheduled_end_positions[i] + 1, req_state.prompt_len)
+                        restore_start = max(0, prompt_end - 1)
+                        if restore_start >= scheduled_end_positions[i]:
+                            batched_logits[i] = InferenceLogits(
+                                last_token_logits=np.asarray(sequence_logits)[-1, :],
+                                full_sequence_logits=sequence_logits,
+                            )
+                            sequence_lengths[i] = max(1, restore_start)
+                            next_cache_sizes[i] = restore_start
+                        else:
+                            restore_indices.append(i)
+                            restore_start_positions[i] = restore_start
+                self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
-                    sequence_logits=batched_logits[i].full_sequence_logits,
+                    sequence_logits=sequence_logits,
                     start_idx=cache_sizes[i],
                     scheduled_end=scheduled_end_positions[i],
                     cache_id=cache_ids[i],
+                    can_emit_output=False,
                 )
-                if batched_logits[i].full_sequence_logits is None and prompt_logprobs_tensors is not None:
-                    # The fallback replays prompt prefixes in this cache slot. Replay the
-                    # scheduled request from the beginning so the slot's live KV state and
-                    # generated-token logits match the actual request before sampling.
-                    input_embeds = self._build_input_embeds(req_state, 0, scheduled_end_positions[i])
-                    batched_logits[i] = self._infer_logits_batch_with_sequence(
-                        input_embeds_batch=[input_embeds],
-                        cache_sizes=[0],
-                        cache_ids=[cache_ids[i]],
-                    )[0]
+
+            for restore_start in range(0, len(restore_indices), self.max_batch_size):
+                restore_batch = restore_indices[restore_start : restore_start + self.max_batch_size]
+                restore_input_embeds_batch = [
+                    self._build_input_embeds(
+                        self.req_states[req_ids[i]],
+                        restore_start_positions[i],
+                        scheduled_end_positions[i],
+                    )
+                    for i in restore_batch
+                ]
+                restored_logits = self._infer_logits_batch_with_sequence(
+                    input_embeds_batch=restore_input_embeds_batch,
+                    cache_sizes=[restore_start_positions[i] for i in restore_batch],
+                    cache_ids=[cache_ids[i] for i in restore_batch],
+                )
+                for i, input_embeds, inference_logits in zip(
+                    restore_batch,
+                    restore_input_embeds_batch,
+                    restored_logits,
+                ):
+                    batched_logits[i] = inference_logits
                     sequence_lengths[i] = int(input_embeds.shape[0])
-                    next_cache_sizes[i] = sequence_lengths[i]
-                if prompt_logprobs_tensors is not None:
-                    prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
+                    next_cache_sizes[i] = restore_start_positions[i] + sequence_lengths[i]
+
+            for i, req_id in enumerate(req_ids):
+                req_state = self.req_states[req_id]
                 req_state.num_computed_tokens = next_cache_sizes[i]
                 self.runtime_cache.mark_slot_owner(cache_ids[i], req_id)
                 if self._should_sample_after_step(
@@ -1837,6 +2082,12 @@ class MbltWorker(WorkerBase):
                     scheduled_end_positions[i],
                     sequence_lengths[i],
                 ):
+                    prompt_logprobs_tensors = self._pop_completed_prompt_logprobs_tensors_for_scheduler(
+                        req_state=req_state,
+                        can_emit_output=True,
+                    )
+                    if prompt_logprobs_tensors is not None:
+                        prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                     logits_batch.append(torch.from_numpy(batched_logits[i].last_token_logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
@@ -1875,13 +2126,19 @@ class MbltWorker(WorkerBase):
                     deepstack_embeds,
                     cache_size=cache_size,
                 )
-                prompt_logprobs_tensors = self._get_prompt_logprobs_tensors_with_fallback(
+                prompt_logprob_pos_before = req_state.next_prompt_logprob_pos
+                self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
                     sequence_logits=inference_logits.full_sequence_logits,
                     start_idx=cache_size,
                     scheduled_end=scheduled_end,
+                    can_emit_output=False,
                 )
-                if inference_logits.full_sequence_logits is None and prompt_logprobs_tensors is not None:
+                prompt_logprob_fallback_replayed = (
+                    inference_logits.full_sequence_logits is None
+                    and req_state.next_prompt_logprob_pos > prompt_logprob_pos_before
+                )
+                if prompt_logprob_fallback_replayed:
                     # Last-token-only prompt-logprob fallback replays prompt prefixes from
                     # an empty runtime cache.  Re-run this request from the beginning of
                     # the scheduled prefix afterwards so live KV state and generated-token
@@ -1902,8 +2159,6 @@ class MbltWorker(WorkerBase):
                         deepstack_embeds,
                         cache_size=0,
                     )
-                if prompt_logprobs_tensors is not None:
-                    prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                 # The live accelerator KV now belongs to this request at
                 # next_cache_size tokens, so later same-request decode can reuse it
                 # without forcing a block-boundary snapshot dump.
@@ -1914,6 +2169,12 @@ class MbltWorker(WorkerBase):
                     scheduled_end,
                     sequence_length,
                 ):
+                    prompt_logprobs_tensors = self._pop_completed_prompt_logprobs_tensors_for_scheduler(
+                        req_state=req_state,
+                        can_emit_output=True,
+                    )
+                    if prompt_logprobs_tensors is not None:
+                        prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
                     logits_batch.append(torch.from_numpy(inference_logits.last_token_logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)

@@ -431,6 +431,99 @@ class TestMbltWorkerOptimizations:
             assert processor.prompt_logprobs[prompt_pos] is not None
             assert token_id in processor.prompt_logprobs[prompt_pos]
 
+    def test_prompt_logprobs_are_buffered_until_prefill_completion_for_scheduler(self) -> None:
+        worker = self._make_worker()
+        prompt_token_ids = [101, 102, 103, 104]
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        vocab_size = max(prompt_token_ids) + 1
+
+        first_chunk_logits = np.full((2, vocab_size), -10.0, dtype=np.float32)
+        first_chunk_logits[0, prompt_token_ids[1]] = 10.0
+        first_chunk_logits[1, prompt_token_ids[2]] = 10.0
+
+        first_scheduler_prompt_logprobs = worker._get_completed_prompt_logprobs_tensors_for_scheduler(
+            req_state=req_state,
+            sequence_logits=first_chunk_logits,
+            start_idx=0,
+            scheduled_end=2,
+        )
+
+        assert first_scheduler_prompt_logprobs is None
+        assert req_state.in_progress_prompt_logprobs is not None
+        assert req_state.next_prompt_logprob_pos == 3
+
+        second_chunk_logits = np.full((2, vocab_size), -10.0, dtype=np.float32)
+        second_chunk_logits[0, prompt_token_ids[3]] = 10.0
+
+        completed_prompt_logprobs = worker._get_completed_prompt_logprobs_tensors_for_scheduler(
+            req_state=req_state,
+            sequence_logits=second_chunk_logits,
+            start_idx=2,
+            scheduled_end=len(prompt_token_ids),
+        )
+
+        assert completed_prompt_logprobs is not None
+        assert completed_prompt_logprobs.logprob_token_ids.shape[0] == len(prompt_token_ids) - 1
+        assert req_state.in_progress_prompt_logprobs is None
+        assert req_state.next_prompt_logprob_pos == len(prompt_token_ids)
+
+        processor = LogprobsProcessor(
+            tokenizer=None,
+            logprobs=[],
+            prompt_logprobs=[None],
+            cumulative_logprob=0.0,
+            num_logprobs=1,
+            num_prompt_logprobs=1,
+        )
+        processor.update_from_output(
+            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=completed_prompt_logprobs)
+        )
+
+        assert processor.prompt_logprobs is not None
+        assert len(processor.prompt_logprobs) == len(prompt_token_ids)
+        assert processor.prompt_logprobs[0] is None
+        for prompt_pos, token_id in enumerate(prompt_token_ids[1:], start=1):
+            assert processor.prompt_logprobs[prompt_pos] is not None
+            assert token_id in processor.prompt_logprobs[prompt_pos]
+
+    def test_completed_prompt_logprobs_wait_for_scheduler_emitted_output(self) -> None:
+        worker = self._make_worker()
+        prompt_token_ids = [101, 102, 103, 104]
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        vocab_size = max(prompt_token_ids) + 1
+
+        logits = np.full((len(prompt_token_ids) - 1, vocab_size), -10.0, dtype=np.float32)
+        for row, token_id in enumerate(prompt_token_ids[1:]):
+            logits[row, token_id] = 10.0
+
+        non_emitting_step_prompt_logprobs = worker._get_completed_prompt_logprobs_tensors_for_scheduler(
+            req_state=req_state,
+            sequence_logits=logits,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+            can_emit_output=False,
+        )
+
+        assert non_emitting_step_prompt_logprobs is None
+        assert req_state.in_progress_prompt_logprobs is not None
+        assert req_state.next_prompt_logprob_pos == len(prompt_token_ids)
+
+        emitting_step_prompt_logprobs = worker._get_completed_prompt_logprobs_tensors_for_scheduler(
+            req_state=req_state,
+            sequence_logits=None,
+            start_idx=len(prompt_token_ids),
+            scheduled_end=len(prompt_token_ids) + 1,
+            can_emit_output=True,
+        )
+
+        assert emitting_step_prompt_logprobs is not None
+        assert emitting_step_prompt_logprobs.logprob_token_ids.shape[0] == len(prompt_token_ids) - 1
+        assert req_state.in_progress_prompt_logprobs is None
+
     def test_prompt_logprobs_replay_does_not_duplicate_emitted_positions(self) -> None:
         worker = self._make_worker()
         prompt_token_ids = [101, 102, 103, 104]
@@ -806,6 +899,73 @@ class TestMbltWorkerOptimizations:
         assert fallback_logits is not None
         assert fallback_logits.shape == (len(prompt_token_ids) - 1, vocab_size)
         assert calls == [(1, prompt_pos - 1, 7) for prompt_pos in range(1, len(prompt_token_ids))]
+
+    def test_prompt_logprobs_fallback_batches_replay_across_requests(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        prompt_token_ids_by_cache_id = {
+            11: [101, 102, 103, 104],
+            12: [201, 202, 203],
+            13: [301, 302, 303, 304],
+        }
+        req_states: list[RequestState] = []
+        for prompt_token_ids in prompt_token_ids_by_cache_id.values():
+            req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+            req_state.prompt_len = len(prompt_token_ids)
+            req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+            req_states.append(req_state)
+
+        vocab_size = 400
+        calls: list[tuple[tuple[int, int, int], ...]] = []
+
+        def infer_logits_batch(input_embeds_batch, cache_sizes, cache_ids):
+            calls.append(
+                tuple(
+                    (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
+                    for input_embeds, cache_size, cache_id in zip(input_embeds_batch, cache_sizes, cache_ids)
+                )
+            )
+            logits_batch = []
+            for input_embeds, cache_size, cache_id in zip(input_embeds_batch, cache_sizes, cache_ids):
+                prompt_pos = int(cache_size) + int(input_embeds.shape[0])
+                logits = np.full((vocab_size,), -10.0, dtype=np.float32)
+                logits[prompt_token_ids_by_cache_id[int(cache_id)][prompt_pos]] = 10.0
+                logits_batch.append(logits)
+            return logits_batch
+
+        worker._infer_logits_batch = infer_logits_batch
+
+        fallback_logits = worker._compute_prompt_logprobs_sequence_logits_fallback_batch(
+            [
+                (0, req_states[0], 0, req_states[0].prompt_len, 11),
+                (1, req_states[1], 0, req_states[1].prompt_len, 12),
+                (2, req_states[2], 0, req_states[2].prompt_len, 13),
+            ]
+        )
+
+        assert set(fallback_logits) == {0, 1, 2}
+        assert fallback_logits[0].shape == (3, vocab_size)
+        assert fallback_logits[1].shape == (2, vocab_size)
+        assert fallback_logits[2].shape == (3, vocab_size)
+        assert calls == [
+            ((1, 0, 11), (1, 0, 12)),
+            ((1, 0, 13),),
+            ((1, 1, 11), (1, 1, 12)),
+            ((1, 1, 13),),
+            ((1, 2, 11), (1, 2, 13)),
+        ]
+
+        for output_index, req_state in enumerate(req_states):
+            prompt_logprobs_tensors = worker._get_prompt_logprobs_tensors(
+                req_state=req_state,
+                sequence_logits=fallback_logits[output_index],
+                start_idx=0,
+                scheduled_end=req_state.prompt_len,
+            )
+            assert prompt_logprobs_tensors is not None
+            assert prompt_logprobs_tensors.logprob_token_ids.shape[0] == len(req_state.prompt_token_ids) - 1
+            assert req_state.next_prompt_logprob_pos == len(req_state.prompt_token_ids)
 
     def test_prompt_logprobs_unsupported_logits_shape_terminal_during_decode(self) -> None:
         worker = self._make_worker()
