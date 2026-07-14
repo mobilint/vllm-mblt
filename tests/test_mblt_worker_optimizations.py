@@ -686,6 +686,31 @@ class TestMbltWorkerOptimizations:
         assert not worker._should_sample_after_step(req_state, 3, 3)
         assert not worker._should_sample_after_step(req_state, 4, 0)
 
+    def test_generated_token_logprobs_are_log_softmax_normalized(self) -> None:
+        worker = self._make_worker()
+        sampling_params = SamplingParams.from_optional(temperature=0.0, logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, [1, 2])
+        sampling_metadata = worker._make_sampling_metadata([req_state])
+        logits = torch.tensor([[0.0, 5.0, 1.0]], dtype=torch.float32)
+
+        sampler_output = worker._sample_next_token(logits=logits, sampling_metadata=sampling_metadata)
+        assert sampler_output.logprobs_tensors is not None
+
+        logprobs_tensors = sampler_output.logprobs_tensors
+        expected_logprobs = torch.log_softmax(logits, dim=-1)
+        selected_token_id = int(sampler_output.sampled_token_ids[0, 0].item())
+
+        assert selected_token_id == 1
+        assert torch.all(logprobs_tensors.logprobs <= 0)
+        torch.testing.assert_close(
+            logprobs_tensors.logprobs[0, 0],
+            expected_logprobs[0, selected_token_id],
+        )
+        torch.testing.assert_close(
+            logprobs_tensors.logprobs[0, 1],
+            expected_logprobs[0, 1],
+        )
+
     def test_normalize_multimodal_embeddings_accepts_tensor_outputs(self) -> None:
         embeddings = torch.randn(2, 4)
         assert MbltWorker._normalize_multimodal_embeddings(embeddings) is embeddings

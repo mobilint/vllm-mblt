@@ -1241,6 +1241,19 @@ class MbltWorker(WorkerBase):
             return False
         return scheduled_end >= req_state.prompt_len
 
+    def _sample_next_token(self, logits: torch.Tensor, sampling_metadata: SamplingMetadata):
+        # OpenAI-compatible logprobs must be log-softmax-normalized
+        # probabilities, not raw logits. Keep the sampler's raw-logits default
+        # for generation behavior, but request normalized raw logprobs for the
+        # optional generated-token logprob tensors. The sampler only computes
+        # these when max_num_logprobs is not None, so normal generation without
+        # logprobs does not pay the log_softmax cost.
+        return self.sampler.forward(
+            logits=logits,
+            sampling_metadata=sampling_metadata,
+            logprobs_mode_override="raw_logprobs",
+        )
+
     def _load_snapshot_if_needed(
         self,
         req_id: str,
@@ -1890,7 +1903,7 @@ class MbltWorker(WorkerBase):
         if logits_batch:
             logits = torch.cat(logits_batch, dim=0)
             sampling_metadata = self._make_sampling_metadata(req_states_for_sampling)
-            sampler_output = self.sampler.forward(logits=logits, sampling_metadata=sampling_metadata)
+            sampler_output = self._sample_next_token(logits, sampling_metadata)
             sampled_token_ids_int: list[list[int]] = sampler_output.sampled_token_ids.tolist()
             for i, req_id in enumerate(sampling_req_ids):
                 self.req_states[req_id].output_token_ids.extend(sampled_token_ids_int[i])
