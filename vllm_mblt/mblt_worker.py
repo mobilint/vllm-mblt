@@ -1058,6 +1058,13 @@ class MbltWorker(WorkerBase):
             return int(self.model.config.vocab_size)
         return int(num_prompt_logprobs)
 
+    def _should_recompute_prompt_logprobs_from_start(self, req_state: RequestState) -> bool:
+        return (
+            self._num_prompt_logprobs(req_state.sampling_params) is not None
+            and req_state.next_prompt_logprob_pos <= 1
+            and req_state.num_computed_tokens > 0
+        )
+
     def _get_prompt_logprobs_tensors(
         self,
         req_state: RequestState,
@@ -1148,6 +1155,12 @@ class MbltWorker(WorkerBase):
             print_debug=print_debug,
         )
 
+        if self._should_recompute_prompt_logprobs_from_start(req_state):
+            self.runtime_cache.clear_loaded_request()
+            if print_debug:
+                print(f"[cache] req={req_id} bypass-prefix-cache-for-prompt-logprobs")
+            return 0
+
         target_tokens = req_state.num_computed_tokens
         result = self.runtime_cache.load_for_request(
             RuntimeCacheRequest(
@@ -1180,6 +1193,11 @@ class MbltWorker(WorkerBase):
     ) -> int:
         if slot_id is None:
             raise RuntimeError(f"Batch execution requires a cache slot for req_id={req_id}.")
+
+        if self._should_recompute_prompt_logprobs_from_start(req_state):
+            if print_debug:
+                print(f"[cache] req={req_id} slot={slot_id} bypass-prefix-cache-for-prompt-logprobs")
+            return 0
 
         target_tokens = req_state.num_computed_tokens
         result = self.runtime_cache.load_for_slot(

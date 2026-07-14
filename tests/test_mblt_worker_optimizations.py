@@ -137,6 +137,7 @@ class TestMbltWorkerOptimizations:
             cache_config=SimpleNamespace(block_size=128), model_config=worker.model_config
         )
         worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32000))
+        worker.max_batch_size = 1
         worker.empty_logits_processors = LogitsProcessors(None)
         worker.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
         worker.sampler = Sampler(logprobs_mode="raw_logits")
@@ -384,6 +385,50 @@ class TestMbltWorkerOptimizations:
 
         assert processor.prompt_logprobs is not None
         assert len(processor.prompt_logprobs) == len(prompt_token_ids)
+        for prompt_pos, token_id in enumerate(prompt_token_ids[1:], start=1):
+            assert processor.prompt_logprobs[prompt_pos] is not None
+            assert token_id in processor.prompt_logprobs[prompt_pos]
+
+    def test_prompt_logprobs_prefix_cache_hit_recomputes_from_start_for_contiguous_positions(self) -> None:
+        worker = self._make_worker()
+        prompt_token_ids = [101, 102, 103, 104]
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.num_computed_tokens = 2
+
+        cache_size = worker._load_snapshot_if_needed("req", req_state)
+        assert cache_size == 0
+
+        vocab_size = max(prompt_token_ids) + 1
+        sequence_logits = np.full((len(prompt_token_ids), vocab_size), -10.0, dtype=np.float32)
+        for prompt_pos, token_id in enumerate(prompt_token_ids[1:], start=1):
+            sequence_logits[prompt_pos - 1, token_id] = 10.0
+
+        prompt_logprobs_tensors = worker._get_prompt_logprobs_tensors(
+            req_state=req_state,
+            sequence_logits=sequence_logits,
+            start_idx=cache_size,
+            scheduled_end=len(prompt_token_ids),
+        )
+
+        assert prompt_logprobs_tensors is not None
+        assert prompt_logprobs_tensors.logprob_token_ids.shape[0] == len(prompt_token_ids) - 1
+
+        processor = LogprobsProcessor(
+            tokenizer=None,
+            logprobs=[],
+            prompt_logprobs=[None],
+            cumulative_logprob=0.0,
+            num_logprobs=1,
+            num_prompt_logprobs=1,
+        )
+        processor.update_from_output(
+            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors)
+        )
+
+        assert processor.prompt_logprobs is not None
+        assert len(processor.prompt_logprobs) == len(prompt_token_ids)
+        assert processor.prompt_logprobs[0] is None
         for prompt_pos, token_id in enumerate(prompt_token_ids[1:], start=1):
             assert processor.prompt_logprobs[prompt_pos] is not None
             assert token_id in processor.prompt_logprobs[prompt_pos]
