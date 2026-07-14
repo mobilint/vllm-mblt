@@ -114,6 +114,7 @@ class RequestState:
     prompt_token_ids: list[int]
     cache_slot_id: Optional[int]
     vlm_session_id: Optional[str]
+    next_prompt_logprob_pos: int = 1
 
 
 @dataclass
@@ -834,13 +835,17 @@ class MbltWorker(WorkerBase):
         return logits
 
     @staticmethod
-    def _normalize_sequence_logits(logits: np.ndarray) -> Optional[np.ndarray]:
+    def _normalize_sequence_logits(logits: np.ndarray, expected_seq_len: int) -> Optional[np.ndarray]:
         logits = np.asarray(logits)
         if logits.ndim == 3:
             if logits.shape[0] != 1:
                 return None
+            if logits.shape[1] != expected_seq_len:
+                return None
             return logits[0]
         if logits.ndim == 2:
+            if logits.shape[0] != expected_seq_len:
+                return None
             return logits
         return None
 
@@ -934,7 +939,7 @@ class MbltWorker(WorkerBase):
         logits_np = np.asarray(logits)
         return InferenceLogits(
             last_token_logits=self._last_token_logits(logits_np),
-            full_sequence_logits=self._normalize_sequence_logits(logits_np),
+            full_sequence_logits=self._normalize_sequence_logits(logits_np, expected_seq_len=int(input_embeds.shape[0])),
         )
 
     def _infer_logits_batch(
@@ -1091,7 +1096,7 @@ class MbltWorker(WorkerBase):
         # For prompt position i > 0, use logits produced while processing token
         # i - 1. There is intentionally no logprob for prompt token 0; vLLM's
         # LogprobsProcessor seeds prompt_logprobs with a leading None.
-        first_prompt_pos = max(1, start_idx + 1)
+        first_prompt_pos = max(1, start_idx + 1, req_state.next_prompt_logprob_pos)
         if prompt_end <= first_prompt_pos:
             return None
 
@@ -1110,6 +1115,7 @@ class MbltWorker(WorkerBase):
         prompt_logits = torch.from_numpy(sequence_logits[logits_start:logits_end]).to(dtype=torch.float32)
         target_token_ids = torch.as_tensor(prompt_token_ids[first_prompt_pos:prompt_end], dtype=torch.int64)
         logprobs = self.sampler.compute_logprobs(prompt_logits)
+        req_state.next_prompt_logprob_pos = prompt_end
         return self.sampler.gather_logprobs(logprobs, num_prompt_logprobs, target_token_ids)
 
     @staticmethod

@@ -334,6 +334,68 @@ class TestMbltWorkerOptimizations:
             assert processor.prompt_logprobs[prompt_pos] is not None
             assert token_id in processor.prompt_logprobs[prompt_pos]
 
+    def test_prompt_logprobs_replay_does_not_duplicate_emitted_positions(self) -> None:
+        worker = self._make_worker()
+        prompt_token_ids = [101, 102, 103, 104]
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        vocab_size = max(prompt_token_ids) + 1
+
+        first_chunk_logits = np.full((2, vocab_size), -10.0, dtype=np.float32)
+        first_chunk_logits[0, prompt_token_ids[1]] = 10.0
+        first_chunk_logits[1, prompt_token_ids[2]] = 10.0
+        first_chunk_prompt_logprobs = worker._get_prompt_logprobs_tensors(
+            req_state=req_state,
+            sequence_logits=first_chunk_logits,
+            start_idx=0,
+            scheduled_end=2,
+        )
+        assert first_chunk_prompt_logprobs is not None
+        assert first_chunk_prompt_logprobs.logprob_token_ids.shape[0] == 2
+
+        replay_logits = np.full((3, vocab_size), -10.0, dtype=np.float32)
+        replay_logits[0, prompt_token_ids[1]] = 10.0
+        replay_logits[1, prompt_token_ids[2]] = 10.0
+        replay_logits[2, prompt_token_ids[3]] = 10.0
+        replay_prompt_logprobs = worker._get_prompt_logprobs_tensors(
+            req_state=req_state,
+            sequence_logits=replay_logits,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+
+        assert replay_prompt_logprobs is not None
+        assert replay_prompt_logprobs.logprob_token_ids.shape[0] == 1
+
+        processor = LogprobsProcessor(
+            tokenizer=None,
+            logprobs=[],
+            prompt_logprobs=[None],
+            cumulative_logprob=0.0,
+            num_logprobs=1,
+            num_prompt_logprobs=1,
+        )
+        processor.update_from_output(
+            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=first_chunk_prompt_logprobs)
+        )
+        processor.update_from_output(
+            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=replay_prompt_logprobs)
+        )
+
+        assert processor.prompt_logprobs is not None
+        assert len(processor.prompt_logprobs) == len(prompt_token_ids)
+        for prompt_pos, token_id in enumerate(prompt_token_ids[1:], start=1):
+            assert processor.prompt_logprobs[prompt_pos] is not None
+            assert token_id in processor.prompt_logprobs[prompt_pos]
+
+    def test_2d_single_row_logits_are_not_treated_as_full_sequence_logits(self) -> None:
+        vocab_size = 8
+        last_token_logits = np.zeros((1, vocab_size), dtype=np.float32)
+
+        assert MbltWorker._normalize_sequence_logits(last_token_logits, expected_seq_len=2) is None
+        sequence_logits = MbltWorker._normalize_sequence_logits(last_token_logits, expected_seq_len=1)
+        assert sequence_logits is last_token_logits
+
     def test_sampling_penalties_can_be_forced_off_for_non_cuda_runtime(self) -> None:
         worker = self._make_worker()
         worker.enable_sampling_penalties = False
