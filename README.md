@@ -13,6 +13,7 @@
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/vllm-mblt?logo=python)](https://pypi.org/project/vllm-mblt/)
 [![vLLM](https://img.shields.io/badge/vLLM-0.11.2-blue)](https://github.com/vllm-project/vllm)
 [![Mobilint](https://img.shields.io/badge/Mobilint-NPU-green)](https://www.mobilint.com/)
+[![PyPI Downloads](https://static.pepy.tech/badge/vllm-mblt?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://clickpy.clickhouse.com/dashboard/vllm-mblt)
 
 </div>
 
