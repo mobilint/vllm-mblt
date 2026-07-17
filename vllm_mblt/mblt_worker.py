@@ -151,6 +151,31 @@ class PromptLogprobFallbackReplayState:
     rows: list[np.ndarray]
 
 
+@dataclass
+class PromptLogprobMicrostepState:
+    output_index: int
+    req_id: str
+    req_state: RequestState
+    start_idx: int
+    scheduled_end: int
+    cache_id: int
+    cache_size: int
+    prompt_logits_end: int
+    rows: list[np.ndarray]
+    last_token_logits: Optional[np.ndarray] = None
+
+
+@dataclass
+class NormalBatchChunkState:
+    output_index: int
+    input_embeds: np.ndarray
+    cache_id: int
+    cache_size: int
+    offset: int = 0
+    full_sequence_logits: Optional[list[np.ndarray]] = None
+    last_token_logits: Optional[np.ndarray] = None
+
+
 class MbltWorker(WorkerBase):
     MAX_FINISHED_CACHE_SNAPSHOTS = 16
 
@@ -171,6 +196,7 @@ class MbltWorker(WorkerBase):
 
         self.req_states: Dict[str, RequestState] = {}
         self._warned_batch_cache_snapshot_unsupported = False
+        self._warned_last_logit_prompt_logprobs = False
         self._vlm_image_positions_by_session: dict[str, tuple[int, int, Optional[tuple[bool, ...]]]] = {}
 
         self.max_batch_size = resolve_model_max_batch_size(self.vllm_config) or 1
@@ -395,6 +421,17 @@ class MbltWorker(WorkerBase):
                 cache_ids,
             )
         ]
+
+    def _normal_batch_chunk_token_cap(self) -> Optional[int]:
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        cap = getattr(scheduler_config, "long_prefill_token_threshold", None)
+        if cap is None:
+            return None
+        try:
+            cap = int(cap)
+        except (TypeError, ValueError):
+            return None
+        return cap if cap > 0 else None
 
     def _to_cpu_float32_numpy(self, tensor: torch.Tensor) -> np.ndarray:
         tensor = tensor.detach()
@@ -864,6 +901,62 @@ class MbltWorker(WorkerBase):
         return None
 
     @staticmethod
+    def _shape_dim_matches_sequence(dim: int, input_seq_len: int) -> bool:
+        return dim == -1 or dim == input_seq_len
+
+    def _runtime_output_logits_mode(self, input_seq_len: int) -> str:
+        """Best-effort classify MXQ logits as full-sequence, last-token, or unknown."""
+
+        cache_model = self._get_cache_model()
+        get_output_shape = getattr(cache_model, "get_model_output_shape", None)
+        if not callable(get_output_shape):
+            return "unknown"
+        try:
+            output_shapes = get_output_shape()
+        except Exception:
+            return "unknown"
+        if not output_shapes:
+            return "unknown"
+
+        output_shape = tuple(output_shapes[0])
+        if len(output_shape) == 3:
+            if self._is_batch_model():
+                return "unknown"
+            if self._shape_dim_matches_sequence(int(output_shape[1]), input_seq_len):
+                return "full_sequence"
+            if input_seq_len > 1 and int(output_shape[1]) == 1:
+                return "last_token"
+            return "unknown"
+        if len(output_shape) == 2:
+            if self._is_batch_model():
+                return "last_token"
+            if self._shape_dim_matches_sequence(int(output_shape[0]), input_seq_len):
+                return "full_sequence"
+            return "last_token"
+        return "unknown"
+
+    def _needs_last_logit_prompt_logprob_microsteps(
+        self,
+        req_state: RequestState,
+        sequence_length: int,
+    ) -> bool:
+        if self._num_prompt_logprobs(req_state.sampling_params) is None:
+            return False
+        if sequence_length <= 0:
+            return False
+        mode = self._runtime_output_logits_mode(sequence_length)
+        return mode != "full_sequence"
+
+    def _warn_last_logit_prompt_logprobs_once(self) -> None:
+        if getattr(self, "_warned_last_logit_prompt_logprobs", False):
+            return
+        logger.warning(
+            "Prompt logprobs on last-logit MBLT/MXQ outputs use a slower 1-token microstep path. "
+            "Compile or use a full-logits MXQ for faster prompt logprob serving."
+        )
+        self._warned_last_logit_prompt_logprobs = True
+
+    @staticmethod
     def _can_reuse_output_buffers(
         cache_model: Any,
         output_buffers: list[np.ndarray],
@@ -1063,6 +1156,97 @@ class MbltWorker(WorkerBase):
             )
         logits_np = logits_np.reshape(batch_size, -1)
         return [InferenceLogits(last_token_logits=logits_np[i], full_sequence_logits=None) for i in range(batch_size)]
+
+    def _infer_normal_logits_batch_chunked(
+        self,
+        output_indices: list[int],
+        input_embeds_batch: list[np.ndarray],
+        cache_sizes: list[int],
+        cache_ids: list[int],
+    ) -> dict[int, InferenceLogits]:
+        if not output_indices:
+            return {}
+        if not (
+            len(output_indices) == len(input_embeds_batch) == len(cache_sizes) == len(cache_ids)
+        ):
+            raise RuntimeError(
+                "Normal batch chunk inputs must have identical lengths: "
+                f"indices={len(output_indices)}, input_embeds={len(input_embeds_batch)}, "
+                f"cache_sizes={len(cache_sizes)}, cache_ids={len(cache_ids)}"
+            )
+
+        token_cap = self._normal_batch_chunk_token_cap()
+        states = [
+            NormalBatchChunkState(
+                output_index=output_index,
+                input_embeds=input_embeds,
+                cache_size=cache_size,
+                cache_id=cache_id,
+                full_sequence_logits=[],
+            )
+            for output_index, input_embeds, cache_size, cache_id in zip(
+                output_indices,
+                input_embeds_batch,
+                cache_sizes,
+                cache_ids,
+            )
+        ]
+
+        while True:
+            active_states = [state for state in states if state.offset < int(state.input_embeds.shape[0])]
+            if not active_states:
+                break
+
+            for batch_start in range(0, len(active_states), self.max_batch_size):
+                batch_states = active_states[batch_start : batch_start + self.max_batch_size]
+                chunk_embeds_batch: list[np.ndarray] = []
+                chunk_cache_sizes: list[int] = []
+                chunk_cache_ids: list[int] = []
+                for state in batch_states:
+                    remaining = int(state.input_embeds.shape[0]) - state.offset
+                    chunk_len = remaining if token_cap is None else min(remaining, token_cap)
+                    if chunk_len <= 0:
+                        continue
+                    chunk_start = state.offset
+                    chunk_end = chunk_start + chunk_len
+                    chunk_embeds_batch.append(state.input_embeds[chunk_start:chunk_end])
+                    chunk_cache_sizes.append(state.cache_size)
+                    chunk_cache_ids.append(state.cache_id)
+
+                if not chunk_embeds_batch:
+                    continue
+
+                logits_batch = self._infer_logits_batch_with_sequence(
+                    input_embeds_batch=chunk_embeds_batch,
+                    cache_sizes=chunk_cache_sizes,
+                    cache_ids=chunk_cache_ids,
+                )
+                for state, chunk_embeds, inference_logits in zip(batch_states, chunk_embeds_batch, logits_batch):
+                    chunk_len = int(chunk_embeds.shape[0])
+                    state.offset += chunk_len
+                    state.cache_size += chunk_len
+                    state.last_token_logits = inference_logits.last_token_logits
+                    if inference_logits.full_sequence_logits is None:
+                        state.full_sequence_logits = None
+                    elif state.full_sequence_logits is not None:
+                        state.full_sequence_logits.append(inference_logits.full_sequence_logits)
+
+        outputs: dict[int, InferenceLogits] = {}
+        for state in states:
+            if state.last_token_logits is None:
+                raise RuntimeError(f"Missing normal batched logits for output_index={state.output_index}.")
+            full_sequence_logits = None
+            if state.full_sequence_logits is not None:
+                full_sequence_logits = (
+                    np.concatenate(state.full_sequence_logits, axis=0)
+                    if state.full_sequence_logits
+                    else np.empty((0, int(state.last_token_logits.shape[0])), dtype=state.last_token_logits.dtype)
+                )
+            outputs[state.output_index] = InferenceLogits(
+                last_token_logits=state.last_token_logits,
+                full_sequence_logits=full_sequence_logits,
+            )
+        return outputs
 
     def _num_prompt_logprobs(self, sampling_params: SamplingParams) -> Optional[int]:
         num_prompt_logprobs = sampling_params.prompt_logprobs
@@ -1339,6 +1523,93 @@ class MbltWorker(WorkerBase):
             for state in states
             if state.rows
         }
+
+    def _run_prompt_logprob_microsteps_batch(
+        self,
+        requests: list[tuple[int, str, RequestState, int, int, int]],
+    ) -> dict[int, InferenceLogits]:
+        """Run scheduled prompt-logprob requests as 1-token batched steps.
+
+        Last-token-only MXQs cannot produce the per-position prompt logits from
+        a multi-token prefill.  This path advances the live request cache one
+        token at a time, preserving the final sampling logits while collecting
+        prompt-position logits from the same scheduled range.
+        """
+
+        states = [
+            PromptLogprobMicrostepState(
+                output_index=output_index,
+                req_id=req_id,
+                req_state=req_state,
+                start_idx=start_idx,
+                scheduled_end=scheduled_end,
+                cache_id=cache_id,
+                cache_size=start_idx,
+                prompt_logits_end=min(scheduled_end + 1, req_state.prompt_len),
+                rows=[],
+            )
+            for output_index, req_id, req_state, start_idx, scheduled_end, cache_id in requests
+            if scheduled_end > start_idx
+        ]
+        if not states:
+            return {}
+
+        if self.print_debug:
+            logger.info(
+                "[mblt-batch-debug] prompt-logprob microsteps: state_count=%d "
+                "max_batch_size=%d ranges=%s cache_sizes=%s",
+                len(states),
+                self.max_batch_size,
+                [
+                    (state.req_id, state.start_idx, state.scheduled_end, state.prompt_logits_end)
+                    for state in states
+                ],
+                [state.cache_size for state in states],
+            )
+        self._warn_last_logit_prompt_logprobs_once()
+
+        while True:
+            active_states = [state for state in states if state.cache_size < state.scheduled_end]
+            if not active_states:
+                break
+
+            for batch_start in range(0, len(active_states), self.max_batch_size):
+                batch_states = active_states[batch_start : batch_start + self.max_batch_size]
+                input_embeds_batch = [
+                    self._build_input_embeds(state.req_state, state.cache_size, state.cache_size + 1)
+                    for state in batch_states
+                ]
+                cache_sizes = [state.cache_size for state in batch_states]
+                cache_ids = [state.cache_id for state in batch_states]
+
+                logits_batch = self._infer_logits_batch(
+                    input_embeds_batch=input_embeds_batch,
+                    cache_sizes=cache_sizes,
+                    cache_ids=cache_ids,
+                )
+
+                for state, logits in zip(batch_states, logits_batch):
+                    logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1)
+                    prompt_pos = state.cache_size + 1
+                    if prompt_pos < state.prompt_logits_end:
+                        state.rows.append(logits_row)
+                    state.last_token_logits = logits_row
+                    state.cache_size += 1
+
+        outputs: dict[int, InferenceLogits] = {}
+        for state in states:
+            if state.last_token_logits is None:
+                continue
+            full_sequence_logits = (
+                np.stack(state.rows, axis=0)
+                if state.rows
+                else np.empty((0, int(state.last_token_logits.shape[0])), dtype=state.last_token_logits.dtype)
+            )
+            outputs[state.output_index] = InferenceLogits(
+                last_token_logits=state.last_token_logits,
+                full_sequence_logits=full_sequence_logits,
+            )
+        return outputs
 
     def _get_prompt_logprobs_tensors_with_fallback(
         self,
@@ -1960,6 +2231,19 @@ class MbltWorker(WorkerBase):
         prompt_logprobs_dict = {}
 
         if self._is_batch_model():
+            if print_debug:
+                logger.info(
+                    "[mblt-batch-debug] scheduler_output: batch_size=%d max_batch_size=%d "
+                    "max_num_batched_tokens=%s scheduled_tokens=%s cached_req_ids=%s "
+                    "new_req_count=%d finished_req_count=%d",
+                    batch_size,
+                    self.max_batch_size,
+                    getattr(self, "max_num_batched_tokens", None),
+                    dict(scheduler_output.num_scheduled_tokens),
+                    list(getattr(scheduler_output.scheduled_cached_reqs, "req_ids", []) or []),
+                    len(getattr(scheduler_output, "scheduled_new_reqs", []) or []),
+                    len(getattr(scheduler_output, "finished_req_ids", []) or []),
+                )
             if batch_size > self.max_batch_size:
                 raise RuntimeError(
                     "Scheduled batch exceeds compiled batch capacity: "
@@ -1969,6 +2253,8 @@ class MbltWorker(WorkerBase):
             input_embeds_batch: list[np.ndarray] = []
             cache_sizes: list[int] = []
             cache_ids: list[int] = []
+            microstep_indices: list[int] = []
+            normal_indices: list[int] = []
 
             for req_id, num_scheduled_token in scheduler_output.num_scheduled_tokens.items():
                 req_state = self.req_states[req_id]
@@ -2000,46 +2286,60 @@ class MbltWorker(WorkerBase):
                 cache_sizes.append(cache_size)
                 cache_ids.append(slot_id)
 
-            batched_logits = self._infer_logits_batch_with_sequence(
-                input_embeds_batch=input_embeds_batch,
-                cache_sizes=cache_sizes,
-                cache_ids=cache_ids,
-            )
+                if self._needs_last_logit_prompt_logprob_microsteps(req_state, sequence_length):
+                    microstep_indices.append(len(req_ids) - 1)
+                else:
+                    normal_indices.append(len(req_ids) - 1)
 
-            fallback_sequence_logits = self._compute_prompt_logprobs_sequence_logits_fallback_batch(
-                [
-                    (
-                        i,
-                        self.req_states[req_id],
-                        cache_sizes[i],
-                        scheduled_end_positions[i],
-                        cache_ids[i],
-                    )
-                    for i, req_id in enumerate(req_ids)
-                    if batched_logits[i].full_sequence_logits is None
-                ]
-            )
-            restore_indices: list[int] = []
-            restore_start_positions: dict[int, int] = {}
+            if print_debug:
+                logger.info(
+                    "[mblt-batch-debug] prepared batch: req_count=%d normal_count=%d "
+                    "microstep_count=%d sequence_lengths=%s cache_sizes=%s "
+                    "scheduled_end_positions=%s prompt_lens=%s next_prompt_logprob_pos=%s",
+                    len(req_ids),
+                    len(normal_indices),
+                    len(microstep_indices),
+                    sequence_lengths,
+                    cache_sizes,
+                    scheduled_end_positions,
+                    [self.req_states[req_id].prompt_len for req_id in req_ids],
+                    [self.req_states[req_id].next_prompt_logprob_pos for req_id in req_ids],
+                )
+            batched_logits: list[Optional[InferenceLogits]] = [None for _ in req_ids]
+
+            if normal_indices:
+                normal_logits = self._infer_normal_logits_batch_chunked(
+                    output_indices=normal_indices,
+                    input_embeds_batch=[input_embeds_batch[i] for i in normal_indices],
+                    cache_sizes=[cache_sizes[i] for i in normal_indices],
+                    cache_ids=[cache_ids[i] for i in normal_indices],
+                )
+                for i, inference_logits in normal_logits.items():
+                    batched_logits[i] = inference_logits
+
+            if microstep_indices:
+                microstep_logits = self._run_prompt_logprob_microsteps_batch(
+                    [
+                        (
+                            i,
+                            req_ids[i],
+                            self.req_states[req_ids[i]],
+                            cache_sizes[i],
+                            scheduled_end_positions[i],
+                            cache_ids[i],
+                        )
+                        for i in microstep_indices
+                    ]
+                )
+                for i, inference_logits in microstep_logits.items():
+                    batched_logits[i] = inference_logits
 
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
-                sequence_logits = batched_logits[i].full_sequence_logits
-                if sequence_logits is None:
-                    sequence_logits = fallback_sequence_logits.get(i)
-                    if sequence_logits is not None:
-                        prompt_end = min(scheduled_end_positions[i] + 1, req_state.prompt_len)
-                        restore_start = max(0, prompt_end - 1)
-                        if restore_start >= scheduled_end_positions[i]:
-                            batched_logits[i] = InferenceLogits(
-                                last_token_logits=np.asarray(sequence_logits)[-1, :],
-                                full_sequence_logits=sequence_logits,
-                            )
-                            sequence_lengths[i] = max(1, restore_start)
-                            next_cache_sizes[i] = restore_start
-                        else:
-                            restore_indices.append(i)
-                            restore_start_positions[i] = restore_start
+                inference_logits = batched_logits[i]
+                if inference_logits is None:
+                    raise RuntimeError(f"Missing batched logits for req_id={req_id}.")
+                sequence_logits = inference_logits.full_sequence_logits
                 self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
                     sequence_logits=sequence_logits,
@@ -2048,30 +2348,6 @@ class MbltWorker(WorkerBase):
                     cache_id=cache_ids[i],
                     can_emit_output=False,
                 )
-
-            for restore_start in range(0, len(restore_indices), self.max_batch_size):
-                restore_batch = restore_indices[restore_start : restore_start + self.max_batch_size]
-                restore_input_embeds_batch = [
-                    self._build_input_embeds(
-                        self.req_states[req_ids[i]],
-                        restore_start_positions[i],
-                        scheduled_end_positions[i],
-                    )
-                    for i in restore_batch
-                ]
-                restored_logits = self._infer_logits_batch_with_sequence(
-                    input_embeds_batch=restore_input_embeds_batch,
-                    cache_sizes=[restore_start_positions[i] for i in restore_batch],
-                    cache_ids=[cache_ids[i] for i in restore_batch],
-                )
-                for i, input_embeds, inference_logits in zip(
-                    restore_batch,
-                    restore_input_embeds_batch,
-                    restored_logits,
-                ):
-                    batched_logits[i] = inference_logits
-                    sequence_lengths[i] = int(input_embeds.shape[0])
-                    next_cache_sizes[i] = restore_start_positions[i] + sequence_lengths[i]
 
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
@@ -2088,7 +2364,10 @@ class MbltWorker(WorkerBase):
                     )
                     if prompt_logprobs_tensors is not None:
                         prompt_logprobs_dict[req_id] = prompt_logprobs_tensors
-                    logits_batch.append(torch.from_numpy(batched_logits[i].last_token_logits).reshape(1, -1))
+                    inference_logits = batched_logits[i]
+                    if inference_logits is None:
+                        raise RuntimeError(f"Missing sampling logits for req_id={req_id}.")
+                    logits_batch.append(torch.from_numpy(inference_logits.last_token_logits).reshape(1, -1))
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
         else:
@@ -2187,16 +2466,22 @@ class MbltWorker(WorkerBase):
             sampling_metadata = self._make_sampling_metadata(req_states_for_sampling)
             sampler_output = self._sample_next_token(logits, sampling_metadata)
             sampled_token_ids_int: list[list[int]] = sampler_output.sampled_token_ids.tolist()
+            generated_lengths_by_req_id: dict[str, int] = {}
             for i, req_id in enumerate(sampling_req_ids):
                 self.req_states[req_id].output_token_ids.extend(sampled_token_ids_int[i])
+                generated_lengths_by_req_id[req_id] = len(sampled_token_ids_int[i])
                 sampled_token_ids[req_id_to_index[req_id]] = np.asarray(
                     sampled_token_ids_int[i],
                     dtype=np.int64,
                 )
 
-            logprobs = (
-                sampler_output.logprobs_tensors.tolists() if sampler_output.logprobs_tensors is not None else None
-            )
+            if sampler_output.logprobs_tensors is not None:
+                cu_num_generated_tokens = [0]
+                for req_id in req_ids:
+                    cu_num_generated_tokens.append(
+                        cu_num_generated_tokens[-1] + generated_lengths_by_req_id.get(req_id, 0)
+                    )
+                logprobs = sampler_output.logprobs_tensors.tolists(cu_num_generated_tokens)
 
         if print_debug:
             print(req_ids, req_id_to_index, sampled_token_ids)
