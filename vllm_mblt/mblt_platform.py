@@ -229,6 +229,16 @@ class MbltPlatform(Platform):
         scheduler_config: SchedulerConfig = vllm_config.scheduler_config
 
         scheduler_config.chunked_prefill_enabled = True
+        logger.info(
+            "Initial scheduler prefill config: max_num_batched_tokens=%r, max_num_seqs=%r, "
+            "max_num_partial_prefills=%r, max_long_partial_prefills=%r, "
+            "long_prefill_token_threshold=%r.",
+            getattr(scheduler_config, "max_num_batched_tokens", None),
+            getattr(scheduler_config, "max_num_seqs", None),
+            getattr(scheduler_config, "max_num_partial_prefills", None),
+            getattr(scheduler_config, "max_long_partial_prefills", None),
+            getattr(scheduler_config, "long_prefill_token_threshold", None),
+        )
         resolved_max_batch_size = resolve_model_max_batch_size(vllm_config)
         effective_max_num_seqs = None
         if resolved_max_batch_size is not None:
@@ -280,4 +290,15 @@ class MbltPlatform(Platform):
                 scheduler_config.max_num_batched_tokens,
                 resolved_chunk_size,
             )
+        logger.info(
+            "Final scheduler prefill config: chunked_prefill_enabled=%r, "
+            "max_num_batched_tokens=%r, max_num_seqs=%r, max_num_partial_prefills=%r, "
+            "max_long_partial_prefills=%r, long_prefill_token_threshold=%r.",
+            getattr(scheduler_config, "chunked_prefill_enabled", None),
+            getattr(scheduler_config, "max_num_batched_tokens", None),
+            getattr(scheduler_config, "max_num_seqs", None),
+            getattr(scheduler_config, "max_num_partial_prefills", None),
+            getattr(scheduler_config, "max_long_partial_prefills", None),
+            getattr(scheduler_config, "long_prefill_token_threshold", None),
+        )
         return
