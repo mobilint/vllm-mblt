@@ -146,6 +146,7 @@ class TestMbltWorkerOptimizations:
         worker.sampler = Sampler(logprobs_mode="raw_logits")
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker.input_embeddings = SimpleNamespace()
+        worker.print_debug = False
         worker._warned_last_logit_prompt_logprobs = False
         worker._vlm_image_positions_by_session = {}
         return worker
