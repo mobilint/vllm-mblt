@@ -2349,16 +2349,22 @@ class MbltWorker(WorkerBase):
             sampling_metadata = self._make_sampling_metadata(req_states_for_sampling)
             sampler_output = self._sample_next_token(logits, sampling_metadata)
             sampled_token_ids_int: list[list[int]] = sampler_output.sampled_token_ids.tolist()
+            generated_lengths_by_req_id: dict[str, int] = {}
             for i, req_id in enumerate(sampling_req_ids):
                 self.req_states[req_id].output_token_ids.extend(sampled_token_ids_int[i])
+                generated_lengths_by_req_id[req_id] = len(sampled_token_ids_int[i])
                 sampled_token_ids[req_id_to_index[req_id]] = np.asarray(
                     sampled_token_ids_int[i],
                     dtype=np.int64,
                 )
 
-            logprobs = (
-                sampler_output.logprobs_tensors.tolists() if sampler_output.logprobs_tensors is not None else None
-            )
+            if sampler_output.logprobs_tensors is not None:
+                cu_num_generated_tokens = [0]
+                for req_id in req_ids:
+                    cu_num_generated_tokens.append(
+                        cu_num_generated_tokens[-1] + generated_lengths_by_req_id.get(req_id, 0)
+                    )
+                logprobs = sampler_output.logprobs_tensors.tolists(cu_num_generated_tokens)
 
         if print_debug:
             print(req_ids, req_id_to_index, sampled_token_ids)

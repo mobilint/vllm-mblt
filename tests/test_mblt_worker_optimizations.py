@@ -7,6 +7,7 @@ from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.logprobs import Logprob
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.logprobs import LogprobsProcessor, create_prompt_logprobs
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.sampler import Sampler
 
@@ -1121,6 +1122,67 @@ class TestMbltWorkerOptimizations:
         assert "prompt" in output.prompt_logprobs_dict
         assert output.sampled_token_ids[output.req_id_to_index["normal"]].tolist() == [7]
         assert output.sampled_token_ids[output.req_id_to_index["prompt"]].tolist() == [8]
+
+    def test_mixed_batch_logprobs_align_with_full_req_ids(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 3
+        worker.req_states = {}
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=3, block_size=128)
+        worker.print_debug = False
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(3, 16)])
+
+        sampling_params = SamplingParams.from_optional(temperature=0.0, logprobs=1)
+        prefill_state = self._make_request_state(worker, sampling_params, [1, 2, 3, 4, 5])
+        sample_a_state = self._make_request_state(worker, sampling_params, [6, 7, 8])
+        sample_b_state = self._make_request_state(worker, sampling_params, [9, 10, 11])
+        for slot_id, req_state in enumerate((prefill_state, sample_a_state, sample_b_state)):
+            req_state.prompt_embeds = np.ones((len(req_state.prompt_token_ids), 4), dtype=np.float32)
+            req_state.prompt_len = len(req_state.prompt_token_ids)
+            req_state.cache_slot_id = slot_id
+        worker.req_states = {
+            "prefill": prefill_state,
+            "sample-a": sample_a_state,
+            "sample-b": sample_b_state,
+        }
+
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+        worker._infer_logits_batch_with_sequence = lambda input_embeds_batch, cache_sizes, cache_ids: [
+            InferenceLogits(last_token_logits=np.zeros(16, dtype=np.float32), full_sequence_logits=None)
+            for _ in input_embeds_batch
+        ]
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[12], [13]], dtype=torch.int64),
+            logprobs_tensors=LogprobsTensors(
+                logprob_token_ids=torch.tensor([[12, 1], [13, 2]], dtype=torch.int32),
+                logprobs=torch.tensor([[-0.1, -1.0], [-0.2, -2.0]], dtype=torch.float32),
+                selected_token_ranks=torch.tensor([1, 1], dtype=torch.int32),
+            ),
+        )
+
+        output = worker.execute_model(
+            SimpleNamespace(
+                finished_req_ids=[],
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=[],
+                    num_computed_tokens=[],
+                    num_output_tokens=[],
+                    new_block_ids=[],
+                    resumed_req_ids=set(),
+                ),
+                num_scheduled_tokens={"prefill": 3, "sample-a": 3, "sample-b": 3},
+                kv_connector_metadata=None,
+            )
+        )
+
+        assert output is not None
+        assert output.req_ids == ["prefill", "sample-a", "sample-b"]
+        assert output.logprobs is not None
+        assert output.logprobs.cu_num_generated_tokens == [0, 0, 1, 2]
+        assert output.logprobs.slice(0, 1).logprob_token_ids.shape[0] == 0
+        assert output.logprobs.slice(1, 2).logprob_token_ids.tolist() == [[12, 1]]
+        assert output.logprobs.slice(2, 3).logprob_token_ids.tolist() == [[13, 2]]
 
     def test_last_logit_prompt_logprob_microstep_warning_emitted_once(self, caplog) -> None:
         worker = self._make_worker()
