@@ -22,6 +22,7 @@ def _make_vllm_config(
     scheduler_max_num_seqs=None,
     scheduler_max_num_partial_prefills=1,
     scheduler_max_long_partial_prefills=1,
+    scheduler_long_prefill_token_threshold=0,
 ):
     if loader_extra_config is None:
         loader_extra_config = {"core_mode": loader_core_mode} if loader_core_mode is not None else {}
@@ -34,6 +35,7 @@ def _make_vllm_config(
             max_num_seqs=scheduler_max_num_seqs,
             max_num_partial_prefills=scheduler_max_num_partial_prefills,
             max_long_partial_prefills=scheduler_max_long_partial_prefills,
+            long_prefill_token_threshold=scheduler_long_prefill_token_threshold,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
@@ -215,6 +217,7 @@ class TestMbltPlatformPrefill:
         assert config.scheduler_config.max_num_seqs == 32
         assert config.scheduler_config.max_num_partial_prefills == 32
         assert config.scheduler_config.max_long_partial_prefills == 32
+        assert config.scheduler_config.long_prefill_token_threshold == 128
 
     def test_platform_scales_scheduler_prefill_budget_for_batch_model(self) -> None:
         config = _make_vllm_config({"single": 256}, hf_core_mode="single", max_batch_size=16)
@@ -224,6 +227,7 @@ class TestMbltPlatformPrefill:
         assert config.scheduler_config.max_num_seqs == 16
         assert config.scheduler_config.max_num_partial_prefills == 16
         assert config.scheduler_config.max_long_partial_prefills == 16
+        assert config.scheduler_config.long_prefill_token_threshold == 128
 
     def test_platform_scales_scheduler_prefill_budget_for_user_seq_limit(self) -> None:
         config = _make_vllm_config(
@@ -238,6 +242,17 @@ class TestMbltPlatformPrefill:
         assert config.scheduler_config.max_num_seqs == 8
         assert config.scheduler_config.max_num_partial_prefills == 8
         assert config.scheduler_config.max_long_partial_prefills == 8
+        assert config.scheduler_config.long_prefill_token_threshold == 128
+
+    def test_platform_overrides_batch_long_prefill_threshold_to_chunk_size(self) -> None:
+        config = _make_vllm_config(
+            {"single": 256},
+            hf_core_mode="single",
+            max_batch_size=16,
+            scheduler_long_prefill_token_threshold=4096,
+        )
+        MbltPlatform.check_and_update_config(config)
+        assert config.scheduler_config.long_prefill_token_threshold == 128
 
     def test_platform_warns_when_max_num_seqs_exceeds_model_batch_size(self, caplog) -> None:
         caplog.set_level(logging.WARNING, logger="vllm_mblt.mblt_platform")

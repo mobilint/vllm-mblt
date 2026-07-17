@@ -274,6 +274,7 @@ class MbltPlatform(Platform):
 
         if effective_max_num_seqs is not None and effective_max_num_seqs > 1:
             scheduler_config.max_num_batched_tokens = resolved_chunk_size * effective_max_num_seqs
+            scheduler_config.long_prefill_token_threshold = resolved_chunk_size
             for attr_name in ("max_num_partial_prefills", "max_long_partial_prefills"):
                 current_value = _coerce_positive_int(getattr(scheduler_config, attr_name, None))
                 if current_value is None or current_value < effective_max_num_seqs:
