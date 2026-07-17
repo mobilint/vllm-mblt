@@ -11,6 +11,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_mblt.mblt_worker import (
+    InferenceLogits,
     MbltWorker,
     RequestState,
     _is_multimodal_hf_config,
@@ -137,11 +138,14 @@ class TestMbltWorkerOptimizations:
             cache_config=SimpleNamespace(block_size=128), model_config=worker.model_config
         )
         worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32000))
+        worker.cache_model = None
         worker.max_batch_size = 1
         worker.empty_logits_processors = LogitsProcessors(None)
         worker.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
         worker.sampler = Sampler(logprobs_mode="raw_logits")
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
+        worker.input_embeddings = SimpleNamespace()
+        worker._warned_last_logit_prompt_logprobs = False
         worker._vlm_image_positions_by_session = {}
         return worker
 
@@ -967,6 +971,182 @@ class TestMbltWorkerOptimizations:
             assert prompt_logprobs_tensors.logprob_token_ids.shape[0] == len(req_state.prompt_token_ids) - 1
             assert req_state.next_prompt_logprob_pos == len(req_state.prompt_token_ids)
 
+    def test_prompt_logprob_microsteps_do_not_submit_long_batch_param(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        prompt_token_ids = list(range(300))
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+
+        calls: list[tuple[int, int, int]] = []
+        vocab_size = 320
+
+        def infer(_inputs, *, params):
+            calls.extend(
+                (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
+                for param in params
+            )
+            return [np.zeros((len(params), vocab_size), dtype=np.float32)]
+
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(2, vocab_size)],
+        )
+
+        outputs = worker._run_prompt_logprob_microsteps_batch(
+            [(0, "req", req_state, 256, 258, 7)]
+        )
+
+        assert set(outputs) == {0}
+        assert calls == [(1, 256, 7), (1, 257, 7)]
+        assert all(sequence_length == 1 for sequence_length, _cache_size, _cache_id in calls)
+
+    def test_prompt_logprob_microsteps_batch_requests_up_to_max_batch_size(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_states: list[RequestState] = []
+        for base in (10, 20, 30):
+            prompt_token_ids = [base, base + 1, base + 2]
+            req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+            req_state.prompt_len = len(prompt_token_ids)
+            req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+            req_states.append(req_state)
+
+        calls: list[tuple[tuple[int, int, int], ...]] = []
+        vocab_size = 64
+
+        def infer(_inputs, *, params):
+            calls.append(
+                tuple(
+                    (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
+                    for param in params
+                )
+            )
+            return [np.zeros((len(params), vocab_size), dtype=np.float32)]
+
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(2, vocab_size)],
+        )
+
+        outputs = worker._run_prompt_logprob_microsteps_batch(
+            [
+                (0, "req-a", req_states[0], 0, 2, 11),
+                (1, "req-b", req_states[1], 0, 2, 12),
+                (2, "req-c", req_states[2], 0, 2, 13),
+            ]
+        )
+
+        assert set(outputs) == {0, 1, 2}
+        assert calls == [
+            ((1, 0, 11), (1, 0, 12)),
+            ((1, 0, 13),),
+            ((1, 1, 11), (1, 1, 12)),
+            ((1, 1, 13),),
+        ]
+
+    def test_mixed_batch_keeps_normal_chunk_and_microsteps_prompt_logprobs(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.req_states = {}
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.print_debug = False
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(2, 16)])
+
+        normal_params = SamplingParams.from_optional(temperature=0.0)
+        prompt_params = SamplingParams.from_optional(temperature=0.0, prompt_logprobs=1)
+        normal_state = self._make_request_state(worker, normal_params, [1, 2, 3])
+        prompt_state = self._make_request_state(worker, prompt_params, [4, 5, 6])
+        for slot_id, req_state in enumerate((normal_state, prompt_state)):
+            req_state.prompt_len = 3
+            req_state.prompt_embeds = np.ones((3, 4), dtype=np.float32)
+            req_state.cache_slot_id = slot_id
+        worker.req_states = {"normal": normal_state, "prompt": prompt_state}
+
+        chunk_calls: list[tuple[int, int, int]] = []
+        micro_calls: list[tuple[tuple[int, int, int], ...]] = []
+
+        def load_snapshot(_req_id, req_state, **_kwargs):
+            return int(req_state.num_computed_tokens)
+
+        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids):
+            chunk_calls.extend(
+                (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
+                for input_embeds, cache_size, cache_id in zip(input_embeds_batch, cache_sizes, cache_ids)
+            )
+            return [InferenceLogits(last_token_logits=np.zeros(16, dtype=np.float32), full_sequence_logits=None)]
+
+        def infer_micro(input_embeds_batch, cache_sizes, cache_ids):
+            micro_calls.append(
+                tuple(
+                    (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
+                    for input_embeds, cache_size, cache_id in zip(input_embeds_batch, cache_sizes, cache_ids)
+                )
+            )
+            return [np.zeros(16, dtype=np.float32) for _ in input_embeds_batch]
+
+        worker._load_snapshot_if_needed = load_snapshot
+        worker._infer_logits_batch_with_sequence = infer_chunk
+        worker._infer_logits_batch = infer_micro
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7], [8]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        output = worker.execute_model(
+            SimpleNamespace(
+                finished_req_ids=[],
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=[],
+                    num_computed_tokens=[],
+                    num_output_tokens=[],
+                    new_block_ids=[],
+                    resumed_req_ids=set(),
+                ),
+                num_scheduled_tokens={"normal": 3, "prompt": 3},
+                kv_connector_metadata=None,
+            )
+        )
+
+        assert output is not None
+        assert chunk_calls == [(3, 0, 0)]
+        assert micro_calls == [((1, 0, 1),), ((1, 1, 1),), ((1, 2, 1),)]
+        assert normal_state.num_computed_tokens == 3
+        assert prompt_state.num_computed_tokens == 3
+        assert "prompt" in output.prompt_logprobs_dict
+        assert output.sampled_token_ids[output.req_id_to_index["normal"]].tolist() == [7]
+        assert output.sampled_token_ids[output.req_id_to_index["prompt"]].tolist() == [8]
+
+    def test_last_logit_prompt_logprob_microstep_warning_emitted_once(self, caplog) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 1
+        sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
+        req_state = self._make_request_state(worker, sampling_params, [1, 2])
+        req_state.prompt_len = 2
+        req_state.prompt_embeds = np.ones((2, 4), dtype=np.float32)
+
+        worker.cache_model = SimpleNamespace(
+            infer=lambda _inputs, *, params: [np.zeros((len(params), 8), dtype=np.float32)],
+            get_model_output_shape=lambda: [(1, 8)],
+        )
+
+        caplog.set_level("WARNING")
+        worker._run_prompt_logprob_microsteps_batch([(0, "req", req_state, 0, 1, 0)])
+        worker._run_prompt_logprob_microsteps_batch([(0, "req", req_state, 1, 2, 0)])
+
+        warning_records = [
+            record
+            for record in caplog.records
+            if "Prompt logprobs on last-logit MBLT/MXQ outputs use a slower 1-token microstep path"
+            in record.getMessage()
+        ]
+        assert len(warning_records) == 1
+
     def test_prompt_logprobs_unsupported_logits_shape_terminal_during_decode(self) -> None:
         worker = self._make_worker()
         prompt_token_ids = [101, 102, 103]
@@ -993,6 +1173,13 @@ class TestMbltWorkerOptimizations:
         assert MbltWorker._normalize_sequence_logits(last_token_logits, expected_seq_len=2) is None
         sequence_logits = MbltWorker._normalize_sequence_logits(last_token_logits, expected_seq_len=1)
         assert sequence_logits is last_token_logits
+
+    def test_batch_2d_output_shape_is_treated_as_last_token_even_when_seq_len_matches_batch(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(2, 8)])
+
+        assert worker._runtime_output_logits_mode(input_seq_len=2) == "last_token"
 
     def test_sampling_penalties_can_be_forced_off_for_non_cuda_runtime(self) -> None:
         worker = self._make_worker()
