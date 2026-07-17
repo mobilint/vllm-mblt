@@ -229,6 +229,28 @@ class MbltPlatform(Platform):
         scheduler_config: SchedulerConfig = vllm_config.scheduler_config
 
         scheduler_config.chunked_prefill_enabled = True
+        resolved_max_batch_size = resolve_model_max_batch_size(vllm_config)
+        effective_max_num_seqs = None
+        if resolved_max_batch_size is not None:
+            configured_max_num_seqs = _coerce_positive_int(getattr(scheduler_config, "max_num_seqs", None))
+            if configured_max_num_seqs is None:
+                effective_max_num_seqs = resolved_max_batch_size
+            elif configured_max_num_seqs > resolved_max_batch_size:
+                logger.warning(
+                    "Clamping scheduler max_num_seqs from %d to model-configured max batch size %d.",
+                    configured_max_num_seqs,
+                    resolved_max_batch_size,
+                )
+                effective_max_num_seqs = resolved_max_batch_size
+            else:
+                effective_max_num_seqs = configured_max_num_seqs
+            scheduler_config.max_num_seqs = effective_max_num_seqs
+            logger.info(
+                "Using model-configured max batch size %d for scheduler max_num_seqs=%d.",
+                resolved_max_batch_size,
+                scheduler_config.max_num_seqs,
+            )
+
         model_chunk_size = resolve_npu_prefill_chunk_size(vllm_config)
         if model_chunk_size is None:
             resolved_chunk_size = 128
@@ -240,28 +262,22 @@ class MbltPlatform(Platform):
                 _resolve_core_mode(vllm_config),
             )
 
-        scheduler_config.max_num_batched_tokens = min(
-            scheduler_config.max_num_batched_tokens,
-            resolved_chunk_size,
-        )
-
-        resolved_max_batch_size = resolve_model_max_batch_size(vllm_config)
-        if resolved_max_batch_size is not None:
-            configured_max_num_seqs = _coerce_positive_int(getattr(scheduler_config, "max_num_seqs", None))
-            if configured_max_num_seqs is None:
-                scheduler_config.max_num_seqs = resolved_max_batch_size
-            elif configured_max_num_seqs > resolved_max_batch_size:
-                logger.warning(
-                    "Clamping scheduler max_num_seqs from %d to model-configured max batch size %d.",
-                    configured_max_num_seqs,
-                    resolved_max_batch_size,
-                )
-                scheduler_config.max_num_seqs = resolved_max_batch_size
-            else:
-                scheduler_config.max_num_seqs = configured_max_num_seqs
+        if effective_max_num_seqs is not None and effective_max_num_seqs > 1:
+            scheduler_config.max_num_batched_tokens = resolved_chunk_size * effective_max_num_seqs
+            for attr_name in ("max_num_partial_prefills", "max_long_partial_prefills"):
+                current_value = _coerce_positive_int(getattr(scheduler_config, attr_name, None))
+                if current_value is None or current_value < effective_max_num_seqs:
+                    setattr(scheduler_config, attr_name, effective_max_num_seqs)
             logger.info(
-                "Using model-configured max batch size %d for scheduler max_num_seqs=%d.",
-                resolved_max_batch_size,
-                scheduler_config.max_num_seqs,
+                "Using per-sequence chunk size %d across %d scheduler sequences "
+                "(max_num_batched_tokens=%d).",
+                resolved_chunk_size,
+                effective_max_num_seqs,
+                scheduler_config.max_num_batched_tokens,
+            )
+        else:
+            scheduler_config.max_num_batched_tokens = min(
+                scheduler_config.max_num_batched_tokens,
+                resolved_chunk_size,
             )
         return
