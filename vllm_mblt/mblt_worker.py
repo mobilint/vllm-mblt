@@ -1441,17 +1441,18 @@ class MbltWorker(WorkerBase):
         if not states:
             return {}
 
-        logger.info(
-            "[mblt-batch-debug] prompt-logprob microsteps: state_count=%d "
-            "max_batch_size=%d ranges=%s cache_sizes=%s",
-            len(states),
-            self.max_batch_size,
-            [
-                (state.req_id, state.start_idx, state.scheduled_end, state.prompt_logits_end)
-                for state in states
-            ],
-            [state.cache_size for state in states],
-        )
+        if self.print_debug:
+            logger.info(
+                "[mblt-batch-debug] prompt-logprob microsteps: state_count=%d "
+                "max_batch_size=%d ranges=%s cache_sizes=%s",
+                len(states),
+                self.max_batch_size,
+                [
+                    (state.req_id, state.start_idx, state.scheduled_end, state.prompt_logits_end)
+                    for state in states
+                ],
+                [state.cache_size for state in states],
+            )
         self._warn_last_logit_prompt_logprobs_once()
 
         while True:
@@ -2117,18 +2118,19 @@ class MbltWorker(WorkerBase):
         prompt_logprobs_dict = {}
 
         if self._is_batch_model():
-            logger.info(
-                "[mblt-batch-debug] scheduler_output: batch_size=%d max_batch_size=%d "
-                "max_num_batched_tokens=%s scheduled_tokens=%s cached_req_ids=%s "
-                "new_req_count=%d finished_req_count=%d",
-                batch_size,
-                self.max_batch_size,
-                getattr(self, "max_num_batched_tokens", None),
-                dict(scheduler_output.num_scheduled_tokens),
-                list(getattr(scheduler_output.scheduled_cached_reqs, "req_ids", []) or []),
-                len(getattr(scheduler_output, "scheduled_new_reqs", []) or []),
-                len(getattr(scheduler_output, "finished_req_ids", []) or []),
-            )
+            if print_debug:
+                logger.info(
+                    "[mblt-batch-debug] scheduler_output: batch_size=%d max_batch_size=%d "
+                    "max_num_batched_tokens=%s scheduled_tokens=%s cached_req_ids=%s "
+                    "new_req_count=%d finished_req_count=%d",
+                    batch_size,
+                    self.max_batch_size,
+                    getattr(self, "max_num_batched_tokens", None),
+                    dict(scheduler_output.num_scheduled_tokens),
+                    list(getattr(scheduler_output.scheduled_cached_reqs, "req_ids", []) or []),
+                    len(getattr(scheduler_output, "scheduled_new_reqs", []) or []),
+                    len(getattr(scheduler_output, "finished_req_ids", []) or []),
+                )
             if batch_size > self.max_batch_size:
                 raise RuntimeError(
                     "Scheduled batch exceeds compiled batch capacity: "
@@ -2176,19 +2178,20 @@ class MbltWorker(WorkerBase):
                 else:
                     normal_indices.append(len(req_ids) - 1)
 
-            logger.info(
-                "[mblt-batch-debug] prepared batch: req_count=%d normal_count=%d "
-                "microstep_count=%d sequence_lengths=%s cache_sizes=%s "
-                "scheduled_end_positions=%s prompt_lens=%s next_prompt_logprob_pos=%s",
-                len(req_ids),
-                len(normal_indices),
-                len(microstep_indices),
-                sequence_lengths,
-                cache_sizes,
-                scheduled_end_positions,
-                [self.req_states[req_id].prompt_len for req_id in req_ids],
-                [self.req_states[req_id].next_prompt_logprob_pos for req_id in req_ids],
-            )
+            if print_debug:
+                logger.info(
+                    "[mblt-batch-debug] prepared batch: req_count=%d normal_count=%d "
+                    "microstep_count=%d sequence_lengths=%s cache_sizes=%s "
+                    "scheduled_end_positions=%s prompt_lens=%s next_prompt_logprob_pos=%s",
+                    len(req_ids),
+                    len(normal_indices),
+                    len(microstep_indices),
+                    sequence_lengths,
+                    cache_sizes,
+                    scheduled_end_positions,
+                    [self.req_states[req_id].prompt_len for req_id in req_ids],
+                    [self.req_states[req_id].next_prompt_logprob_pos for req_id in req_ids],
+                )
             batched_logits: list[Optional[InferenceLogits]] = [None for _ in req_ids]
 
             if normal_indices:

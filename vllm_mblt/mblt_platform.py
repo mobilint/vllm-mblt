@@ -1,4 +1,5 @@
 import json
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -16,6 +17,11 @@ _MULTIMODAL_HF_MODEL_TYPES = frozenset(
         "mobilint-qwen3_vl",
     }
 )
+_TRUE_ENV_VALUES = {"1", "true", "TRUE", "True"}
+
+
+def _mblt_debug_enabled() -> bool:
+    return os.getenv("VLLM_MBLT_DEBUG", "0") in _TRUE_ENV_VALUES
 
 
 def _coerce_positive_int(value: object) -> int | None:
@@ -229,16 +235,18 @@ class MbltPlatform(Platform):
         scheduler_config: SchedulerConfig = vllm_config.scheduler_config
 
         scheduler_config.chunked_prefill_enabled = True
-        logger.info(
-            "Initial scheduler prefill config: max_num_batched_tokens=%r, max_num_seqs=%r, "
-            "max_num_partial_prefills=%r, max_long_partial_prefills=%r, "
-            "long_prefill_token_threshold=%r.",
-            getattr(scheduler_config, "max_num_batched_tokens", None),
-            getattr(scheduler_config, "max_num_seqs", None),
-            getattr(scheduler_config, "max_num_partial_prefills", None),
-            getattr(scheduler_config, "max_long_partial_prefills", None),
-            getattr(scheduler_config, "long_prefill_token_threshold", None),
-        )
+        print_debug = _mblt_debug_enabled()
+        if print_debug:
+            logger.info(
+                "Initial scheduler prefill config: max_num_batched_tokens=%r, max_num_seqs=%r, "
+                "max_num_partial_prefills=%r, max_long_partial_prefills=%r, "
+                "long_prefill_token_threshold=%r.",
+                getattr(scheduler_config, "max_num_batched_tokens", None),
+                getattr(scheduler_config, "max_num_seqs", None),
+                getattr(scheduler_config, "max_num_partial_prefills", None),
+                getattr(scheduler_config, "max_long_partial_prefills", None),
+                getattr(scheduler_config, "long_prefill_token_threshold", None),
+            )
         resolved_max_batch_size = resolve_model_max_batch_size(vllm_config)
         effective_max_num_seqs = None
         if resolved_max_batch_size is not None:
@@ -279,27 +287,29 @@ class MbltPlatform(Platform):
                 current_value = _coerce_positive_int(getattr(scheduler_config, attr_name, None))
                 if current_value is None or current_value < effective_max_num_seqs:
                     setattr(scheduler_config, attr_name, effective_max_num_seqs)
-            logger.info(
-                "Using per-sequence chunk size %d across %d scheduler sequences "
-                "(max_num_batched_tokens=%d).",
-                resolved_chunk_size,
-                effective_max_num_seqs,
-                scheduler_config.max_num_batched_tokens,
-            )
+            if print_debug:
+                logger.info(
+                    "Using per-sequence chunk size %d across %d scheduler sequences "
+                    "(max_num_batched_tokens=%d).",
+                    resolved_chunk_size,
+                    effective_max_num_seqs,
+                    scheduler_config.max_num_batched_tokens,
+                )
         else:
             scheduler_config.max_num_batched_tokens = min(
                 scheduler_config.max_num_batched_tokens,
                 resolved_chunk_size,
             )
-        logger.info(
-            "Final scheduler prefill config: chunked_prefill_enabled=%r, "
-            "max_num_batched_tokens=%r, max_num_seqs=%r, max_num_partial_prefills=%r, "
-            "max_long_partial_prefills=%r, long_prefill_token_threshold=%r.",
-            getattr(scheduler_config, "chunked_prefill_enabled", None),
-            getattr(scheduler_config, "max_num_batched_tokens", None),
-            getattr(scheduler_config, "max_num_seqs", None),
-            getattr(scheduler_config, "max_num_partial_prefills", None),
-            getattr(scheduler_config, "max_long_partial_prefills", None),
-            getattr(scheduler_config, "long_prefill_token_threshold", None),
-        )
+        if print_debug:
+            logger.info(
+                "Final scheduler prefill config: chunked_prefill_enabled=%r, "
+                "max_num_batched_tokens=%r, max_num_seqs=%r, max_num_partial_prefills=%r, "
+                "max_long_partial_prefills=%r, long_prefill_token_threshold=%r.",
+                getattr(scheduler_config, "chunked_prefill_enabled", None),
+                getattr(scheduler_config, "max_num_batched_tokens", None),
+                getattr(scheduler_config, "max_num_seqs", None),
+                getattr(scheduler_config, "max_num_partial_prefills", None),
+                getattr(scheduler_config, "max_long_partial_prefills", None),
+                getattr(scheduler_config, "long_prefill_token_threshold", None),
+            )
         return
