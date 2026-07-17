@@ -1181,6 +1181,28 @@ class TestMbltWorkerOptimizations:
 
         assert worker._runtime_output_logits_mode(input_seq_len=2) == "last_token"
 
+    def test_batch_3d_output_shape_does_not_force_full_sequence_mode(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 16
+
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, 128, 8)])
+        assert worker._runtime_output_logits_mode(input_seq_len=128) == "unknown"
+
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, -1, 8)])
+        assert worker._runtime_output_logits_mode(input_seq_len=128) == "unknown"
+
+    def test_batch_3d_prompt_logprobs_use_microsteps(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 16
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, 128, 8)])
+        req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(prompt_logprobs=1),
+            list(range(512)),
+        )
+
+        assert worker._needs_last_logit_prompt_logprob_microsteps(req_state, sequence_length=128)
+
     def test_sampling_penalties_can_be_forced_off_for_non_cuda_runtime(self) -> None:
         worker = self._make_worker()
         worker.enable_sampling_penalties = False

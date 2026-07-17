@@ -898,6 +898,8 @@ class MbltWorker(WorkerBase):
 
         output_shape = tuple(output_shapes[0])
         if len(output_shape) == 3:
+            if self._is_batch_model():
+                return "unknown"
             if self._shape_dim_matches_sequence(int(output_shape[1]), input_seq_len):
                 return "full_sequence"
             if input_seq_len > 1 and int(output_shape[1]) == 1:
