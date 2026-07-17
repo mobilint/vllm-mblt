@@ -136,7 +136,9 @@ class TestMbltWorkerOptimizations:
         worker = MbltWorker.__new__(MbltWorker)
         worker.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen2"))
         worker.vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=128), model_config=worker.model_config
+            cache_config=SimpleNamespace(block_size=128),
+            model_config=worker.model_config,
+            scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         )
         worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32000))
         worker.cache_model = None
@@ -150,6 +152,21 @@ class TestMbltWorkerOptimizations:
         worker._warned_last_logit_prompt_logprobs = False
         worker._vlm_image_positions_by_session = {}
         return worker
+
+    def _make_scheduler_output(self, num_scheduled_tokens: dict[str, int]) -> SimpleNamespace:
+        return SimpleNamespace(
+            finished_req_ids=[],
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                num_computed_tokens=[],
+                num_output_tokens=[],
+                new_block_ids=[],
+                resumed_req_ids=set(),
+            ),
+            num_scheduled_tokens=num_scheduled_tokens,
+            kv_connector_metadata=None,
+        )
 
     def _make_request_state(
         self,
@@ -1050,9 +1067,115 @@ class TestMbltWorkerOptimizations:
             ((1, 1, 13),),
         ]
 
-    def test_mixed_batch_keeps_normal_chunk_and_microsteps_prompt_logprobs(self) -> None:
+    def test_normal_long_prefill_is_submitted_in_per_request_chunks(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 4
+        worker.vllm_config.scheduler_config.long_prefill_token_threshold = 128
+        worker.req_states = {}
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=4, block_size=128)
+        worker.print_debug = False
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(4, 16)])
+
+        sampling_params = SamplingParams.from_optional(temperature=0.0)
+        req_state = self._make_request_state(worker, sampling_params, list(range(300)))
+        req_state.prompt_len = 300
+        req_state.prompt_embeds = np.ones((300, 4), dtype=np.float32)
+        req_state.cache_slot_id = 0
+        worker.req_states = {"long": req_state}
+
+        calls: list[tuple[tuple[int, int, int], ...]] = []
+
+        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids):
+            calls.append(
+                tuple(
+                    (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
+                    for input_embeds, cache_size, cache_id in zip(input_embeds_batch, cache_sizes, cache_ids)
+                )
+            )
+            return [
+                InferenceLogits(
+                    last_token_logits=np.full(16, int(cache_size) + int(input_embeds.shape[0]), dtype=np.float32),
+                    full_sequence_logits=np.zeros((int(input_embeds.shape[0]), 16), dtype=np.float32),
+                )
+                for input_embeds, cache_size in zip(input_embeds_batch, cache_sizes)
+            ]
+
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+        worker._infer_logits_batch_with_sequence = infer_chunk
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[9]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        output = worker.execute_model(self._make_scheduler_output({"long": 300}))
+
+        assert output is not None
+        assert calls == [((128, 0, 0),), ((128, 128, 0),), ((44, 256, 0),)]
+        assert max(sequence_length for call in calls for sequence_length, _cache_size, _cache_id in call) <= 128
+        assert req_state.num_computed_tokens == 300
+        assert output.sampled_token_ids[output.req_id_to_index["long"]].tolist() == [9]
+
+    def test_multiple_normal_long_prefills_are_grouped_per_chunk(self) -> None:
         worker = self._make_worker()
         worker.max_batch_size = 2
+        worker.vllm_config.scheduler_config.long_prefill_token_threshold = 128
+        worker.req_states = {}
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.print_debug = False
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(2, 16)])
+
+        sampling_params = SamplingParams.from_optional(temperature=0.0)
+        req_a_state = self._make_request_state(worker, sampling_params, list(range(260)))
+        req_b_state = self._make_request_state(worker, sampling_params, list(range(1000, 1260)))
+        for slot_id, req_state in enumerate((req_a_state, req_b_state)):
+            req_state.prompt_len = 260
+            req_state.prompt_embeds = np.ones((260, 4), dtype=np.float32)
+            req_state.cache_slot_id = slot_id
+        worker.req_states = {"req-a": req_a_state, "req-b": req_b_state}
+
+        calls: list[tuple[tuple[int, int, int], ...]] = []
+
+        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids):
+            calls.append(
+                tuple(
+                    (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
+                    for input_embeds, cache_size, cache_id in zip(input_embeds_batch, cache_sizes, cache_ids)
+                )
+            )
+            return [
+                InferenceLogits(
+                    last_token_logits=np.full(16, int(cache_id), dtype=np.float32),
+                    full_sequence_logits=None,
+                )
+                for cache_id in cache_ids
+            ]
+
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+        worker._infer_logits_batch_with_sequence = infer_chunk
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7], [8]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        output = worker.execute_model(self._make_scheduler_output({"req-a": 260, "req-b": 260}))
+
+        assert output is not None
+        assert calls == [
+            ((128, 0, 0), (128, 0, 1)),
+            ((128, 128, 0), (128, 128, 1)),
+            ((4, 256, 0), (4, 256, 1)),
+        ]
+        assert req_a_state.num_computed_tokens == 260
+        assert req_b_state.num_computed_tokens == 260
+        assert output.sampled_token_ids[output.req_id_to_index["req-a"]].tolist() == [7]
+        assert output.sampled_token_ids[output.req_id_to_index["req-b"]].tolist() == [8]
+
+    def test_mixed_batch_keeps_normal_chunks_and_microsteps_prompt_logprobs_in_order(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.vllm_config.scheduler_config.long_prefill_token_threshold = 128
         worker.req_states = {}
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
         worker.print_debug = False
@@ -1060,11 +1183,13 @@ class TestMbltWorkerOptimizations:
 
         normal_params = SamplingParams.from_optional(temperature=0.0)
         prompt_params = SamplingParams.from_optional(temperature=0.0, prompt_logprobs=1)
-        normal_state = self._make_request_state(worker, normal_params, [1, 2, 3])
+        normal_state = self._make_request_state(worker, normal_params, list(range(260)))
         prompt_state = self._make_request_state(worker, prompt_params, [4, 5, 6])
+        normal_state.prompt_len = 260
+        normal_state.prompt_embeds = np.ones((260, 4), dtype=np.float32)
+        prompt_state.prompt_len = 3
+        prompt_state.prompt_embeds = np.ones((3, 4), dtype=np.float32)
         for slot_id, req_state in enumerate((normal_state, prompt_state)):
-            req_state.prompt_len = 3
-            req_state.prompt_embeds = np.ones((3, 4), dtype=np.float32)
             req_state.cache_slot_id = slot_id
         worker.req_states = {"normal": normal_state, "prompt": prompt_state}
 
@@ -1079,7 +1204,10 @@ class TestMbltWorkerOptimizations:
                 (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
                 for input_embeds, cache_size, cache_id in zip(input_embeds_batch, cache_sizes, cache_ids)
             )
-            return [InferenceLogits(last_token_logits=np.zeros(16, dtype=np.float32), full_sequence_logits=None)]
+            return [
+                InferenceLogits(last_token_logits=np.zeros(16, dtype=np.float32), full_sequence_logits=None)
+                for _input_embeds in input_embeds_batch
+            ]
 
         def infer_micro(input_embeds_batch, cache_sizes, cache_ids):
             micro_calls.append(
@@ -1110,17 +1238,18 @@ class TestMbltWorkerOptimizations:
                     new_block_ids=[],
                     resumed_req_ids=set(),
                 ),
-                num_scheduled_tokens={"normal": 3, "prompt": 3},
+                num_scheduled_tokens={"normal": 260, "prompt": 3},
                 kv_connector_metadata=None,
             )
         )
 
         assert output is not None
-        assert chunk_calls == [(3, 0, 0)]
+        assert chunk_calls == [(128, 0, 0), (128, 128, 0), (4, 256, 0)]
         assert micro_calls == [((1, 0, 1),), ((1, 1, 1),), ((1, 2, 1),)]
-        assert normal_state.num_computed_tokens == 3
+        assert normal_state.num_computed_tokens == 260
         assert prompt_state.num_computed_tokens == 3
         assert "prompt" in output.prompt_logprobs_dict
+        assert output.req_ids == ["normal", "prompt"]
         assert output.sampled_token_ids[output.req_id_to_index["normal"]].tolist() == [7]
         assert output.sampled_token_ids[output.req_id_to_index["prompt"]].tolist() == [8]
 

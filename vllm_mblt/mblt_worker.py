@@ -165,6 +165,17 @@ class PromptLogprobMicrostepState:
     last_token_logits: Optional[np.ndarray] = None
 
 
+@dataclass
+class NormalBatchChunkState:
+    output_index: int
+    input_embeds: np.ndarray
+    cache_id: int
+    cache_size: int
+    offset: int = 0
+    full_sequence_logits: Optional[list[np.ndarray]] = None
+    last_token_logits: Optional[np.ndarray] = None
+
+
 class MbltWorker(WorkerBase):
     MAX_FINISHED_CACHE_SNAPSHOTS = 16
 
@@ -410,6 +421,17 @@ class MbltWorker(WorkerBase):
                 cache_ids,
             )
         ]
+
+    def _normal_batch_chunk_token_cap(self) -> Optional[int]:
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        cap = getattr(scheduler_config, "long_prefill_token_threshold", None)
+        if cap is None:
+            return None
+        try:
+            cap = int(cap)
+        except (TypeError, ValueError):
+            return None
+        return cap if cap > 0 else None
 
     def _to_cpu_float32_numpy(self, tensor: torch.Tensor) -> np.ndarray:
         tensor = tensor.detach()
@@ -1134,6 +1156,97 @@ class MbltWorker(WorkerBase):
             )
         logits_np = logits_np.reshape(batch_size, -1)
         return [InferenceLogits(last_token_logits=logits_np[i], full_sequence_logits=None) for i in range(batch_size)]
+
+    def _infer_normal_logits_batch_chunked(
+        self,
+        output_indices: list[int],
+        input_embeds_batch: list[np.ndarray],
+        cache_sizes: list[int],
+        cache_ids: list[int],
+    ) -> dict[int, InferenceLogits]:
+        if not output_indices:
+            return {}
+        if not (
+            len(output_indices) == len(input_embeds_batch) == len(cache_sizes) == len(cache_ids)
+        ):
+            raise RuntimeError(
+                "Normal batch chunk inputs must have identical lengths: "
+                f"indices={len(output_indices)}, input_embeds={len(input_embeds_batch)}, "
+                f"cache_sizes={len(cache_sizes)}, cache_ids={len(cache_ids)}"
+            )
+
+        token_cap = self._normal_batch_chunk_token_cap()
+        states = [
+            NormalBatchChunkState(
+                output_index=output_index,
+                input_embeds=input_embeds,
+                cache_size=cache_size,
+                cache_id=cache_id,
+                full_sequence_logits=[],
+            )
+            for output_index, input_embeds, cache_size, cache_id in zip(
+                output_indices,
+                input_embeds_batch,
+                cache_sizes,
+                cache_ids,
+            )
+        ]
+
+        while True:
+            active_states = [state for state in states if state.offset < int(state.input_embeds.shape[0])]
+            if not active_states:
+                break
+
+            for batch_start in range(0, len(active_states), self.max_batch_size):
+                batch_states = active_states[batch_start : batch_start + self.max_batch_size]
+                chunk_embeds_batch: list[np.ndarray] = []
+                chunk_cache_sizes: list[int] = []
+                chunk_cache_ids: list[int] = []
+                for state in batch_states:
+                    remaining = int(state.input_embeds.shape[0]) - state.offset
+                    chunk_len = remaining if token_cap is None else min(remaining, token_cap)
+                    if chunk_len <= 0:
+                        continue
+                    chunk_start = state.offset
+                    chunk_end = chunk_start + chunk_len
+                    chunk_embeds_batch.append(state.input_embeds[chunk_start:chunk_end])
+                    chunk_cache_sizes.append(state.cache_size)
+                    chunk_cache_ids.append(state.cache_id)
+
+                if not chunk_embeds_batch:
+                    continue
+
+                logits_batch = self._infer_logits_batch_with_sequence(
+                    input_embeds_batch=chunk_embeds_batch,
+                    cache_sizes=chunk_cache_sizes,
+                    cache_ids=chunk_cache_ids,
+                )
+                for state, chunk_embeds, inference_logits in zip(batch_states, chunk_embeds_batch, logits_batch):
+                    chunk_len = int(chunk_embeds.shape[0])
+                    state.offset += chunk_len
+                    state.cache_size += chunk_len
+                    state.last_token_logits = inference_logits.last_token_logits
+                    if inference_logits.full_sequence_logits is None:
+                        state.full_sequence_logits = None
+                    elif state.full_sequence_logits is not None:
+                        state.full_sequence_logits.append(inference_logits.full_sequence_logits)
+
+        outputs: dict[int, InferenceLogits] = {}
+        for state in states:
+            if state.last_token_logits is None:
+                raise RuntimeError(f"Missing normal batched logits for output_index={state.output_index}.")
+            full_sequence_logits = None
+            if state.full_sequence_logits is not None:
+                full_sequence_logits = (
+                    np.concatenate(state.full_sequence_logits, axis=0)
+                    if state.full_sequence_logits
+                    else np.empty((0, int(state.last_token_logits.shape[0])), dtype=state.last_token_logits.dtype)
+                )
+            outputs[state.output_index] = InferenceLogits(
+                last_token_logits=state.last_token_logits,
+                full_sequence_logits=full_sequence_logits,
+            )
+        return outputs
 
     def _num_prompt_logprobs(self, sampling_params: SamplingParams) -> Optional[int]:
         num_prompt_logprobs = sampling_params.prompt_logprobs
@@ -2195,12 +2308,13 @@ class MbltWorker(WorkerBase):
             batched_logits: list[Optional[InferenceLogits]] = [None for _ in req_ids]
 
             if normal_indices:
-                normal_logits = self._infer_logits_batch_with_sequence(
+                normal_logits = self._infer_normal_logits_batch_chunked(
+                    output_indices=normal_indices,
                     input_embeds_batch=[input_embeds_batch[i] for i in normal_indices],
                     cache_sizes=[cache_sizes[i] for i in normal_indices],
                     cache_ids=[cache_ids[i] for i in normal_indices],
                 )
-                for i, inference_logits in zip(normal_indices, normal_logits):
+                for i, inference_logits in normal_logits.items():
                     batched_logits[i] = inference_logits
 
             if microstep_indices:

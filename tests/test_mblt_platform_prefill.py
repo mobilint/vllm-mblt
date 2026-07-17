@@ -229,6 +229,12 @@ class TestMbltPlatformPrefill:
         assert config.scheduler_config.max_long_partial_prefills == 16
         assert config.scheduler_config.long_prefill_token_threshold == 128
 
+    def test_platform_keeps_aggregate_budget_and_per_request_worker_cap_for_batch_model(self) -> None:
+        config = _make_vllm_config({"single": 256}, hf_core_mode="single", max_batch_size=16)
+        MbltPlatform.check_and_update_config(config)
+        assert config.scheduler_config.max_num_batched_tokens == 128 * 16
+        assert config.scheduler_config.long_prefill_token_threshold == 128
+
     def test_platform_scales_scheduler_prefill_budget_for_user_seq_limit(self) -> None:
         config = _make_vllm_config(
             {"single": 256},
