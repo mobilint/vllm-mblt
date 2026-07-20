@@ -1366,6 +1366,211 @@ class TestMbltWorkerOptimizations:
         sequence_logits = MbltWorker._normalize_sequence_logits(last_token_logits, expected_seq_len=1)
         assert sequence_logits is last_token_logits
 
+    def test_runtime_last_token_shape_is_not_prompt_sequence_logits_for_batch1_single_core(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 1
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, 8)])
+        last_token_logits = np.zeros((1, 8), dtype=np.float32)
+
+        assert worker._runtime_output_logits_mode(input_seq_len=1) == "last_token"
+        assert worker._normalize_runtime_sequence_logits(last_token_logits, expected_seq_len=1) is None
+
+    def test_runtime_full_sequence_shape_is_preserved_for_prompt_logprobs(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 1
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(-1, 8)])
+        sequence_logits = np.zeros((3, 8), dtype=np.float32)
+
+        normalized = worker._normalize_runtime_sequence_logits(sequence_logits, expected_seq_len=3)
+
+        assert normalized is sequence_logits
+
+    def test_batch1_single_core_echo_prompt_logprobs_microstep_live_cache_not_final_row(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 1
+        worker.req_states = {}
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
+        worker.print_debug = False
+        worker._infer_output_buffers = None
+
+        # The simple prompt mirrors "The capital of France is" tokenized into a
+        # short sequence for this worker-level regression.  Requesting both
+        # logprobs and prompt_logprobs corresponds to OpenAI completions
+        # echo=true, logprobs=5, max_tokens=1.
+        prompt_token_ids = [101, 102, 103, 104]
+        generated_token_id = 7
+        vocab_size = 128
+        sampling_params = SamplingParams.from_optional(temperature=0.0, logprobs=5, prompt_logprobs=5)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+        worker.req_states = {"france": req_state}
+
+        infer_calls: list[tuple[int, int]] = []
+
+        def infer(inputs, *, cache_size, outputs=None):
+            input_embeds = np.asarray(inputs[0] if isinstance(inputs, list) else inputs)
+            sequence_length = int(input_embeds.shape[1])
+            cache_size = int(cache_size)
+            infer_calls.append((sequence_length, cache_size))
+            prompt_pos = cache_size + sequence_length
+            if prompt_pos >= len(prompt_token_ids):
+                logits = np.full((1, vocab_size), -40.0, dtype=np.float32)
+                logits[0, generated_token_id] = 40.0
+                # This is the repeated final-position top token observed in the
+                # bug.  It must remain only the generated-token distribution and
+                # must not be copied to every echoed prompt position.
+                logits[0, 10] = 39.0
+                return [logits]
+
+            logits = np.full((1, vocab_size), -40.0, dtype=np.float32)
+            logits[0, prompt_token_ids[prompt_pos]] = 40.0
+            logits[0, 20 + prompt_pos] = 39.0
+            return [logits]
+
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(1, vocab_size)],
+            get_num_model_variants=lambda: 0,
+        )
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+
+        output = worker.execute_model(self._make_scheduler_output({"france": len(prompt_token_ids)}))
+
+        assert output is not None
+        assert infer_calls == [(1, pos) for pos in range(len(prompt_token_ids))]
+        assert all(sequence_length == 1 for sequence_length, _cache_size in infer_calls)
+        assert output.sampled_token_ids[output.req_id_to_index["france"]].tolist() == [generated_token_id]
+        assert output.logprobs is not None
+        assert output.prompt_logprobs_dict.keys() == {"france"}
+
+        prompt_logprobs_tensors = output.prompt_logprobs_dict["france"]
+        prompt_top_ids = prompt_logprobs_tensors.logprob_token_ids[:, 0].tolist()
+        assert prompt_top_ids == prompt_token_ids[1:]
+        assert len({tuple(row.tolist()) for row in prompt_logprobs_tensors.logprob_token_ids}) > 1
+        assert all(10 not in row.tolist() for row in prompt_logprobs_tensors.logprob_token_ids)
+        assert output.logprobs.logprob_token_ids.tolist()[0][0] == generated_token_id
+
+    def test_chat_template_echo_prompt_logprobs_do_not_reuse_repeated_final_top_token(self) -> None:
+        worker = self._make_worker()
+        sampling_params = SamplingParams.from_optional(logprobs=5, prompt_logprobs=5)
+        # Token IDs stand in for the Llama chat-template repro prompt with
+        # special tokens.  The regression checks prompt-position alignment, not
+        # tokenizer-specific decoding.
+        prompt_token_ids = [128000, 128006, 9125, 128007, 271, 387, 4320, 128009, 128006, 882, 128007, 271, 9906, 1917]
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        vocab_size = max(prompt_token_ids) + 32
+        repeated_final_top_id = 271
+
+        prompt_rows = np.full((len(prompt_token_ids) - 1, vocab_size), -40.0, dtype=np.float32)
+        for row, token_id in enumerate(prompt_token_ids[1:]):
+            prompt_rows[row, repeated_final_top_id] = -5.0
+            prompt_rows[row, token_id] = 5.0 + row
+
+        prompt_logprobs_tensors = worker._get_prompt_logprobs_tensors(
+            req_state=req_state,
+            sequence_logits=prompt_rows,
+            start_idx=0,
+            scheduled_end=len(prompt_token_ids),
+        )
+
+        assert prompt_logprobs_tensors is not None
+        top_token_rows = [tuple(row.tolist()) for row in prompt_logprobs_tensors.logprob_token_ids]
+        assert len(set(top_token_rows)) > 1
+        assert prompt_logprobs_tensors.logprob_token_ids[:, 0].tolist() == prompt_token_ids[1:]
+        repeated_final_top_count = sum(
+            repeated_final_top_id == int(row[0]) for row in prompt_logprobs_tensors.logprob_token_ids
+        )
+        assert repeated_final_top_count < len(prompt_token_ids) - 1
+
+    @pytest.mark.parametrize(
+        ("name", "prompt_token_ids", "repeated_final_top_id"),
+        [
+            ("simple_fact", [101, 102, 103, 104, 105, 106], 201),
+            ("repeat", [301, 302, 303, 304, 305, 306, 307, 308], 303),
+            (
+                "llama_chat",
+                [128000, 128006, 9125, 128007, 271, 387, 4320, 128009, 128006, 882, 128007, 271, 9906, 1917],
+                9906,
+            ),
+        ],
+    )
+    def test_echo_prompt_logprob_microsteps_copy_rows_from_reused_runtime_output_buffer(
+        self,
+        name: str,
+        prompt_token_ids: list[int],
+        repeated_final_top_id: int,
+    ) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 1
+        worker.req_states = {}
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
+        worker.print_debug = False
+        worker._infer_output_buffers = None
+
+        generated_token_id = 7
+        vocab_size = max(max(prompt_token_ids), repeated_final_top_id, generated_token_id) + 16
+        sampling_params = SamplingParams.from_optional(temperature=0.0, logprobs=5, prompt_logprobs=5)
+        req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
+        req_state.prompt_len = len(prompt_token_ids)
+        req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+        worker.req_states = {name: req_state}
+
+        infer_calls: list[tuple[int, int, bool]] = []
+
+        def make_logits(cache_size: int, sequence_length: int) -> np.ndarray:
+            prompt_pos = cache_size + sequence_length
+            logits = np.full((1, vocab_size), -40.0, dtype=np.float32)
+            if prompt_pos >= len(prompt_token_ids):
+                # Final prefill/assistant-first distribution.  If prompt rows are
+                # views into a reused backend output buffer, this row is later
+                # observed at most/all echo prompt positions.
+                logits[0, generated_token_id] = 40.0
+                logits[0, repeated_final_top_id] = 39.0
+            else:
+                # Position-specific prefill distribution that predicts prompt
+                # token i from logits row i - 1.
+                logits[0, prompt_token_ids[prompt_pos]] = 40.0
+                logits[0, (20 + prompt_pos) % vocab_size] = 39.0
+            return logits
+
+        def infer(inputs, *, cache_size, outputs=None):
+            input_embeds = np.asarray(inputs[0] if isinstance(inputs, list) else inputs)
+            sequence_length = int(input_embeds.shape[1])
+            cache_size = int(cache_size)
+            infer_calls.append((sequence_length, cache_size, outputs is not None))
+            logits = make_logits(cache_size, sequence_length)
+            if outputs is not None:
+                outputs[0][...] = logits
+                return None
+            return [logits]
+
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(1, vocab_size)],
+            get_num_model_variants=lambda: 0,
+        )
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+
+        output = worker.execute_model(self._make_scheduler_output({name: len(prompt_token_ids)}))
+
+        assert output is not None
+        assert infer_calls == [(1, pos, pos > 0) for pos in range(len(prompt_token_ids))]
+        assert output.sampled_token_ids[output.req_id_to_index[name]].tolist() == [generated_token_id]
+        assert output.logprobs is not None
+        assert output.logprobs.logprob_token_ids.tolist()[0][0] == generated_token_id
+        assert output.prompt_logprobs_dict.keys() == {name}
+
+        prompt_logprobs_tensors = output.prompt_logprobs_dict[name]
+        prompt_top_ids = prompt_logprobs_tensors.logprob_token_ids[:, 0].tolist()
+
+        assert prompt_top_ids == prompt_token_ids[1:]
+        assert len(set(prompt_top_ids)) > 1
+        assert prompt_top_ids != [generated_token_id] * (len(prompt_token_ids) - 1)
+        assert prompt_top_ids != [repeated_final_top_id] * (len(prompt_token_ids) - 1)
+        final_top_count = sum(token_id in (generated_token_id, repeated_final_top_id) for token_id in prompt_top_ids)
+        assert final_top_count < len(prompt_top_ids) - 1
+
     def test_batch_2d_output_shape_is_treated_as_last_token_even_when_seq_len_matches_batch(self) -> None:
         worker = self._make_worker()
         worker.max_batch_size = 2

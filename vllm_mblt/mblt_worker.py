@@ -930,10 +930,34 @@ class MbltWorker(WorkerBase):
         if len(output_shape) == 2:
             if self._is_batch_model():
                 return "last_token"
-            if self._shape_dim_matches_sequence(int(output_shape[0]), input_seq_len):
+            sequence_dim = int(output_shape[0])
+            if sequence_dim == -1:
+                return "full_sequence"
+            if sequence_dim == 1:
+                return "last_token"
+            if sequence_dim == input_seq_len:
                 return "full_sequence"
             return "last_token"
         return "unknown"
+
+    def _normalize_runtime_sequence_logits(self, logits: np.ndarray, expected_seq_len: int) -> Optional[np.ndarray]:
+        """Return per-position logits only when the MXQ output is known to contain them.
+
+        OpenAI completions with ``echo=true`` and ``logprobs=N`` require prompt
+        token ``i`` to be scored from logits at prompt position ``i - 1``.  A
+        last-token-only MXQ can return a 2-D tensor with shape ``(1, vocab)``;
+        for Batch1/single-core requests this may accidentally match a
+        one-token scheduled/microstep input and looks like valid sequence
+        logits if we check the tensor shape alone.  Treat known last-token
+        runtime outputs as unavailable for prompt-logprob sequence scoring so
+        callers use the dedicated prompt-logprob microstep/fallback path instead
+        of reusing the same final-position distribution for prompt tokens.
+        """
+
+        mode = self._runtime_output_logits_mode(expected_seq_len)
+        if mode != "full_sequence":
+            return None
+        return self._normalize_sequence_logits(logits, expected_seq_len=expected_seq_len)
 
     def _needs_last_logit_prompt_logprob_microsteps(
         self,
@@ -1046,7 +1070,7 @@ class MbltWorker(WorkerBase):
         logits_np = np.asarray(logits)
         return InferenceLogits(
             last_token_logits=self._last_token_logits(logits_np),
-            full_sequence_logits=self._normalize_sequence_logits(
+            full_sequence_logits=self._normalize_runtime_sequence_logits(
                 logits_np, expected_seq_len=int(input_embeds.shape[0])
             ),
         )
@@ -1411,7 +1435,14 @@ class MbltWorker(WorkerBase):
                 )[0]
             else:
                 logits = self._infer_logits(input_embeds, input_deepstack, cache_size=fallback_cache_size)
-            rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1)[None, :][0])
+            # _infer_logits may return a view into qbruntime's reusable output
+            # buffer.  Prompt logprob replay/microstep paths keep one row per
+            # prompt position, so each row must be detached immediately.  If we
+            # store the view, later infer() calls overwrite the same memory and
+            # every echoed prompt position can become identical to the final
+            # prefill/decode distribution (for example repeated "Hello" or
+            # " Paris" top-1 rows).
+            rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1).copy())
             fallback_cache_size += int(input_embeds.shape[0])
 
         if not rows:
@@ -1514,7 +1545,9 @@ class MbltWorker(WorkerBase):
                 )
 
                 for state, input_embeds, logits in zip(batch_states, input_embeds_batch, logits_batch):
-                    state.rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1))
+                    # Detach from any backend-owned/reused logits buffer before
+                    # the next microstep overwrites it.
+                    state.rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1).copy())
                     state.fallback_cache_size += int(input_embeds.shape[0])
                     state.current_prompt_pos += 1
 
@@ -1589,7 +1622,11 @@ class MbltWorker(WorkerBase):
                 )
 
                 for state, logits in zip(batch_states, logits_batch):
-                    logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1)
+                    # Keep a copy of the position-specific logits row.  Some
+                    # runtimes reuse the same output buffer for every infer()
+                    # call; storing a view would broadcast the last step's
+                    # logits across all prompt echo logprob positions.
+                    logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1).copy()
                     prompt_pos = state.cache_size + 1
                     if prompt_pos < state.prompt_logits_end:
                         state.rows.append(logits_row)
@@ -1610,6 +1647,75 @@ class MbltWorker(WorkerBase):
                 full_sequence_logits=full_sequence_logits,
             )
         return outputs
+
+    def _run_prompt_logprob_microsteps_single(
+        self,
+        req_id: str,
+        req_state: RequestState,
+        start_idx: int,
+        scheduled_end: int,
+    ) -> Optional[InferenceLogits]:
+        """Run a nonbatch scheduled range as 1-token steps for prompt logprobs.
+
+        This is the single-core equivalent of
+        :meth:`_run_prompt_logprob_microsteps_batch`.  Last-token-only MXQs
+        cannot return per-position prompt logits from a multi-token prefill, so
+        OpenAI ``echo=true`` prompt logprobs must advance the live request cache
+        one token at a time and collect the logits from token ``i - 1`` to score
+        prompt token ``i``.  The final microstep's logits are also the normal
+        sampling logits, which preserves generated-token logprob behavior.
+        """
+
+        if scheduled_end <= start_idx:
+            return None
+
+        cache_size = start_idx
+        prompt_logits_end = min(scheduled_end + 1, req_state.prompt_len)
+        rows: list[np.ndarray] = []
+        last_token_logits: Optional[np.ndarray] = None
+
+        if self.print_debug:
+            logger.info(
+                "[mblt-debug] prompt-logprob single microsteps: req_id=%s range=(%d,%d) "
+                "prompt_logits_end=%d next_prompt_logprob_pos=%d",
+                req_id,
+                start_idx,
+                scheduled_end,
+                prompt_logits_end,
+                req_state.next_prompt_logprob_pos,
+            )
+        self._warn_last_logit_prompt_logprobs_once()
+
+        while cache_size < scheduled_end:
+            input_embeds = self._build_input_embeds(req_state, cache_size, cache_size + 1)
+            deepstack_embeds = self._build_deepstack_input_embeds(req_state, cache_size, cache_size + 1)
+            logits = self._infer_logits(input_embeds, deepstack_embeds, cache_size=cache_size)
+            # Keep a copy of the position-specific logits row.  _infer_logits
+            # can return a view into self._infer_output_buffers/qbruntime output
+            # memory, which is overwritten by the next infer() call.
+            logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1).copy()
+
+            # The logits emitted after consuming token at cache_size predict the
+            # next token at prompt_pos=cache_size + 1.  There is no prompt
+            # logprob for prompt token 0, and logits that predict the first
+            # generated token are kept only as last_token_logits for sampling.
+            prompt_pos = cache_size + 1
+            if prompt_pos < prompt_logits_end:
+                rows.append(logits_row)
+            last_token_logits = logits_row
+            cache_size += 1
+
+        if last_token_logits is None:
+            return None
+        full_sequence_logits = (
+            np.stack(rows, axis=0)
+            if rows
+            else np.empty((0, int(last_token_logits.shape[0])), dtype=last_token_logits.dtype)
+        )
+        return InferenceLogits(
+            last_token_logits=last_token_logits,
+            full_sequence_logits=full_sequence_logits,
+        )
 
     def _get_prompt_logprobs_tensors_with_fallback(
         self,
@@ -2400,11 +2506,21 @@ class MbltWorker(WorkerBase):
                 next_cache_sizes.append(next_cache_size)
                 sequence_lengths.append(sequence_length)
 
-                inference_logits = self._infer_logits_with_sequence(
-                    input_embeds,
-                    deepstack_embeds,
-                    cache_size=cache_size,
-                )
+                if self._needs_last_logit_prompt_logprob_microsteps(req_state, sequence_length):
+                    inference_logits = self._run_prompt_logprob_microsteps_single(
+                        req_id=req_id,
+                        req_state=req_state,
+                        start_idx=cache_size,
+                        scheduled_end=scheduled_end,
+                    )
+                    if inference_logits is None:
+                        raise RuntimeError(f"Missing single prompt-logprob microstep logits for req_id={req_id}.")
+                else:
+                    inference_logits = self._infer_logits_with_sequence(
+                        input_embeds,
+                        deepstack_embeds,
+                        cache_size=cache_size,
+                    )
                 prompt_logprob_pos_before = req_state.next_prompt_logprob_pos
                 self._get_completed_prompt_logprobs_tensors_for_scheduler(
                     req_state=req_state,
