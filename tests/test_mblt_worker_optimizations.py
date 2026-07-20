@@ -1385,7 +1385,7 @@ class TestMbltWorkerOptimizations:
 
         assert normalized is sequence_logits
 
-    def test_batch1_single_core_echo_prompt_logprobs_use_fallback_not_final_row(self) -> None:
+    def test_batch1_single_core_echo_prompt_logprobs_microstep_live_cache_not_final_row(self) -> None:
         worker = self._make_worker()
         worker.max_batch_size = 1
         worker.req_states = {}
@@ -1406,15 +1406,15 @@ class TestMbltWorkerOptimizations:
         req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
         worker.req_states = {"france": req_state}
 
-        live_infer_calls: list[tuple[int, int]] = []
-        fallback_infer_calls: list[tuple[int, int]] = []
+        infer_calls: list[tuple[int, int]] = []
 
         def infer(inputs, *, cache_size, outputs=None):
             input_embeds = np.asarray(inputs[0] if isinstance(inputs, list) else inputs)
             sequence_length = int(input_embeds.shape[1])
             cache_size = int(cache_size)
-            if sequence_length == len(prompt_token_ids) and cache_size == 0:
-                live_infer_calls.append((sequence_length, cache_size))
+            infer_calls.append((sequence_length, cache_size))
+            prompt_pos = cache_size + sequence_length
+            if prompt_pos >= len(prompt_token_ids):
                 logits = np.full((1, vocab_size), -40.0, dtype=np.float32)
                 logits[0, generated_token_id] = 40.0
                 # This is the repeated final-position top token observed in the
@@ -1423,8 +1423,6 @@ class TestMbltWorkerOptimizations:
                 logits[0, 10] = 39.0
                 return [logits]
 
-            fallback_infer_calls.append((sequence_length, cache_size))
-            prompt_pos = cache_size + sequence_length
             logits = np.full((1, vocab_size), -40.0, dtype=np.float32)
             logits[0, prompt_token_ids[prompt_pos]] = 40.0
             logits[0, 20 + prompt_pos] = 39.0
@@ -1440,8 +1438,8 @@ class TestMbltWorkerOptimizations:
         output = worker.execute_model(self._make_scheduler_output({"france": len(prompt_token_ids)}))
 
         assert output is not None
-        assert live_infer_calls == [(len(prompt_token_ids), 0), (len(prompt_token_ids), 0)]
-        assert fallback_infer_calls == [(1, prompt_pos - 1) for prompt_pos in range(1, len(prompt_token_ids))]
+        assert infer_calls == [(1, pos) for pos in range(len(prompt_token_ids))]
+        assert all(sequence_length == 1 for sequence_length, _cache_size in infer_calls)
         assert output.sampled_token_ids[output.req_id_to_index["france"]].tolist() == [generated_token_id]
         assert output.logprobs is not None
         assert output.prompt_logprobs_dict.keys() == {"france"}
