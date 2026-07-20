@@ -930,10 +930,34 @@ class MbltWorker(WorkerBase):
         if len(output_shape) == 2:
             if self._is_batch_model():
                 return "last_token"
-            if self._shape_dim_matches_sequence(int(output_shape[0]), input_seq_len):
+            sequence_dim = int(output_shape[0])
+            if sequence_dim == -1:
+                return "full_sequence"
+            if sequence_dim == 1:
+                return "last_token"
+            if sequence_dim == input_seq_len:
                 return "full_sequence"
             return "last_token"
         return "unknown"
+
+    def _normalize_runtime_sequence_logits(self, logits: np.ndarray, expected_seq_len: int) -> Optional[np.ndarray]:
+        """Return per-position logits only when the MXQ output is known to contain them.
+
+        OpenAI completions with ``echo=true`` and ``logprobs=N`` require prompt
+        token ``i`` to be scored from logits at prompt position ``i - 1``.  A
+        last-token-only MXQ can return a 2-D tensor with shape ``(1, vocab)``;
+        for Batch1/single-core requests this may accidentally match a
+        one-token scheduled/microstep input and looks like valid sequence
+        logits if we check the tensor shape alone.  Treat known last-token
+        runtime outputs as unavailable for prompt-logprob sequence scoring so
+        callers use the dedicated prompt-logprob microstep/fallback path instead
+        of reusing the same final-position distribution for prompt tokens.
+        """
+
+        mode = self._runtime_output_logits_mode(expected_seq_len)
+        if mode != "full_sequence":
+            return None
+        return self._normalize_sequence_logits(logits, expected_seq_len=expected_seq_len)
 
     def _needs_last_logit_prompt_logprob_microsteps(
         self,
@@ -1046,7 +1070,7 @@ class MbltWorker(WorkerBase):
         logits_np = np.asarray(logits)
         return InferenceLogits(
             last_token_logits=self._last_token_logits(logits_np),
-            full_sequence_logits=self._normalize_sequence_logits(
+            full_sequence_logits=self._normalize_runtime_sequence_logits(
                 logits_np, expected_seq_len=int(input_embeds.shape[0])
             ),
         )
