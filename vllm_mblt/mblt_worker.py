@@ -1435,7 +1435,14 @@ class MbltWorker(WorkerBase):
                 )[0]
             else:
                 logits = self._infer_logits(input_embeds, input_deepstack, cache_size=fallback_cache_size)
-            rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1)[None, :][0])
+            # _infer_logits may return a view into qbruntime's reusable output
+            # buffer.  Prompt logprob replay/microstep paths keep one row per
+            # prompt position, so each row must be detached immediately.  If we
+            # store the view, later infer() calls overwrite the same memory and
+            # every echoed prompt position can become identical to the final
+            # prefill/decode distribution (for example repeated "Hello" or
+            # " Paris" top-1 rows).
+            rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1).copy())
             fallback_cache_size += int(input_embeds.shape[0])
 
         if not rows:
@@ -1538,7 +1545,9 @@ class MbltWorker(WorkerBase):
                 )
 
                 for state, input_embeds, logits in zip(batch_states, input_embeds_batch, logits_batch):
-                    state.rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1))
+                    # Detach from any backend-owned/reused logits buffer before
+                    # the next microstep overwrites it.
+                    state.rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1).copy())
                     state.fallback_cache_size += int(input_embeds.shape[0])
                     state.current_prompt_pos += 1
 
@@ -1613,7 +1622,11 @@ class MbltWorker(WorkerBase):
                 )
 
                 for state, logits in zip(batch_states, logits_batch):
-                    logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1)
+                    # Keep a copy of the position-specific logits row.  Some
+                    # runtimes reuse the same output buffer for every infer()
+                    # call; storing a view would broadcast the last step's
+                    # logits across all prompt echo logprob positions.
+                    logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1).copy()
                     prompt_pos = state.cache_size + 1
                     if prompt_pos < state.prompt_logits_end:
                         state.rows.append(logits_row)
@@ -1677,7 +1690,10 @@ class MbltWorker(WorkerBase):
             input_embeds = self._build_input_embeds(req_state, cache_size, cache_size + 1)
             deepstack_embeds = self._build_deepstack_input_embeds(req_state, cache_size, cache_size + 1)
             logits = self._infer_logits(input_embeds, deepstack_embeds, cache_size=cache_size)
-            logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1)
+            # Keep a copy of the position-specific logits row.  _infer_logits
+            # can return a view into self._infer_output_buffers/qbruntime output
+            # memory, which is overwritten by the next infer() call.
+            logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1).copy()
 
             # The logits emitted after consuming token at cache_size predict the
             # next token at prompt_pos=cache_size + 1.  There is no prompt
