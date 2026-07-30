@@ -1983,8 +1983,8 @@ class TestMbltWorkerOptimizations:
             blobs=["lm-kv-prefix"],
             block_ids=([11],),
             first_seq_blocks=(11,),
-            first_seq_block_hashes=("shared-text-prefix-block",),
             num_tokens=128,
+            cache_token_ids=tuple(range(128)),
         )
 
         image_feature_calls: list[dict[str, torch.Tensor]] = []
@@ -2025,7 +2025,6 @@ class TestMbltWorkerOptimizations:
             [feature],
             num_computed_tokens=128,
             block_ids=([11, 12],),
-            block_hashes=("shared-text-prefix-block", "vlm-suffix-block"),
             session_id="vlm-session",
         )
         scheduler_output = self._make_scheduler_output({"vlm-hit": 2})

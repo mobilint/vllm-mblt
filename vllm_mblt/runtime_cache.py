@@ -18,6 +18,7 @@ class RuntimeCacheSnapshot:
     first_seq_blocks: tuple[int, ...]
     num_tokens: int
     cache_token_ids: tuple[int, ...] | None = None
+    multimodal_cache_identity: Hashable | None = None
     first_seq_block_hashes: tuple[Hashable, ...] | None = None
 
 
@@ -29,6 +30,7 @@ class RuntimeCacheRequest:
     num_computed_tokens: int
     cache_slot_id: int | None = None
     cache_token_ids: tuple[int, ...] | None = None
+    multimodal_cache_identity: Hashable | None = None
     first_seq_block_hashes: tuple[Hashable, ...] | None = None
 
 
@@ -165,34 +167,18 @@ class MbltRuntimeCacheManager:
         *,
         first_seq_block_hashes: tuple[Hashable, ...] | None = None,
     ) -> list[str]:
-        """Invalidate ID-keyed snapshots when vLLM reuses physical KV blocks.
+        """Record physical KV block ownership observed from the scheduler.
 
-        Content-hashed requests/snapshots are safe to match across physical block
-        reuse. Hashless snapshots are only safe while their physical blocks have
-        not been observed under another request.
+        vLLM 0.11.2 exposes physical block IDs but not scheduler block hashes.
+        A changed physical owner is therefore only a collision signal, not proof
+        that a finished snapshot is stale: prefix caching can intentionally share
+        physical blocks across requests with identical token content. Snapshot
+        removal is deferred to choose/load, where token and multimodal identity
+        are available to prove incompatibility.
         """
-        if first_seq_block_hashes is not None:
-            return []
-
-        stale_req_ids: set[str] = set()
-        for block_id in first_seq_blocks(block_ids):
-            owner = self.physical_block_owner.get(block_id)
-            if owner is None or owner == req_id:
-                continue
-            for snapshot_req_id, snapshot in self.snapshots.items():
-                if snapshot_req_id == req_id or snapshot.first_seq_block_hashes is not None:
-                    continue
-                if block_id in snapshot.first_seq_blocks:
-                    stale_req_ids.add(snapshot_req_id)
-
-        removed: list[str] = []
-        for stale_req_id in sorted(stale_req_ids):
-            if self.remove_snapshot(stale_req_id) is not None:
-                removed.append(stale_req_id)
-
         for block_id in first_seq_blocks(block_ids):
             self.physical_block_owner[block_id] = req_id
-        return removed
+        return []
 
     def get_slot(self, req_id: str) -> int:
         slot_id = self.req_to_slot.get(req_id)
@@ -256,6 +242,7 @@ class MbltRuntimeCacheManager:
         num_tokens: int,
         first_seq_block_ids: tuple[int, ...] | None = None,
         cache_token_ids: tuple[int, ...] | list[int] | None = None,
+        multimodal_cache_identity: Hashable | None = None,
     ) -> RuntimeCacheSnapshot:
         return self.store_snapshot(
             req_id=req_id,
@@ -264,6 +251,7 @@ class MbltRuntimeCacheManager:
             first_seq_blocks=first_seq_block_ids if first_seq_block_ids is not None else first_seq_blocks(block_ids),
             num_tokens=num_tokens,
             cache_token_ids=cache_token_ids,
+            multimodal_cache_identity=multimodal_cache_identity,
         )
 
     def store_snapshot(
@@ -276,6 +264,7 @@ class MbltRuntimeCacheManager:
         first_seq_block_hashes: tuple[Hashable, ...] | None = None,
         num_tokens: int,
         cache_token_ids: tuple[int, ...] | list[int] | None = None,
+        multimodal_cache_identity: Hashable | None = None,
     ) -> RuntimeCacheSnapshot:
         self.finished_snapshot_lru.pop(req_id, None)
         snapshot = RuntimeCacheSnapshot(
@@ -285,6 +274,7 @@ class MbltRuntimeCacheManager:
             first_seq_block_hashes=tuple(first_seq_block_hashes) if first_seq_block_hashes is not None else None,
             num_tokens=max(0, int(num_tokens)),
             cache_token_ids=tuple(cache_token_ids) if cache_token_ids is not None else None,
+            multimodal_cache_identity=multimodal_cache_identity,
         )
         self.snapshots[req_id] = snapshot
         if snapshot.first_seq_block_hashes is None:
@@ -363,6 +353,7 @@ class MbltRuntimeCacheManager:
         num_tokens: int,
         slot_id: int | None = None,
         cache_token_ids: tuple[int, ...] | list[int] | None = None,
+        multimodal_cache_identity: Hashable | None = None,
     ) -> RuntimeCacheSnapshot | None:
         if self._dump_runtime_cache_fn is None:
             raise RuntimeError("Runtime cache dump adapter is not configured.")
@@ -377,6 +368,7 @@ class MbltRuntimeCacheManager:
             first_seq_block_hashes=first_seq_block_hashes,
             num_tokens=num_tokens,
             cache_token_ids=cache_token_ids,
+            multimodal_cache_identity=multimodal_cache_identity,
         )
 
     def choose_prefix_snapshot(
@@ -398,26 +390,65 @@ class MbltRuntimeCacheManager:
         best_snapshot: RuntimeCacheSnapshot | None = None
         best_req_id: str | None = None
         best_tokens = 0
+        stale_req_ids: set[str] = set()
         node = self.snapshot_index_root
         for depth, block_id in enumerate(target_blocks, start=1):
             node = node.children.get(block_id)
             if node is None or not node.req_ids:
                 break
 
-            for req_id in node.req_ids:
+            for req_id in tuple(node.req_ids):
                 snapshot = self.snapshots.get(req_id)
                 if snapshot is None:
                     continue
                 matched_tokens = min(snapshot.num_tokens, depth * self.block_size, target_tokens)
-                matched_tokens = token_compatible_tokens(
+                has_physical_collision = (
+                    request is not None
+                    and snapshot.first_seq_block_hashes is None
+                    and request.first_seq_block_hashes is None
+                    and req_id != request.req_id
+                    and physical_prefix_overlaps(request.first_seq_blocks, snapshot.first_seq_blocks)
+                    and any(
+                        self.physical_block_owner.get(block_id) == request.req_id
+                        for block_id in snapshot.first_seq_blocks
+                    )
+                )
+                if has_physical_collision and (
+                    request.cache_token_ids is None or snapshot.cache_token_ids is None
+                ):
+                    stale_req_ids.add(req_id)
+                    continue
+                token_matched_tokens = token_compatible_tokens(
                     matched_tokens,
                     request.cache_token_ids if request is not None else None,
                     snapshot.cache_token_ids,
                 )
+                matched_tokens = multimodal_compatible_tokens(
+                    token_matched_tokens,
+                    request.multimodal_cache_identity if request is not None else None,
+                    snapshot.multimodal_cache_identity,
+                )
+                if (
+                    request is not None
+                    and matched_tokens <= 0
+                    and token_matched_tokens <= 0
+                    and has_physical_collision
+                ):
+                    stale_req_ids.add(req_id)
+                if (
+                    matched_tokens <= 0
+                    and has_physical_collision
+                    and snapshot.multimodal_cache_identity is not None
+                    and snapshot.multimodal_cache_identity != request.multimodal_cache_identity
+                ):
+                    stale_req_ids.add(req_id)
                 if matched_tokens > best_tokens:
                     best_tokens = matched_tokens
                     best_snapshot = snapshot
                     best_req_id = req_id
+
+        for stale_req_id in sorted(stale_req_ids):
+            self.remove_snapshot(stale_req_id)
 
         return RuntimeCacheSnapshotMatch(snapshot=best_snapshot, matched_tokens=best_tokens, req_id=best_req_id)
 
@@ -435,6 +466,8 @@ class MbltRuntimeCacheManager:
                 snapshot_tokens=own_snapshot.num_tokens,
                 target_token_ids=request.cache_token_ids,
                 snapshot_token_ids=own_snapshot.cache_token_ids,
+                target_multimodal_identity=request.multimodal_cache_identity,
+                snapshot_multimodal_identity=own_snapshot.multimodal_cache_identity,
             )
             if matched_tokens >= target_tokens:
                 return RuntimeCacheSnapshotMatch(
@@ -455,6 +488,8 @@ class MbltRuntimeCacheManager:
         snapshot_tokens: int,
         target_token_ids: tuple[int, ...] | None = None,
         snapshot_token_ids: tuple[int, ...] | None = None,
+        target_multimodal_identity: Hashable | None = None,
+        snapshot_multimodal_identity: Hashable | None = None,
     ) -> int:
         matched_tokens = prefix_compatible_tokens(
             target_blocks,
@@ -463,7 +498,8 @@ class MbltRuntimeCacheManager:
             snapshot_tokens,
             self.block_size,
         )
-        return token_compatible_tokens(matched_tokens, target_token_ids, snapshot_token_ids)
+        matched_tokens = token_compatible_tokens(matched_tokens, target_token_ids, snapshot_token_ids)
+        return multimodal_compatible_tokens(matched_tokens, target_multimodal_identity, snapshot_multimodal_identity)
 
     def required_blocks(self, num_tokens: int) -> int:
         return required_blocks(num_tokens, self.block_size)
@@ -497,6 +533,7 @@ class MbltRuntimeCacheManager:
             first_seq_block_hashes=request.first_seq_block_hashes,
             num_tokens=request.num_computed_tokens,
             cache_token_ids=request.cache_token_ids,
+            multimodal_cache_identity=request.multimodal_cache_identity,
         )
         return True
 
@@ -617,6 +654,7 @@ class MbltRuntimeCacheManager:
                 num_computed_tokens=request.num_computed_tokens,
                 first_seq_block_hashes=request.first_seq_block_hashes,
                 cache_token_ids=request.cache_token_ids,
+                multimodal_cache_identity=request.multimodal_cache_identity,
                 cache_slot_id=slot_id,
             )
         return self.load_snapshot_for_slot(request)
@@ -727,3 +765,24 @@ def token_compatible_tokens(
         if common_tokens >= matched_tokens:
             break
     return min(matched_tokens, common_tokens)
+
+
+def multimodal_compatible_tokens(
+    matched_tokens: int,
+    target_multimodal_identity: Hashable | None,
+    snapshot_multimodal_identity: Hashable | None,
+) -> int:
+    if matched_tokens <= 0:
+        return 0
+    if snapshot_multimodal_identity is None:
+        return matched_tokens
+    if target_multimodal_identity == snapshot_multimodal_identity:
+        return matched_tokens
+    return 0
+
+
+def physical_prefix_overlaps(
+    target_blocks: tuple[int, ...],
+    snapshot_blocks: tuple[int, ...],
+) -> bool:
+    return any(target_block == snapshot_block for target_block, snapshot_block in zip(target_blocks, snapshot_blocks))

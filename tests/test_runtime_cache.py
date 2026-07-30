@@ -27,6 +27,7 @@ def _request(
     block_hashes: tuple[object, ...] | None = None,
     cache_slot_id: int | None = None,
     cache_token_ids: tuple[int, ...] | list[int] | None = None,
+    multimodal_cache_identity: object | None = None,
 ) -> RuntimeCacheRequest:
     return RuntimeCacheRequest(
         req_id=req_id,
@@ -36,6 +37,7 @@ def _request(
         first_seq_block_hashes=block_hashes,
         cache_slot_id=cache_slot_id,
         cache_token_ids=tuple(cache_token_ids) if cache_token_ids is not None else None,
+        multimodal_cache_identity=multimodal_cache_identity,
     )
 
 
@@ -48,6 +50,7 @@ def _store_snapshot(
     blobs: list[object] | None = None,
     cache_token_ids: tuple[int, ...] | list[int] | None = None,
     block_hashes: tuple[object, ...] | None = None,
+    multimodal_cache_identity: object | None = None,
 ) -> None:
     block_tuple = tuple(blocks)
     block_ids = (list(block_tuple),)
@@ -59,6 +62,7 @@ def _store_snapshot(
         first_seq_block_hashes=block_hashes,
         num_tokens=tokens,
         cache_token_ids=cache_token_ids,
+        multimodal_cache_identity=multimodal_cache_identity,
     )
 
 
@@ -224,23 +228,25 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert match.snapshot is manager.get_snapshot("right-content")
         assert match.matched_tokens == 8
 
-    def test_hashless_snapshot_invalidates_when_physical_block_owner_changes(self) -> None:
+    def test_hashless_snapshot_is_not_invalidated_before_token_identity_check(self) -> None:
         manager = _make_manager(block_size=4)
-        _store_snapshot(manager, "old", (1, 2), 8)
+        _store_snapshot(manager, "old", (1, 2), 8, cache_token_ids=tuple(range(8)))
 
         evicted = manager.observe_request_blocks("new", ([1, 3],))
 
-        assert evicted == ["old"]
-        assert manager.get_snapshot("old") is None
-        assert manager.choose_snapshot(_request("new", (1, 2), 8)).snapshot is None
+        assert evicted == []
+        assert manager.get_snapshot("old") is not None
+        match = manager.choose_snapshot(_request("new", (1, 2), 8, cache_token_ids=tuple(range(8))))
+        assert match.snapshot is manager.get_snapshot("old")
+        assert match.matched_tokens == 8
 
     def test_hashless_load_invalidates_stale_snapshot_before_restore(self) -> None:
         manager = _make_manager(block_size=4)
-        _store_snapshot(manager, "old", (1, 2), 8)
+        _store_snapshot(manager, "old", (1, 2), 8, cache_token_ids=tuple(range(8)))
         load_calls = []
 
         result = manager.load_snapshot_for_request(
-            _request("new", (1, 2), 8),
+            _request("new", (1, 2), 8, cache_token_ids=tuple(range(100, 108))),
             lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
         )
 
@@ -248,6 +254,112 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert result.matched_tokens == 0
         assert load_calls == []
         assert manager.get_snapshot("old") is None
+
+    def test_real_vllm_0112_hashless_shared_prefix_restores_with_token_identity(self) -> None:
+        manager = _make_manager(block_size=4)
+        token_ids = (10, 11, 12, 13, 14, 15, 16, 17)
+        _store_snapshot(manager, "finished-a", (1, 2), 8, cache_token_ids=token_ids)
+        manager.mark_snapshot_finished("finished-a")
+
+        new_request_data = type(
+            "NewRequestData0112",
+            (),
+            {
+                "__annotations__": {
+                    "req_id": str,
+                    "prompt_token_ids": list[int],
+                    "mm_features": object,
+                    "sampling_params": object,
+                    "pooling_params": object,
+                    "block_ids": object,
+                    "num_computed_tokens": int,
+                    "lora_request": object,
+                    "prompt_embeds": object,
+                }
+            },
+        )()
+        new_request_data.req_id = "new-b"
+        new_request_data.prompt_token_ids = list(token_ids)
+        new_request_data.block_ids = ([1, 2],)
+        new_request_data.num_computed_tokens = 8
+
+        manager.observe_request_blocks(new_request_data.req_id, new_request_data.block_ids)
+        result = manager.load_snapshot_for_request(
+            _request(
+                new_request_data.req_id,
+                tuple(new_request_data.block_ids[0]),
+                new_request_data.num_computed_tokens,
+                cache_token_ids=tuple(new_request_data.prompt_token_ids),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.loaded
+        assert result.loaded_snapshot_req_id == "finished-a"
+        assert result.matched_tokens == 8
+
+    def test_real_vllm_0112_cached_request_reused_physical_block_with_different_tokens_is_removed(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "old-content", (7,), 4, cache_token_ids=(1, 2, 3, 4))
+        cached_request_data = type(
+            "CachedRequestData0112",
+            (),
+            {
+                "__annotations__": {
+                    "req_ids": list[str],
+                    "resumed_req_ids": set[str],
+                    "new_token_ids": list[list[int]],
+                    "all_token_ids": dict[str, list[int]],
+                    "new_block_ids": object,
+                    "num_computed_tokens": list[int],
+                    "num_output_tokens": list[int],
+                }
+            },
+        )()
+        cached_request_data.req_ids = ["new-content"]
+        cached_request_data.all_token_ids = {"new-content": [9, 2, 3, 4]}
+        cached_request_data.new_block_ids = [([7],)]
+        cached_request_data.num_computed_tokens = [4]
+
+        manager.observe_request_blocks(cached_request_data.req_ids[0], cached_request_data.new_block_ids[0])
+        result = manager.load_snapshot_for_request(
+            _request(
+                cached_request_data.req_ids[0],
+                tuple(cached_request_data.new_block_ids[0][0]),
+                cached_request_data.num_computed_tokens[0],
+                cache_token_ids=tuple(cached_request_data.all_token_ids["new-content"]),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert manager.get_snapshot("old-content") is None
+
+    def test_hashless_multimodal_identity_mismatch_is_rejected(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=("vlm", "session-a", (1, 2, None)),
+        )
+
+        manager.observe_request_blocks("vlm-new", ([30],))
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=("vlm", "session-b", (1, 2, None)),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert manager.get_snapshot("vlm-old") is None
 
     def test_snapshot_update_and_removal_refresh_prefix_index(self) -> None:
         manager = _make_manager(block_size=4)

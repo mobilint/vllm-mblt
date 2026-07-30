@@ -117,6 +117,7 @@ class RequestState:
     prompt_token_ids: list[int]
     cache_slot_id: Optional[int]
     vlm_session_id: Optional[str]
+    multimodal_cache_identity: Optional[Hashable] = None
     next_prompt_logprob_pos: int = 1
     in_progress_prompt_logprobs: Optional[LogprobsTensors] = None
 
@@ -2142,6 +2143,7 @@ class MbltWorker(WorkerBase):
                 first_seq_block_hashes=req_state.first_seq_block_hashes,
                 cache_slot_id=slot_id,
                 cache_token_ids=self._cache_token_ids(req_state, target_tokens),
+                multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
             )
         )
         if print_debug:
@@ -2240,6 +2242,7 @@ class MbltWorker(WorkerBase):
                 first_seq_block_hashes=req_state.first_seq_block_hashes,
                 cache_slot_id=slot_id,
                 cache_token_ids=self._cache_token_ids(req_state, target_tokens),
+                multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
             )
         )
         if print_debug:
@@ -2343,6 +2346,7 @@ class MbltWorker(WorkerBase):
             first_seq_block_hashes=req_state.first_seq_block_hashes,
             num_tokens=next_num_tokens,
             cache_token_ids=self._cache_token_ids(req_state, next_num_tokens),
+            multimodal_cache_identity=self._cache_multimodal_identity(req_state, next_num_tokens),
         )
         if print_debug:
             num_blocks = len(req_state.first_seq_blocks)
@@ -2359,6 +2363,16 @@ class MbltWorker(WorkerBase):
         if len(token_ids) < num_tokens:
             return None
         return tuple(token_ids[:num_tokens])
+
+    @staticmethod
+    def _cache_multimodal_identity(req_state: RequestState, num_tokens: int) -> Hashable | None:
+        if not req_state.is_multimodal:
+            return None
+        if req_state.multimodal_cache_identity is None:
+            return None
+        if max(0, int(num_tokens)) <= 0:
+            return None
+        return req_state.multimodal_cache_identity
 
     def _finalize_finished_request(
         self,
@@ -2690,6 +2704,11 @@ class MbltWorker(WorkerBase):
                 prompt_token_ids=new_req.prompt_token_ids or [],
                 cache_slot_id=cache_slot_id,
                 vlm_session_id=vlm_session_id,
+                multimodal_cache_identity=(
+                    ("vlm", vlm_session_id, self._vlm_image_positions_by_session.get(vlm_session_id))
+                    if new_req.mm_features
+                    else None
+                ),
             )
 
         # Continue cached requests
