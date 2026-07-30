@@ -2029,9 +2029,12 @@ class MbltWorker(WorkerBase):
         return True
 
     @staticmethod
-    def _cache_token_ids(req_state: RequestState, num_tokens: int) -> tuple[int, ...]:
+    def _cache_token_ids(req_state: RequestState, num_tokens: int) -> tuple[int, ...] | None:
         token_ids = list(req_state.prompt_token_ids) + list(req_state.output_token_ids)
-        return tuple(token_ids[: max(0, int(num_tokens))])
+        num_tokens = max(0, int(num_tokens))
+        if len(token_ids) < num_tokens:
+            return None
+        return tuple(token_ids[:num_tokens])
 
     def _finalize_finished_request(
         self,

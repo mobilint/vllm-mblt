@@ -616,6 +616,7 @@ class MbltRuntimeCacheManager:
                 first_seq_blocks=request.first_seq_blocks,
                 num_computed_tokens=request.num_computed_tokens,
                 first_seq_block_hashes=request.first_seq_block_hashes,
+                cache_token_ids=request.cache_token_ids,
                 cache_slot_id=slot_id,
             )
         return self.load_snapshot_for_slot(request)

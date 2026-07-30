@@ -176,6 +176,7 @@ class TestMbltWorkerOptimizations:
         *,
         num_computed_tokens: int = 0,
         block_ids: tuple[list[int], ...] | None = None,
+        block_hashes: tuple[object, ...] | None = None,
         session_id: str | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
@@ -185,6 +186,7 @@ class TestMbltWorkerOptimizations:
             prompt_embeds=prompt_embeds,
             mm_features=mm_features,
             block_ids=block_ids or ([11],),
+            block_hashes=block_hashes,
             num_computed_tokens=num_computed_tokens,
             session_id=session_id,
         )
@@ -1831,6 +1833,7 @@ class TestMbltWorkerOptimizations:
             blobs=["lm-kv-prefix"],
             block_ids=([11],),
             first_seq_blocks=(11,),
+            first_seq_block_hashes=("shared-text-prefix-block",),
             num_tokens=128,
         )
 
@@ -1872,6 +1875,7 @@ class TestMbltWorkerOptimizations:
             [feature],
             num_computed_tokens=128,
             block_ids=([11, 12],),
+            block_hashes=("shared-text-prefix-block", "vlm-suffix-block"),
             session_id="vlm-session",
         )
         scheduler_output = self._make_scheduler_output({"vlm-hit": 2})
