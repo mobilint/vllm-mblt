@@ -774,11 +774,124 @@ def multimodal_compatible_tokens(
 ) -> int:
     if matched_tokens <= 0:
         return 0
-    if snapshot_multimodal_identity is None:
+    if target_multimodal_identity is None and snapshot_multimodal_identity is None:
         return matched_tokens
-    if target_multimodal_identity == snapshot_multimodal_identity:
+
+    if (
+        target_multimodal_identity is not None
+        and snapshot_multimodal_identity is not None
+        and _is_resolved_multimodal_identity(target_multimodal_identity)
+        and _is_resolved_multimodal_identity(snapshot_multimodal_identity)
+        and target_multimodal_identity == snapshot_multimodal_identity
+    ):
         return matched_tokens
-    return 0
+
+    text_only_limit = _known_text_only_prefix_limit(
+        target_multimodal_identity,
+        snapshot_multimodal_identity,
+    )
+    if text_only_limit is None:
+        return 0
+    return min(matched_tokens, text_only_limit)
+
+
+def _known_text_only_prefix_limit(
+    target_multimodal_identity: Hashable | None,
+    snapshot_multimodal_identity: Hashable | None,
+) -> int | None:
+    starts: list[int] = []
+    for identity in (target_multimodal_identity, snapshot_multimodal_identity):
+        spans = _multimodal_identity_spans(identity)
+        if spans is None:
+            if identity is not None:
+                return None
+            continue
+        starts.extend(start for start, _end in spans)
+
+    if not starts:
+        return None
+    return max(0, min(starts))
+
+
+def _is_resolved_multimodal_identity(identity: Hashable) -> bool:
+    if not isinstance(identity, tuple) or not identity:
+        return True
+    if identity[0] != "vlm":
+        return True
+
+    entries = _vlm_identity_entries(identity)
+    if entries is None:
+        return False
+    return all(_vlm_entry_content_fingerprint(entry) is not None for entry in entries)
+
+
+def _multimodal_identity_spans(identity: Hashable | None) -> tuple[tuple[int, int], ...] | None:
+    if identity is None:
+        return None
+    if not isinstance(identity, tuple) or not identity:
+        return None
+    if identity[0] != "vlm":
+        return None
+
+    entries = _vlm_identity_entries(identity)
+    if entries is None:
+        return None
+
+    spans: list[tuple[int, int]] = []
+    for entry in entries:
+        position = _vlm_entry_position_signature(entry)
+        if position is None:
+            return None
+        offset, length, _embed_signature = position
+        spans.append((offset, offset + length))
+    return tuple(spans)
+
+
+def _vlm_identity_entries(identity: tuple[object, ...]) -> tuple[object, ...] | None:
+    if len(identity) < 3:
+        return None
+
+    payload = identity[2]
+    if _is_position_signature(payload):
+        # Legacy identity shape: ("vlm", session_id, position_signature). It
+        # proves the text-only prefix boundary but not multimodal content.
+        return (("legacy", payload, None),)
+
+    if isinstance(payload, tuple) and all(_is_vlm_identity_entry(entry) for entry in payload):
+        return payload
+
+    return None
+
+
+def _is_vlm_identity_entry(entry: object) -> bool:
+    return isinstance(entry, tuple) and len(entry) >= 3 and _is_position_signature(entry[1])
+
+
+def _vlm_entry_position_signature(entry: object) -> tuple[int, int, object] | None:
+    if not isinstance(entry, tuple):
+        return None
+    if _is_position_signature(entry):
+        position = entry
+    elif len(entry) >= 2 and _is_position_signature(entry[1]):
+        position = entry[1]
+    else:
+        return None
+    return (int(position[0]), int(position[1]), position[2])
+
+
+def _vlm_entry_content_fingerprint(entry: object) -> object | None:
+    if not isinstance(entry, tuple):
+        return None
+    if len(entry) >= 3:
+        return entry[2]
+    return None
+
+
+def _is_position_signature(value: object) -> bool:
+    if not isinstance(value, tuple) or len(value) != 3:
+        return False
+    offset, length, _embed_signature = value
+    return isinstance(offset, int) and isinstance(length, int)
 
 
 def physical_prefix_overlaps(

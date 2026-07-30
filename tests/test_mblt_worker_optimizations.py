@@ -133,6 +133,70 @@ class TestMbltWorkerOptimizations:
         )
         assert getattr(worker, "_vlm_image_positions_by_session", {}) == {}
 
+    def test_vlm_multimodal_cache_identity_includes_image_content_fingerprint(self) -> None:
+        image_a = self._make_mm_feature(
+            "image",
+            offset=1,
+            length=2,
+            data={
+                "pixel_values": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                "image_grid_thw": torch.tensor([1, 1, 2]),
+            },
+        )
+        image_b = self._make_mm_feature(
+            "image",
+            offset=1,
+            length=2,
+            data={
+                "pixel_values": torch.tensor([[1.0, 2.0], [3.0, 5.0]]),
+                "image_grid_thw": torch.tensor([1, 1, 2]),
+            },
+        )
+
+        identity_a = MbltWorker._build_vlm_multimodal_cache_identity("session-a", [image_a])
+        identity_b = MbltWorker._build_vlm_multimodal_cache_identity("session-a", [image_b])
+
+        assert identity_a != identity_b
+
+    def test_vlm_multimodal_cache_identity_is_stable_for_same_image_content(self) -> None:
+        data = {
+            "pixel_values": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "image_grid_thw": torch.tensor([1, 1, 2]),
+        }
+
+        identity_a = MbltWorker._build_vlm_multimodal_cache_identity(
+            "session-a",
+            [self._make_mm_feature("image", offset=1, length=2, data=data)],
+        )
+        identity_b = MbltWorker._build_vlm_multimodal_cache_identity(
+            "session-a",
+            [
+                self._make_mm_feature(
+                    "image",
+                    offset=1,
+                    length=2,
+                    data={key: value.clone() for key, value in data.items()},
+                )
+            ],
+        )
+
+        assert identity_a == identity_b
+
+    def test_vlm_multimodal_cache_identity_marks_unfingerprintable_feature_unresolved(self) -> None:
+        identity = MbltWorker._build_vlm_multimodal_cache_identity(
+            "session-a",
+            [
+                self._make_mm_feature(
+                    "image",
+                    offset=1,
+                    length=2,
+                    data={"pixel_values": object(), "image_grid_thw": torch.tensor([1, 1, 2])},
+                )
+            ],
+        )
+
+        assert identity == ("vlm", "session-a", (("image", (1, 2, None), None),))
+
     def _make_worker(self) -> MbltWorker:
         worker = MbltWorker.__new__(MbltWorker)
         worker.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen2"))
@@ -221,10 +285,18 @@ class TestMbltWorkerOptimizations:
         )
 
     def _make_mm_feature(
-        self, modality: str = "image", *, offset: int = 1, length: int = 2, is_embed: torch.Tensor | None = None
+        self,
+        modality: str = "image",
+        *,
+        offset: int = 1,
+        length: int = 2,
+        is_embed: torch.Tensor | None = None,
+        data: dict[str, object] | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
-            modality=modality, data={}, mm_position=SimpleNamespace(offset=offset, length=length, is_embed=is_embed)
+            modality=modality,
+            data=data or {},
+            mm_position=SimpleNamespace(offset=offset, length=length, is_embed=is_embed),
         )
 
     def test_snapshot_index_can_prefer_shallower_prefix_with_more_tokens(self) -> None:
@@ -1978,6 +2050,12 @@ class TestMbltWorkerOptimizations:
             dump_runtime_cache=lambda _slot_id: ["unused"],
             load_runtime_cache=lambda blobs, _slot_id: blobs == ["lm-kv-prefix"],
         )
+        base_prompt_embeds = torch.arange(130 * 4, dtype=torch.float32).reshape(130, 4)
+        feature = SimpleNamespace(
+            modality="image",
+            data={"pixel_values": torch.zeros(1, 3), "image_grid_thw": torch.tensor([1, 1, 1])},
+            mm_position=SimpleNamespace(offset=4, length=2, is_embed=None),
+        )
         worker.runtime_cache.store_snapshot(
             req_id="shared-text-prefix",
             blobs=["lm-kv-prefix"],
@@ -1985,6 +2063,10 @@ class TestMbltWorkerOptimizations:
             first_seq_blocks=(11,),
             num_tokens=128,
             cache_token_ids=tuple(range(128)),
+            multimodal_cache_identity=MbltWorker._build_vlm_multimodal_cache_identity(
+                "vlm-session",
+                [feature],
+            ),
         )
 
         image_feature_calls: list[dict[str, torch.Tensor]] = []
@@ -2013,12 +2095,6 @@ class TestMbltWorkerOptimizations:
             logprobs_tensors=None,
         )
 
-        base_prompt_embeds = torch.arange(130 * 4, dtype=torch.float32).reshape(130, 4)
-        feature = SimpleNamespace(
-            modality="image",
-            data={"pixel_values": torch.zeros(1, 3), "image_grid_thw": torch.tensor([1, 1, 1])},
-            mm_position=SimpleNamespace(offset=4, length=2, is_embed=None),
-        )
         new_req = self._make_new_request(
             "vlm-hit",
             base_prompt_embeds,

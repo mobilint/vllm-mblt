@@ -1,3 +1,4 @@
+import hashlib
 import math
 import os
 import statistics
@@ -571,6 +572,69 @@ class MbltWorker(WorkerBase):
             )
 
         positions_by_session[session_id] = position
+
+    @staticmethod
+    def _fingerprint_multimodal_value(value: object) -> tuple[str, tuple[int, ...], str, str] | None:
+        if value is None:
+            return None
+        value = getattr(value, "data", value)
+        try:
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().cpu()
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                array = tensor.numpy()
+            else:
+                array = np.asarray(value)
+        except (TypeError, ValueError, RuntimeError):
+            return None
+
+        if array.dtype == object:
+            return None
+        if not array.flags.c_contiguous:
+            array = np.ascontiguousarray(array)
+
+        digest = hashlib.sha256()
+        digest.update(str(array.dtype).encode("utf-8"))
+        digest.update(repr(tuple(int(dim) for dim in array.shape)).encode("utf-8"))
+        digest.update(array.tobytes())
+        return ("sha256", tuple(int(dim) for dim in array.shape), str(array.dtype), digest.hexdigest())
+
+    @classmethod
+    def _multimodal_feature_content_fingerprint(cls, feature: MultiModalFeatureSpec) -> Hashable | None:
+        modality = str(getattr(feature, "modality", ""))
+        if modality.startswith("image"):
+            value_keys = ("pixel_values", "image_grid_thw")
+        elif modality.startswith("video"):
+            value_keys = ("pixel_values_videos", "video_grid_thw")
+        else:
+            return None
+
+        fingerprints: list[tuple[str, tuple[str, tuple[int, ...], str, str] | None]] = []
+        for key in value_keys:
+            value = cls._extract_multimodal_value(feature, key)
+            fingerprint = cls._fingerprint_multimodal_value(value)
+            if fingerprint is None:
+                return None
+            fingerprints.append((key, fingerprint))
+
+        return (modality, tuple(fingerprints))
+
+    @classmethod
+    def _build_vlm_multimodal_cache_identity(
+        cls,
+        session_id: str,
+        mm_features: Optional[list[MultiModalFeatureSpec]],
+    ) -> Hashable | None:
+        if not mm_features:
+            return None
+
+        entries = []
+        for feature in mm_features:
+            position = cls._multimodal_position_signature(feature.mm_position)
+            fingerprint = cls._multimodal_feature_content_fingerprint(feature)
+            entries.append((str(getattr(feature, "modality", "")), position, fingerprint))
+        return ("vlm", str(session_id), tuple(entries))
 
     def _get_cache_slot(self, req_id: str) -> int:
         return self.runtime_cache.get_slot(req_id)
@@ -2704,10 +2768,9 @@ class MbltWorker(WorkerBase):
                 prompt_token_ids=new_req.prompt_token_ids or [],
                 cache_slot_id=cache_slot_id,
                 vlm_session_id=vlm_session_id,
-                multimodal_cache_identity=(
-                    ("vlm", vlm_session_id, self._vlm_image_positions_by_session.get(vlm_session_id))
-                    if new_req.mm_features
-                    else None
+                multimodal_cache_identity=self._build_vlm_multimodal_cache_identity(
+                    vlm_session_id,
+                    new_req.mm_features,
                 ),
             )
 

@@ -66,6 +66,16 @@ def _store_snapshot(
     )
 
 
+def _vlm_identity(
+    session_id: str,
+    *,
+    offset: int = 2,
+    length: int = 2,
+    content: object = "image-a",
+) -> tuple[object, ...]:
+    return ("vlm", session_id, (("image", (offset, length, None), content),))
+
+
 class TestRuntimeCacheBlockHelpers:
     def test_normalize_and_append_block_ids_copy_inputs(self) -> None:
         current = ([1, 2], [10])
@@ -343,7 +353,7 @@ class TestMbltRuntimeCacheManagerSnapshots:
             (30,),
             4,
             cache_token_ids=(1, 2, 3, 4),
-            multimodal_cache_identity=("vlm", "session-a", (1, 2, None)),
+            multimodal_cache_identity=("vlm", "session-a", (0, 2, None)),
         )
 
         manager.observe_request_blocks("vlm-new", ([30],))
@@ -353,13 +363,144 @@ class TestMbltRuntimeCacheManagerSnapshots:
                 (30,),
                 4,
                 cache_token_ids=(1, 2, 3, 4),
-                multimodal_cache_identity=("vlm", "session-b", (1, 2, None)),
+                multimodal_cache_identity=("vlm", "session-b", (0, 2, None)),
             ),
             lambda blobs, slot_id: True,
         )
 
         assert result.cache_miss
         assert manager.get_snapshot("vlm-old") is None
+
+    def test_identityless_snapshot_is_rejected_when_vlm_prefix_overlaps_embedding(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=None,
+        )
+
+        manager.observe_request_blocks("vlm-new", ([30],))
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=_vlm_identity("session-a", offset=0, length=2),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+
+    def test_identityless_snapshot_can_match_text_only_prefix_before_vlm_embedding(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=None,
+        )
+
+        match = manager.choose_snapshot(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=_vlm_identity("session-a", offset=4, length=2),
+            )
+        )
+
+        assert match.req_id == "vlm-old"
+        assert match.matched_tokens == 4
+
+    def test_same_vlm_identity_reuses_snapshot(self) -> None:
+        manager = _make_manager(block_size=4)
+        identity = _vlm_identity("session-a", offset=2, length=2, content="same-image")
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=identity,
+        )
+
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=identity,
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.loaded
+        assert result.loaded_snapshot_req_id == "vlm-old"
+        assert result.matched_tokens == 4
+
+    def test_same_session_position_with_different_vlm_content_rejects_snapshot(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=_vlm_identity("session-a", offset=0, length=2, content="image-a"),
+        )
+
+        manager.observe_request_blocks("vlm-new", ([30],))
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=_vlm_identity("session-a", offset=0, length=2, content="image-b"),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+        assert manager.get_snapshot("vlm-old") is None
+
+    def test_unresolved_vlm_identity_trims_reuse_before_embedding_overlap(self) -> None:
+        manager = _make_manager(block_size=4)
+        unresolved_identity = _vlm_identity("session-a", offset=2, length=2, content=None)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=unresolved_identity,
+        )
+
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=unresolved_identity,
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.loaded
+        assert result.loaded_snapshot_req_id == "vlm-old"
+        assert result.matched_tokens == 2
 
     def test_snapshot_update_and_removal_refresh_prefix_index(self) -> None:
         manager = _make_manager(block_size=4)
