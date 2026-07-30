@@ -14,6 +14,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_mblt.mblt_worker import (
     InferenceLogits,
     MbltWorker,
+    PrefixCacheCostModel,
     RequestState,
     _is_multimodal_hf_config,
     _is_qwen3_vl_hf_config,
@@ -147,6 +148,7 @@ class TestMbltWorkerOptimizations:
         worker.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
         worker.sampler = Sampler(logprobs_mode="raw_logits")
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
         worker.input_embeddings = SimpleNamespace()
         worker.print_debug = False
         worker._warned_last_logit_prompt_logprobs = False
@@ -284,6 +286,154 @@ class TestMbltWorkerOptimizations:
         assert cache_size == 0
         assert load_calls == []
         assert worker.runtime_cache.loaded_req_id is None
+
+    def test_short_prefix_hit_skips_load_and_keeps_snapshot(self) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=16,
+            cache_token_ids=tuple(range(16)),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 16
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.get_snapshot("shared") is not None
+        assert worker.runtime_cache.loaded_req_id is None
+
+    def test_long_prefix_hit_loads_and_returns_suffix_start(self) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=128,
+            cache_token_ids=tuple(range(128)),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(160)))
+        req_state.block_ids = ([10, 11],)
+        req_state.first_seq_blocks = (10, 11)
+        req_state.first_seq_block_hashes = ("shared-block", "suffix-block")
+        req_state.num_computed_tokens = 128
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 128
+        assert load_calls == [(["runtime-cache"], None)]
+        assert worker.runtime_cache.loaded_req_id == "request"
+
+    def test_batch_prefix_cache_threshold_applies_per_cache_id(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            num_tokens=16,
+            cache_token_ids=tuple(range(16)),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(1, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 16
+        req_state.cache_slot_id = 1
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state, slot_id=1)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.live_slot_owner(1) == "request"
+        assert worker.runtime_cache.get_snapshot("shared") is not None
+
+    def test_prefix_cache_manual_override_and_auto_disable(self, monkeypatch) -> None:
+        cost_model = PrefixCacheCostModel(
+            block_size=128,
+            auto_threshold_enabled=True,
+            manual_min_hit_tokens=64,
+        )
+        cost_model.observe_prefill(128, 20.0)
+        cost_model.observe_load(None, 1.0)
+        assert not cost_model.should_load(matched_tokens=16)
+        assert cost_model.should_load(matched_tokens=128)
+
+        cost_model = PrefixCacheCostModel(
+            block_size=128,
+            auto_threshold_enabled=False,
+            manual_min_hit_tokens=None,
+        )
+        cost_model.observe_prefill(128, 1.0)
+        cost_model.observe_load(None, 100.0)
+        assert cost_model.should_load(matched_tokens=16)
+
+        config_model = PrefixCacheCostModel.from_config(
+            SimpleNamespace(
+                load_config=SimpleNamespace(
+                    model_loader_extra_config={
+                        "prefix_cache_auto_threshold": "0",
+                        "prefix_cache_min_hit_tokens": "32",
+                        "prefix_cache_load_margin": "0.8",
+                    }
+                ),
+                model_config=SimpleNamespace(model_kwargs={}, hf_overrides={}),
+            ),
+            block_size=128,
+        )
+        assert not config_model.auto_threshold_enabled
+        assert config_model.manual_min_hit_tokens == 32
+        assert config_model.margin == 0.8
+
+        monkeypatch.setenv("VLLM_MBLT_PREFIX_CACHE_MIN_HIT_TOKENS", "96")
+        env_model = PrefixCacheCostModel.from_config(SimpleNamespace(), block_size=128)
+        assert env_model.manual_min_hit_tokens == 96
+
+    def test_prefix_cache_calibration_uses_one_active_batch_cache_id(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 4
+        worker.max_seq_len = 128
+        worker.input_embeddings = torch.nn.Embedding(1, 4)
+        calls = []
+
+        def infer(inputs, *, params):
+            calls.extend((int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params)
+            total_tokens = sum(int(param.sequence_length) for param in params)
+            return [np.zeros((1, total_tokens, 8), dtype=np.float32)]
+
+        worker.cache_model = SimpleNamespace(infer=infer)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+
+        worker._calibrate_prefix_cache_prefill_costs()
+
+        assert calls
+        assert all(call == (128, 0, 1) for call in calls)
+        assert worker.prefix_cache_cost_model.prefill_ms(128) is not None
 
     def test_llm_prefix_cache_dump_saves_prompt_and_generated_token_identity(self) -> None:
         worker = self._make_worker()
