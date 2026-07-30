@@ -271,6 +271,15 @@ Model artifacts are available through Mobilint model repositories such as the
 - Keep finished-session snapshots for prefix reuse.
 - Evict finished snapshots with an LRU cap of 16 sessions.
 
+VLM prefix caching currently covers the language-model KV cache only. For
+single-request VLM execution (`max_batch_size=1`), the worker may load a
+compatible LM KV prefix snapshot and run only the uncached text/embedding
+suffix. Image/video feature extraction is not cached by this layer: image
+requests still rebuild vision features through the model's multimodal feature
+hooks before the LM prefill/decode step. Batch-compiled VLM execution is not
+supported yet; use VLM models with `max_batch_size=1` until Mobilint batch VLM
+artifacts and worker support are added.
+
 Implementation file: [`vllm_mblt/mblt_worker.py`](vllm_mblt/mblt_worker.py)
 
 ## Tests

@@ -168,6 +168,27 @@ class TestMbltWorkerOptimizations:
             kv_connector_metadata=None,
         )
 
+    def _make_new_request(
+        self,
+        req_id: str,
+        prompt_embeds: torch.Tensor,
+        mm_features: list[SimpleNamespace],
+        *,
+        num_computed_tokens: int = 0,
+        block_ids: tuple[list[int], ...] | None = None,
+        session_id: str | None = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            req_id=req_id,
+            sampling_params=SamplingParams.from_optional(temperature=0.0),
+            prompt_token_ids=list(range(int(prompt_embeds.shape[0]))),
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
+            block_ids=block_ids or ([11],),
+            num_computed_tokens=num_computed_tokens,
+            session_id=session_id,
+        )
+
     def _make_request_state(
         self,
         worker: MbltWorker,
@@ -1745,6 +1766,138 @@ class TestMbltWorkerOptimizations:
         torch.testing.assert_close(merged[1:3], image_embeds)
         torch.testing.assert_close(base_prompt_embeds, torch.arange(20, dtype=torch.float32).reshape(5, 4))
         assert deepstack is None
+
+    def test_single_request_vlm_reuses_lm_kv_prefix_and_runs_suffix_only(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen2_vl")
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", vocab_size=32000)
+        worker.req_states = {}
+        worker._infer_output_buffers = None
+        worker.runtime_cache.set_io_adapters(
+            dump_runtime_cache=lambda _slot_id: ["unused"],
+            load_runtime_cache=lambda blobs, _slot_id: blobs == ["lm-kv-prefix"],
+        )
+        worker.runtime_cache.store_snapshot(
+            req_id="shared-text-prefix",
+            blobs=["lm-kv-prefix"],
+            block_ids=([11],),
+            first_seq_blocks=(11,),
+            num_tokens=128,
+        )
+
+        image_feature_calls: list[dict[str, torch.Tensor]] = []
+        image_embeds = torch.full((2, 4), 9.0)
+
+        def get_image_features(**kwargs):
+            image_feature_calls.append(kwargs)
+            return image_embeds
+
+        infer_calls: list[tuple[int, int, np.ndarray]] = []
+
+        def infer(inputs, *, cache_size, outputs=None):
+            input_embeds = np.asarray(inputs[0] if isinstance(inputs, list) else inputs)
+            infer_calls.append((int(input_embeds.shape[1]), int(cache_size), input_embeds.copy()))
+            return [np.full((1, 16), 1.0, dtype=np.float32)]
+
+        worker.model.get_image_features = get_image_features
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(1, 16)],
+            get_num_model_variants=lambda: 0,
+        )
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        base_prompt_embeds = torch.arange(130 * 4, dtype=torch.float32).reshape(130, 4)
+        feature = SimpleNamespace(
+            modality="image",
+            data={"pixel_values": torch.zeros(1, 3), "image_grid_thw": torch.tensor([1, 1, 1])},
+            mm_position=SimpleNamespace(offset=4, length=2, is_embed=None),
+        )
+        new_req = self._make_new_request(
+            "vlm-hit",
+            base_prompt_embeds,
+            [feature],
+            num_computed_tokens=128,
+            block_ids=([11, 12],),
+            session_id="vlm-session",
+        )
+        scheduler_output = self._make_scheduler_output({"vlm-hit": 2})
+        scheduler_output.scheduled_new_reqs = [new_req]
+
+        output = worker.execute_model(scheduler_output)
+
+        assert output is not None
+        assert image_feature_calls and tuple(image_feature_calls[0]["image_grid_thw"].shape) == (1, 3)
+        assert [(sequence_length, cache_size) for sequence_length, cache_size, _inputs in infer_calls] == [(2, 128)]
+        np.testing.assert_array_equal(infer_calls[0][2][0], base_prompt_embeds[128:130].numpy())
+        assert worker.req_states["vlm-hit"].num_computed_tokens == 130
+        assert worker.runtime_cache.loaded_req_id == "vlm-hit"
+
+    def test_repeated_image_vlm_requests_still_rebuild_vision_embeddings(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen2_vl")
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", vocab_size=32000)
+        worker.req_states = {}
+        worker._infer_output_buffers = None
+        worker.runtime_cache.set_io_adapters(
+            dump_runtime_cache=lambda _slot_id: ["live-kv"],
+            load_runtime_cache=lambda _blobs, _slot_id: True,
+        )
+
+        image_feature_call_count = 0
+
+        def get_image_features(**_kwargs):
+            nonlocal image_feature_call_count
+            image_feature_call_count += 1
+            return torch.full((2, 4), float(image_feature_call_count))
+
+        infer_inputs: list[np.ndarray] = []
+
+        def infer(inputs, *, cache_size, outputs=None):
+            del cache_size, outputs
+            infer_inputs.append(np.asarray(inputs[0] if isinstance(inputs, list) else inputs).copy())
+            return [np.full((1, 16), 1.0, dtype=np.float32)]
+
+        worker.model.get_image_features = get_image_features
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(1, 16)],
+            get_num_model_variants=lambda: 0,
+        )
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        for index, req_id in enumerate(("vlm-first", "vlm-second"), start=1):
+            prompt_embeds = torch.zeros(6, 4)
+            feature = SimpleNamespace(
+                modality="image",
+                data={"pixel_values": torch.full((1, 3), float(index)), "image_grid_thw": torch.tensor([1, 1, 1])},
+                mm_position=SimpleNamespace(offset=2, length=2, is_embed=None),
+            )
+            scheduler_output = self._make_scheduler_output({req_id: 6})
+            scheduler_output.scheduled_new_reqs = [
+                self._make_new_request(
+                    req_id,
+                    prompt_embeds,
+                    [feature],
+                    block_ids=([20 + index],),
+                    session_id=f"vlm-session-{index}",
+                )
+            ]
+
+            assert worker.execute_model(scheduler_output) is not None
+
+        assert image_feature_call_count == 2
+        assert len(infer_inputs) == 2
+        np.testing.assert_array_equal(infer_inputs[0][0, 2:4], np.full((2, 4), 1.0, dtype=np.float32))
+        np.testing.assert_array_equal(infer_inputs[1][0, 2:4], np.full((2, 4), 2.0, dtype=np.float32))
 
     def test_build_deepstack_input_embeds_pads_decode_tokens(self) -> None:
         worker = self._make_worker()
