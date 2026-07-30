@@ -25,6 +25,7 @@ def _request(
     tokens: int,
     *,
     cache_slot_id: int | None = None,
+    cache_token_ids: tuple[int, ...] | list[int] | None = None,
 ) -> RuntimeCacheRequest:
     return RuntimeCacheRequest(
         req_id=req_id,
@@ -32,6 +33,7 @@ def _request(
         first_seq_blocks=blocks,
         num_computed_tokens=tokens,
         cache_slot_id=cache_slot_id,
+        cache_token_ids=tuple(cache_token_ids) if cache_token_ids is not None else None,
     )
 
 
@@ -42,6 +44,7 @@ def _store_snapshot(
     tokens: int,
     *,
     blobs: list[object] | None = None,
+    cache_token_ids: tuple[int, ...] | list[int] | None = None,
 ) -> None:
     block_tuple = tuple(blocks)
     block_ids = (list(block_tuple),)
@@ -51,6 +54,7 @@ def _store_snapshot(
         block_ids=block_ids,
         first_seq_blocks=first_seq_blocks(block_ids),
         num_tokens=tokens,
+        cache_token_ids=cache_token_ids,
     )
 
 
@@ -153,6 +157,59 @@ class TestMbltRuntimeCacheManagerSnapshots:
 
         assert snapshot is None
         assert matched_tokens == 0
+
+    def test_prefix_snapshot_rejects_reused_physical_blocks_with_different_tokens(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "old-content",
+            (10, 11),
+            8,
+            cache_token_ids=(101, 102, 103, 104, 105, 106, 107, 108),
+        )
+
+        match = manager.choose_snapshot(
+            _request(
+                "new-content",
+                (10, 11),
+                8,
+                cache_token_ids=(201, 202, 203, 204, 205, 206, 207, 208),
+            )
+        )
+
+        assert match.snapshot is None
+        assert match.matched_tokens == 0
+
+    def test_prefix_snapshot_selection_skips_incompatible_reused_block_candidate(self) -> None:
+        manager = _make_manager(block_size=4)
+        shared_blocks = (10, 11)
+        _store_snapshot(
+            manager,
+            "wrong-content",
+            shared_blocks,
+            8,
+            cache_token_ids=(101, 102, 103, 104, 105, 106, 107, 108),
+        )
+        _store_snapshot(
+            manager,
+            "right-content",
+            shared_blocks,
+            8,
+            cache_token_ids=(201, 202, 203, 204, 205, 206, 207, 208),
+        )
+
+        match = manager.choose_snapshot(
+            _request(
+                "new-content",
+                shared_blocks,
+                8,
+                cache_token_ids=(201, 202, 203, 204, 205, 206, 207, 208),
+            )
+        )
+
+        assert match.req_id == "right-content"
+        assert match.snapshot is manager.get_snapshot("right-content")
+        assert match.matched_tokens == 8
 
     def test_snapshot_update_and_removal_refresh_prefix_index(self) -> None:
         manager = _make_manager(block_size=4)
@@ -273,6 +330,32 @@ class TestMbltRuntimeCacheManagerRuntimeDecisions:
         assert result.cache_miss
         assert manager.loaded_req_id is None
 
+    def test_single_cache_does_not_load_snapshot_for_reused_blocks_with_different_tokens(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "old-content",
+            (10, 11),
+            8,
+            blobs=["stale-runtime-cache"],
+            cache_token_ids=(101, 102, 103, 104, 105, 106, 107, 108),
+        )
+        load_calls = []
+
+        result = manager.load_snapshot_for_request(
+            _request(
+                "new-content",
+                (10, 11),
+                8,
+                cache_token_ids=(201, 202, 203, 204, 205, 206, 207, 208),
+            ),
+            lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+        assert load_calls == []
+
     def test_dump_snapshot_if_needed_uses_injected_callable_and_block_boundary_policy(self) -> None:
         manager = _make_manager(block_size=4)
         dump_calls = []
@@ -303,6 +386,17 @@ class TestMbltRuntimeCacheManagerRuntimeDecisions:
         assert not not_dumped
         assert dump_calls == [None, None]
         assert manager.get_snapshot("req").blobs == ["blob:req:5"]
+
+    def test_dump_snapshot_if_needed_saves_token_identity_for_reused_block_detection(self) -> None:
+        manager = _make_manager(block_size=4)
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (10, 11), 8, cache_token_ids=(101, 102, 103, 104, 105, 106, 107, 108)),
+            lambda slot_id: ["blob:req"],
+        )
+
+        assert dumped
+        assert manager.get_snapshot("req").cache_token_ids == (101, 102, 103, 104, 105, 106, 107, 108)
 
     def test_dump_live_request_before_switch_dumps_current_owner_when_needed(self) -> None:
         manager = _make_manager(block_size=4)

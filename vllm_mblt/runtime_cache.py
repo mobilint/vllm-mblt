@@ -17,6 +17,7 @@ class RuntimeCacheSnapshot:
     block_ids: KVBlockIds
     first_seq_blocks: tuple[int, ...]
     num_tokens: int
+    cache_token_ids: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -26,6 +27,7 @@ class RuntimeCacheRequest:
     first_seq_blocks: tuple[int, ...]
     num_computed_tokens: int
     cache_slot_id: int | None = None
+    cache_token_ids: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -33,6 +35,7 @@ class RuntimeCacheSnapshotIndexNode:
     children: dict[int, "RuntimeCacheSnapshotIndexNode"] = field(default_factory=dict)
     best_req_id: str | None = None
     best_num_tokens: int = 0
+    req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -203,6 +206,7 @@ class MbltRuntimeCacheManager:
         block_ids: KVBlockIds,
         num_tokens: int,
         first_seq_block_ids: tuple[int, ...] | None = None,
+        cache_token_ids: tuple[int, ...] | list[int] | None = None,
     ) -> RuntimeCacheSnapshot:
         return self.store_snapshot(
             req_id=req_id,
@@ -210,6 +214,7 @@ class MbltRuntimeCacheManager:
             block_ids=block_ids,
             first_seq_blocks=first_seq_block_ids if first_seq_block_ids is not None else first_seq_blocks(block_ids),
             num_tokens=num_tokens,
+            cache_token_ids=cache_token_ids,
         )
 
     def store_snapshot(
@@ -220,6 +225,7 @@ class MbltRuntimeCacheManager:
         block_ids: KVBlockIds,
         first_seq_blocks: tuple[int, ...],
         num_tokens: int,
+        cache_token_ids: tuple[int, ...] | list[int] | None = None,
     ) -> RuntimeCacheSnapshot:
         self.finished_snapshot_lru.pop(req_id, None)
         snapshot = RuntimeCacheSnapshot(
@@ -227,6 +233,7 @@ class MbltRuntimeCacheManager:
             block_ids=normalize_block_ids(block_ids),
             first_seq_blocks=tuple(first_seq_blocks),
             num_tokens=max(0, int(num_tokens)),
+            cache_token_ids=tuple(cache_token_ids) if cache_token_ids is not None else None,
         )
         self.snapshots[req_id] = snapshot
         self.rebuild_snapshot_index()
@@ -246,6 +253,7 @@ class MbltRuntimeCacheManager:
         req_id: str,
         num_tokens: int,
     ) -> None:
+        node.req_ids.append(req_id)
         if num_tokens >= node.best_num_tokens:
             node.best_req_id = req_id
             node.best_num_tokens = num_tokens
@@ -299,6 +307,7 @@ class MbltRuntimeCacheManager:
         first_seq_blocks: tuple[int, ...],
         num_tokens: int,
         slot_id: int | None = None,
+        cache_token_ids: tuple[int, ...] | list[int] | None = None,
     ) -> RuntimeCacheSnapshot | None:
         if self._dump_runtime_cache_fn is None:
             raise RuntimeError("Runtime cache dump adapter is not configured.")
@@ -311,6 +320,7 @@ class MbltRuntimeCacheManager:
             block_ids=block_ids,
             first_seq_blocks=first_seq_blocks,
             num_tokens=num_tokens,
+            cache_token_ids=cache_token_ids,
         )
 
     def choose_prefix_snapshot(
@@ -318,8 +328,8 @@ class MbltRuntimeCacheManager:
         target_blocks: RuntimeCacheRequest | tuple[int, ...],
         target_tokens: int | None = None,
     ) -> RuntimeCacheSnapshotMatch:
-        if isinstance(target_blocks, RuntimeCacheRequest):
-            request = target_blocks
+        request = target_blocks if isinstance(target_blocks, RuntimeCacheRequest) else None
+        if request is not None:
             target_blocks = request.first_seq_blocks
             target_tokens = request.num_computed_tokens
         if target_tokens is None:
@@ -333,18 +343,23 @@ class MbltRuntimeCacheManager:
         node = self.snapshot_index_root
         for depth, block_id in enumerate(target_blocks, start=1):
             node = node.children.get(block_id)
-            if node is None or node.best_req_id is None:
+            if node is None or not node.req_ids:
                 break
 
-            snapshot = self.snapshots.get(node.best_req_id)
-            if snapshot is None:
-                continue
-
-            matched_tokens = min(snapshot.num_tokens, depth * self.block_size, target_tokens)
-            if matched_tokens > best_tokens:
-                best_tokens = matched_tokens
-                best_snapshot = snapshot
-                best_req_id = node.best_req_id
+            for req_id in node.req_ids:
+                snapshot = self.snapshots.get(req_id)
+                if snapshot is None:
+                    continue
+                matched_tokens = min(snapshot.num_tokens, depth * self.block_size, target_tokens)
+                matched_tokens = token_compatible_tokens(
+                    matched_tokens,
+                    request.cache_token_ids if request is not None else None,
+                    snapshot.cache_token_ids,
+                )
+                if matched_tokens > best_tokens:
+                    best_tokens = matched_tokens
+                    best_snapshot = snapshot
+                    best_req_id = req_id
 
         return RuntimeCacheSnapshotMatch(snapshot=best_snapshot, matched_tokens=best_tokens, req_id=best_req_id)
 
@@ -360,6 +375,8 @@ class MbltRuntimeCacheManager:
                 target_tokens=target_tokens,
                 snapshot_blocks=own_snapshot.first_seq_blocks,
                 snapshot_tokens=own_snapshot.num_tokens,
+                target_token_ids=request.cache_token_ids,
+                snapshot_token_ids=own_snapshot.cache_token_ids,
             )
             if matched_tokens >= target_tokens:
                 return RuntimeCacheSnapshotMatch(
@@ -369,7 +386,7 @@ class MbltRuntimeCacheManager:
                     is_own_snapshot=True,
                 )
 
-        return self.choose_prefix_snapshot(request.first_seq_blocks, target_tokens)
+        return self.choose_prefix_snapshot(request)
 
     def compatible_tokens(
         self,
@@ -378,14 +395,17 @@ class MbltRuntimeCacheManager:
         target_tokens: int,
         snapshot_blocks: tuple[int, ...],
         snapshot_tokens: int,
+        target_token_ids: tuple[int, ...] | None = None,
+        snapshot_token_ids: tuple[int, ...] | None = None,
     ) -> int:
-        return prefix_compatible_tokens(
+        matched_tokens = prefix_compatible_tokens(
             target_blocks,
             target_tokens,
             snapshot_blocks,
             snapshot_tokens,
             self.block_size,
         )
+        return token_compatible_tokens(matched_tokens, target_token_ids, snapshot_token_ids)
 
     def required_blocks(self, num_tokens: int) -> int:
         return required_blocks(num_tokens, self.block_size)
@@ -417,6 +437,7 @@ class MbltRuntimeCacheManager:
             block_ids=request.block_ids,
             first_seq_blocks=request.first_seq_blocks,
             num_tokens=request.num_computed_tokens,
+            cache_token_ids=request.cache_token_ids,
         )
         return True
 
@@ -612,3 +633,23 @@ def prefix_compatible_tokens(
         return min(target_tokens, snapshot_tokens)
 
     return min(snapshot_tokens, common_blocks * block_size, target_tokens)
+
+
+def token_compatible_tokens(
+    matched_tokens: int,
+    target_token_ids: tuple[int, ...] | None,
+    snapshot_token_ids: tuple[int, ...] | None,
+) -> int:
+    if matched_tokens <= 0:
+        return 0
+    if target_token_ids is None or snapshot_token_ids is None:
+        return matched_tokens
+
+    common_tokens = 0
+    for target_token_id, snapshot_token_id in zip(target_token_ids, snapshot_token_ids):
+        if target_token_id != snapshot_token_id:
+            break
+        common_tokens += 1
+        if common_tokens >= matched_tokens:
+            break
+    return min(matched_tokens, common_tokens)

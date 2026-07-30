@@ -253,6 +253,54 @@ class TestMbltWorkerOptimizations:
         assert snapshot is short_shared
         assert matched_tokens == 256
 
+    def test_llm_prefix_cache_does_not_load_reused_physical_blocks_for_different_prompt_tokens(self) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.store_snapshot(
+            req_id="old-content",
+            blobs=["stale-runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            num_tokens=4,
+            cache_token_ids=(101, 102, 103, 104),
+        )
+        load_calls = []
+        worker.runtime_cache.set_io_adapters(
+            load_runtime_cache=lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+        req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            [201, 202, 203, 204],
+        )
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.num_computed_tokens = 4
+
+        cache_size = worker._load_snapshot_if_needed("new-content", req_state)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.loaded_req_id is None
+
+    def test_llm_prefix_cache_dump_saves_prompt_and_generated_token_identity(self) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.set_io_adapters(dump_runtime_cache=lambda slot_id: ["runtime-cache"])
+        req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            [101, 102],
+            output_token_ids=[201, 202],
+        )
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+
+        dumped = worker._dump_snapshot("req", req_state, next_num_tokens=4)
+
+        assert dumped
+        snapshot = worker.runtime_cache.get_snapshot("req")
+        assert snapshot is not None
+        assert snapshot.cache_token_ids == (101, 102, 201, 202)
+
     def test_sampling_metadata_reuses_request_generator_and_enables_penalties(self) -> None:
         worker = self._make_worker()
         sampling_params = SamplingParams.from_optional(seed=123, frequency_penalty=0.5, top_k=20)

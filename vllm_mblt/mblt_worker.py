@@ -1885,6 +1885,7 @@ class MbltWorker(WorkerBase):
                 first_seq_blocks=req_state.first_seq_blocks,
                 num_computed_tokens=target_tokens,
                 cache_slot_id=slot_id,
+                cache_token_ids=self._cache_token_ids(req_state, target_tokens),
             )
         )
         if print_debug:
@@ -1923,6 +1924,7 @@ class MbltWorker(WorkerBase):
                 first_seq_blocks=req_state.first_seq_blocks,
                 num_computed_tokens=target_tokens,
                 cache_slot_id=slot_id,
+                cache_token_ids=self._cache_token_ids(req_state, target_tokens),
             ),
             slot_id=slot_id,
         )
@@ -1954,6 +1956,7 @@ class MbltWorker(WorkerBase):
             first_seq_blocks=req_state.first_seq_blocks,
             num_tokens=next_num_tokens,
             slot_id=slot_id,
+            cache_token_ids=self._cache_token_ids(req_state, next_num_tokens),
         )
         if snapshot is None:
             if self._is_batch_model() and not self._warned_batch_cache_snapshot_unsupported:
@@ -1970,6 +1973,11 @@ class MbltWorker(WorkerBase):
                 f"blocks={num_blocks} snapshots={self.runtime_cache.snapshot_count()}"
             )
         return True
+
+    @staticmethod
+    def _cache_token_ids(req_state: RequestState, num_tokens: int) -> tuple[int, ...]:
+        token_ids = list(req_state.prompt_token_ids) + list(req_state.output_token_ids)
+        return tuple(token_ids[: max(0, int(num_tokens))])
 
     def _finalize_finished_request(
         self,
