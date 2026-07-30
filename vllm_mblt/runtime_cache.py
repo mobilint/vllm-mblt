@@ -2,7 +2,7 @@ import math
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Hashable
 
 KVBlockIds = tuple[list[int], ...]
 RuntimeCacheDumpFn = Callable[[int | None], list[Any] | None]
@@ -18,6 +18,7 @@ class RuntimeCacheSnapshot:
     first_seq_blocks: tuple[int, ...]
     num_tokens: int
     cache_token_ids: tuple[int, ...] | None = None
+    first_seq_block_hashes: tuple[Hashable, ...] | None = None
 
 
 @dataclass
@@ -28,11 +29,12 @@ class RuntimeCacheRequest:
     num_computed_tokens: int
     cache_slot_id: int | None = None
     cache_token_ids: tuple[int, ...] | None = None
+    first_seq_block_hashes: tuple[Hashable, ...] | None = None
 
 
 @dataclass
 class RuntimeCacheSnapshotIndexNode:
-    children: dict[int, "RuntimeCacheSnapshotIndexNode"] = field(default_factory=dict)
+    children: dict[Hashable, "RuntimeCacheSnapshotIndexNode"] = field(default_factory=dict)
     best_req_id: str | None = None
     best_num_tokens: int = 0
     req_ids: list[str] = field(default_factory=list)
@@ -97,6 +99,7 @@ class MbltRuntimeCacheManager:
         self.snapshots: dict[str, RuntimeCacheSnapshot] = {}
         self.snapshot_index_root = RuntimeCacheSnapshotIndexNode()
         self.finished_snapshot_lru: OrderedDict[str, None] = OrderedDict()
+        self.physical_block_owner: dict[int, str] = {}
 
         # Single-cache runtime owner.
         self.loaded_req_id: str | None = None
@@ -144,6 +147,52 @@ class MbltRuntimeCacheManager:
         self.slot_to_req = {}
         self.slot_live_req = {}
         self.free_slots = list(range(self.max_batch_size))
+
+    def _request_index_blocks(self, request: RuntimeCacheRequest) -> tuple[Hashable, ...]:
+        if request.first_seq_block_hashes is not None:
+            return tuple(("hash", block_hash) for block_hash in request.first_seq_block_hashes)
+        return tuple(("physical", block_id) for block_id in request.first_seq_blocks)
+
+    def _snapshot_index_blocks(self, snapshot: RuntimeCacheSnapshot) -> tuple[Hashable, ...]:
+        if snapshot.first_seq_block_hashes is not None:
+            return tuple(("hash", block_hash) for block_hash in snapshot.first_seq_block_hashes)
+        return tuple(("physical", block_id) for block_id in snapshot.first_seq_blocks)
+
+    def observe_request_blocks(
+        self,
+        req_id: str,
+        block_ids: KVBlockIds,
+        *,
+        first_seq_block_hashes: tuple[Hashable, ...] | None = None,
+    ) -> list[str]:
+        """Invalidate ID-keyed snapshots when vLLM reuses physical KV blocks.
+
+        Content-hashed requests/snapshots are safe to match across physical block
+        reuse. Hashless snapshots are only safe while their physical blocks have
+        not been observed under another request.
+        """
+        if first_seq_block_hashes is not None:
+            return []
+
+        stale_req_ids: set[str] = set()
+        for block_id in first_seq_blocks(block_ids):
+            owner = self.physical_block_owner.get(block_id)
+            if owner is None or owner == req_id:
+                continue
+            for snapshot_req_id, snapshot in self.snapshots.items():
+                if snapshot_req_id == req_id or snapshot.first_seq_block_hashes is not None:
+                    continue
+                if block_id in snapshot.first_seq_blocks:
+                    stale_req_ids.add(snapshot_req_id)
+
+        removed: list[str] = []
+        for stale_req_id in sorted(stale_req_ids):
+            if self.remove_snapshot(stale_req_id) is not None:
+                removed.append(stale_req_id)
+
+        for block_id in first_seq_blocks(block_ids):
+            self.physical_block_owner[block_id] = req_id
+        return removed
 
     def get_slot(self, req_id: str) -> int:
         slot_id = self.req_to_slot.get(req_id)
@@ -224,6 +273,7 @@ class MbltRuntimeCacheManager:
         blobs: list[Any],
         block_ids: KVBlockIds,
         first_seq_blocks: tuple[int, ...],
+        first_seq_block_hashes: tuple[Hashable, ...] | None = None,
         num_tokens: int,
         cache_token_ids: tuple[int, ...] | list[int] | None = None,
     ) -> RuntimeCacheSnapshot:
@@ -232,10 +282,14 @@ class MbltRuntimeCacheManager:
             blobs=blobs,
             block_ids=normalize_block_ids(block_ids),
             first_seq_blocks=tuple(first_seq_blocks),
+            first_seq_block_hashes=tuple(first_seq_block_hashes) if first_seq_block_hashes is not None else None,
             num_tokens=max(0, int(num_tokens)),
             cache_token_ids=tuple(cache_token_ids) if cache_token_ids is not None else None,
         )
         self.snapshots[req_id] = snapshot
+        if snapshot.first_seq_block_hashes is None:
+            for block_id in snapshot.first_seq_blocks:
+                self.physical_block_owner[block_id] = req_id
         self.rebuild_snapshot_index()
         return snapshot
 
@@ -263,8 +317,8 @@ class MbltRuntimeCacheManager:
         for req_id, snapshot in self.snapshots.items():
             node = root
             self._update_snapshot_index_node(node, req_id, snapshot.num_tokens)
-            for block_id in snapshot.first_seq_blocks:
-                node = node.children.setdefault(block_id, RuntimeCacheSnapshotIndexNode())
+            for block_key in self._snapshot_index_blocks(snapshot):
+                node = node.children.setdefault(block_key, RuntimeCacheSnapshotIndexNode())
                 self._update_snapshot_index_node(node, req_id, snapshot.num_tokens)
         self.snapshot_index_root = root
 
@@ -305,6 +359,7 @@ class MbltRuntimeCacheManager:
         req_id: str,
         block_ids: KVBlockIds,
         first_seq_blocks: tuple[int, ...],
+        first_seq_block_hashes: tuple[Hashable, ...] | None = None,
         num_tokens: int,
         slot_id: int | None = None,
         cache_token_ids: tuple[int, ...] | list[int] | None = None,
@@ -319,6 +374,7 @@ class MbltRuntimeCacheManager:
             blobs=blobs,
             block_ids=block_ids,
             first_seq_blocks=first_seq_blocks,
+            first_seq_block_hashes=first_seq_block_hashes,
             num_tokens=num_tokens,
             cache_token_ids=cache_token_ids,
         )
@@ -330,8 +386,10 @@ class MbltRuntimeCacheManager:
     ) -> RuntimeCacheSnapshotMatch:
         request = target_blocks if isinstance(target_blocks, RuntimeCacheRequest) else None
         if request is not None:
-            target_blocks = request.first_seq_blocks
+            target_blocks = self._request_index_blocks(request)
             target_tokens = request.num_computed_tokens
+        else:
+            target_blocks = tuple(("physical", block_id) for block_id in target_blocks)
         if target_tokens is None:
             raise TypeError("target_tokens is required when target_blocks is not a RuntimeCacheRequest")
         if target_tokens <= 0 or not target_blocks:
@@ -371,9 +429,9 @@ class MbltRuntimeCacheManager:
         own_snapshot = self.snapshots.get(request.req_id)
         if own_snapshot is not None:
             matched_tokens = self.compatible_tokens(
-                target_blocks=request.first_seq_blocks,
+                target_blocks=self._request_index_blocks(request),
                 target_tokens=target_tokens,
-                snapshot_blocks=own_snapshot.first_seq_blocks,
+                snapshot_blocks=self._snapshot_index_blocks(own_snapshot),
                 snapshot_tokens=own_snapshot.num_tokens,
                 target_token_ids=request.cache_token_ids,
                 snapshot_token_ids=own_snapshot.cache_token_ids,
@@ -391,9 +449,9 @@ class MbltRuntimeCacheManager:
     def compatible_tokens(
         self,
         *,
-        target_blocks: tuple[int, ...],
+        target_blocks: tuple[Hashable, ...],
         target_tokens: int,
-        snapshot_blocks: tuple[int, ...],
+        snapshot_blocks: tuple[Hashable, ...],
         snapshot_tokens: int,
         target_token_ids: tuple[int, ...] | None = None,
         snapshot_token_ids: tuple[int, ...] | None = None,
@@ -436,6 +494,7 @@ class MbltRuntimeCacheManager:
             blobs=blobs,
             block_ids=request.block_ids,
             first_seq_blocks=request.first_seq_blocks,
+            first_seq_block_hashes=request.first_seq_block_hashes,
             num_tokens=request.num_computed_tokens,
             cache_token_ids=request.cache_token_ids,
         )
@@ -463,6 +522,12 @@ class MbltRuntimeCacheManager:
         if target_tokens <= 0:
             self.clear_loaded_request()
             return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True, action="skip-empty")
+
+        self.observe_request_blocks(
+            request.req_id,
+            request.block_ids,
+            first_seq_block_hashes=request.first_seq_block_hashes,
+        )
 
         if self.loaded_req_id == request.req_id:
             return RuntimeCacheLoadResult(
@@ -510,6 +575,12 @@ class MbltRuntimeCacheManager:
         if target_tokens <= 0:
             return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True, action="skip-empty")
 
+        self.observe_request_blocks(
+            request.req_id,
+            request.block_ids,
+            first_seq_block_hashes=request.first_seq_block_hashes,
+        )
+
         if self.live_slot_owner(slot_id) == request.req_id:
             return RuntimeCacheLoadResult(
                 matched_tokens=target_tokens,
@@ -544,6 +615,7 @@ class MbltRuntimeCacheManager:
                 block_ids=request.block_ids,
                 first_seq_blocks=request.first_seq_blocks,
                 num_computed_tokens=request.num_computed_tokens,
+                first_seq_block_hashes=request.first_seq_block_hashes,
                 cache_slot_id=slot_id,
             )
         return self.load_snapshot_for_slot(request)
@@ -573,6 +645,7 @@ class MbltRuntimeCacheManager:
         self.snapshots.clear()
         self.finished_snapshot_lru.clear()
         self.snapshot_index_root = RuntimeCacheSnapshotIndexNode()
+        self.physical_block_owner.clear()
         self.loaded_req_id = None
         self.reset_slots()
 

@@ -24,6 +24,7 @@ def _request(
     blocks: tuple[int, ...],
     tokens: int,
     *,
+    block_hashes: tuple[object, ...] | None = None,
     cache_slot_id: int | None = None,
     cache_token_ids: tuple[int, ...] | list[int] | None = None,
 ) -> RuntimeCacheRequest:
@@ -32,6 +33,7 @@ def _request(
         block_ids=(list(blocks),),
         first_seq_blocks=blocks,
         num_computed_tokens=tokens,
+        first_seq_block_hashes=block_hashes,
         cache_slot_id=cache_slot_id,
         cache_token_ids=tuple(cache_token_ids) if cache_token_ids is not None else None,
     )
@@ -45,6 +47,7 @@ def _store_snapshot(
     *,
     blobs: list[object] | None = None,
     cache_token_ids: tuple[int, ...] | list[int] | None = None,
+    block_hashes: tuple[object, ...] | None = None,
 ) -> None:
     block_tuple = tuple(blocks)
     block_ids = (list(block_tuple),)
@@ -53,6 +56,7 @@ def _store_snapshot(
         blobs=blobs if blobs is not None else [f"blob:{req_id}"],
         block_ids=block_ids,
         first_seq_blocks=first_seq_blocks(block_ids),
+        first_seq_block_hashes=block_hashes,
         num_tokens=tokens,
         cache_token_ids=cache_token_ids,
     )
@@ -180,6 +184,15 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert match.snapshot is None
         assert match.matched_tokens == 0
 
+    def test_hashed_snapshot_does_not_match_reused_physical_block_ids(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "old", (1, 2), 8, block_hashes=("old-a", "old-b"))
+
+        match = manager.choose_snapshot(_request("new", (1, 2), 8, block_hashes=("new-a", "new-b")))
+
+        assert match.snapshot is None
+        assert match.matched_tokens == 0
+
     def test_prefix_snapshot_selection_skips_incompatible_reused_block_candidate(self) -> None:
         manager = _make_manager(block_size=4)
         shared_blocks = (10, 11)
@@ -210,6 +223,31 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert match.req_id == "right-content"
         assert match.snapshot is manager.get_snapshot("right-content")
         assert match.matched_tokens == 8
+
+    def test_hashless_snapshot_invalidates_when_physical_block_owner_changes(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "old", (1, 2), 8)
+
+        evicted = manager.observe_request_blocks("new", ([1, 3],))
+
+        assert evicted == ["old"]
+        assert manager.get_snapshot("old") is None
+        assert manager.choose_snapshot(_request("new", (1, 2), 8)).snapshot is None
+
+    def test_hashless_load_invalidates_stale_snapshot_before_restore(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "old", (1, 2), 8)
+        load_calls = []
+
+        result = manager.load_snapshot_for_request(
+            _request("new", (1, 2), 8),
+            lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+        assert load_calls == []
+        assert manager.get_snapshot("old") is None
 
     def test_snapshot_update_and_removal_refresh_prefix_index(self) -> None:
         manager = _make_manager(block_size=4)
@@ -305,11 +343,11 @@ class TestMbltRuntimeCacheManagerRuntimeDecisions:
 
     def test_single_cache_loads_useful_shared_prefix_snapshot(self) -> None:
         manager = _make_manager(block_size=4)
-        _store_snapshot(manager, "shared", (1, 2, 3), 12)
+        _store_snapshot(manager, "shared", (1, 2, 3), 12, block_hashes=("a", "b", "c"))
         load_calls = []
 
         result = manager.load_snapshot_for_request(
-            _request("req", (1, 2, 9), 10),
+            _request("req", (1, 2, 9), 10, block_hashes=("a", "b", "z")),
             lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
         )
 
@@ -469,9 +507,9 @@ class TestMbltRuntimeCacheManagerSlots:
         assert reused.matched_tokens == 4
         assert load_calls == []
 
-        _store_snapshot(manager, "other", (7, 8), 8)
+        _store_snapshot(manager, "other", (7, 8), 8, block_hashes=("a", "b"))
         loaded = manager.load_snapshot_for_slot(
-            _request("new", (7, 9), 8, cache_slot_id=slot_id),
+            _request("new", (7, 9), 8, block_hashes=("a", "z"), cache_slot_id=slot_id),
             lambda blobs, load_slot_id: load_calls.append((blobs, load_slot_id)) or True,
         )
 

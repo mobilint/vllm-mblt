@@ -204,6 +204,7 @@ class TestMbltWorkerOptimizations:
             cached_sampling_state=worker._make_cached_sampling_state(sampling_params, prompt_token_ids),
             block_ids=([],),
             first_seq_blocks=(),
+            first_seq_block_hashes=None,
             num_computed_tokens=0,
             num_output_tokens=0,
             prompt_embeds=np.empty((0, 1), dtype=np.float32),

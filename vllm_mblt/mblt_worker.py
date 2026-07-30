@@ -2,7 +2,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional
 
 import numpy as np
 import torch
@@ -105,6 +105,7 @@ class RequestState:
     cached_sampling_state: "CachedSamplingState"
     block_ids: KVBlockIds
     first_seq_blocks: tuple[int, ...]
+    first_seq_block_hashes: Optional[tuple[Hashable, ...]]
     num_computed_tokens: int
     num_output_tokens: int
     prompt_embeds: np.ndarray
@@ -266,6 +267,56 @@ class MbltWorker(WorkerBase):
 
     def _first_seq_blocks(self, block_ids: KVBlockIds) -> tuple[int, ...]:
         return first_seq_blocks(block_ids)
+
+    def _extract_first_seq_block_hashes(
+        self,
+        source: object,
+        *,
+        candidates: tuple[str, ...] = ("block_hashes", "kv_block_hashes", "block_hash_ids"),
+    ) -> Optional[tuple[Hashable, ...]]:
+        for attr in candidates:
+            block_hashes = getattr(source, attr, None)
+            if block_hashes is None:
+                continue
+            if not block_hashes:
+                return ()
+            if isinstance(block_hashes[0], list):
+                return tuple(block_hashes[0])
+            return tuple(block_hashes)
+        return None
+
+    def _extract_indexed_first_seq_block_hashes(
+        self,
+        source: object,
+        index: int,
+        *,
+        candidates: tuple[str, ...],
+    ) -> Optional[tuple[Hashable, ...]]:
+        for attr in candidates:
+            block_hashes_by_req = getattr(source, attr, None)
+            if block_hashes_by_req is None:
+                continue
+            if not block_hashes_by_req:
+                return ()
+            try:
+                block_hashes = block_hashes_by_req[index]
+            except IndexError:
+                return None
+            if not block_hashes:
+                return ()
+            if isinstance(block_hashes[0], list):
+                return tuple(block_hashes[0])
+            return tuple(block_hashes)
+        return None
+
+    def _append_first_seq_block_hashes(
+        self,
+        current_hashes: Optional[tuple[Hashable, ...]],
+        new_hashes: Optional[tuple[Hashable, ...]],
+    ) -> Optional[tuple[Hashable, ...]]:
+        if current_hashes is None or new_hashes is None:
+            return None
+        return current_hashes + new_hashes
 
     def _get_cache_model(self) -> Any:
         if self.cache_model is None:
@@ -1884,6 +1935,7 @@ class MbltWorker(WorkerBase):
                 block_ids=req_state.block_ids,
                 first_seq_blocks=req_state.first_seq_blocks,
                 num_computed_tokens=target_tokens,
+                first_seq_block_hashes=req_state.first_seq_block_hashes,
                 cache_slot_id=slot_id,
                 cache_token_ids=self._cache_token_ids(req_state, target_tokens),
             )
@@ -1923,6 +1975,7 @@ class MbltWorker(WorkerBase):
                 block_ids=req_state.block_ids,
                 first_seq_blocks=req_state.first_seq_blocks,
                 num_computed_tokens=target_tokens,
+                first_seq_block_hashes=req_state.first_seq_block_hashes,
                 cache_slot_id=slot_id,
                 cache_token_ids=self._cache_token_ids(req_state, target_tokens),
             ),
@@ -1954,6 +2007,7 @@ class MbltWorker(WorkerBase):
             req_id=req_id,
             block_ids=req_state.block_ids,
             first_seq_blocks=req_state.first_seq_blocks,
+            first_seq_block_hashes=req_state.first_seq_block_hashes,
             num_tokens=next_num_tokens,
             slot_id=slot_id,
             cache_token_ids=self._cache_token_ids(req_state, next_num_tokens),
@@ -2276,6 +2330,12 @@ class MbltWorker(WorkerBase):
             )
 
             normalized_block_ids = self._normalize_block_ids(new_req.block_ids)
+            first_seq_block_hashes = self._extract_first_seq_block_hashes(new_req)
+            self.runtime_cache.observe_request_blocks(
+                new_req.req_id,
+                normalized_block_ids,
+                first_seq_block_hashes=first_seq_block_hashes,
+            )
             prompt_embeds_np = self._to_cpu_float32_numpy(prompt_embeds)
             prompt_deepstack_embeds_np = (
                 self._to_cpu_float32_numpy(prompt_deepstack_embeds) if prompt_deepstack_embeds is not None else None
@@ -2292,6 +2352,7 @@ class MbltWorker(WorkerBase):
                 ),
                 block_ids=normalized_block_ids,
                 first_seq_blocks=self._first_seq_blocks(normalized_block_ids),
+                first_seq_block_hashes=first_seq_block_hashes,
                 num_computed_tokens=new_req.num_computed_tokens,
                 num_output_tokens=0,
                 prompt_embeds=prompt_embeds_np,
@@ -2313,14 +2374,29 @@ class MbltWorker(WorkerBase):
 
             new_block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[i]
             if new_block_ids is not None:
+                new_block_hashes = self._extract_indexed_first_seq_block_hashes(
+                    scheduler_output.scheduled_cached_reqs,
+                    i,
+                    candidates=("new_block_hashes", "new_kv_block_hashes", "new_block_hash_ids"),
+                )
                 if req_id in scheduler_output.scheduled_cached_reqs.resumed_req_ids:
                     cached_request_state.block_ids = self._normalize_block_ids(new_block_ids)
+                    cached_request_state.first_seq_block_hashes = new_block_hashes
                 else:
                     cached_request_state.block_ids = self._append_block_ids(
                         cached_request_state.block_ids,
                         new_block_ids,
                     )
+                    cached_request_state.first_seq_block_hashes = self._append_first_seq_block_hashes(
+                        cached_request_state.first_seq_block_hashes,
+                        new_block_hashes,
+                    )
                 cached_request_state.first_seq_blocks = self._first_seq_blocks(cached_request_state.block_ids)
+                self.runtime_cache.observe_request_blocks(
+                    req_id,
+                    cached_request_state.block_ids,
+                    first_seq_block_hashes=cached_request_state.first_seq_block_hashes,
+                )
 
         batch_size = len(scheduler_output.num_scheduled_tokens)
 
