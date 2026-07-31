@@ -49,6 +49,40 @@ class TestMbltWorkerOptimizations:
         assert not _is_qwen3_vl_hf_config(SimpleNamespace(model_type="qwen2_vl"))
         assert not _is_qwen3_vl_hf_config(SimpleNamespace(architectures=["MobilintQwen3VLForConditionalGeneration"]))
 
+    def test_qwen3_vl_composite_config_resolves_text_vocab_size_for_default_top_k(self) -> None:
+        worker = self._make_worker()
+        worker.model.config = SimpleNamespace(
+            model_type="mobilint-qwen3_vl",
+            text_config=SimpleNamespace(vocab_size=151936),
+        )
+
+        cached_state = worker._make_cached_sampling_state(SamplingParams.from_optional(top_k=0), [1, 2, 3])
+
+        assert cached_state.top_k == 151936
+
+    def test_vocab_size_resolution_falls_back_to_hf_text_config(self) -> None:
+        worker = self._make_worker()
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.model_config.hf_config = SimpleNamespace(text_config=SimpleNamespace(vocab_size=151936))
+
+        assert worker._resolve_vocab_size() == 151936
+        assert worker._num_prompt_logprobs(SamplingParams.from_optional(prompt_logprobs=-1)) == 151936
+        packed = worker._pack_prompt_token_ids(
+            [
+                torch.as_tensor([1, 2, 3], dtype=torch.int64),
+                torch.as_tensor([4], dtype=torch.int64),
+            ]
+        )
+        assert packed.tolist() == [[1, 2, 3], [4, 151936, 151936]]
+
+    def test_vocab_size_resolution_rejects_missing_vocab_size(self) -> None:
+        worker = self._make_worker()
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.model_config.hf_config = SimpleNamespace(text_config=SimpleNamespace())
+
+        with pytest.raises(RuntimeError, match="Unable to resolve a positive vocab_size"):
+            worker._make_cached_sampling_state(SamplingParams.from_optional(top_k=0), [1])
+
     def test_multimodal_model_detection_uses_mobilint_model_type_only(self) -> None:
         worker = self._make_worker()
         assert not worker._is_multimodal_model()

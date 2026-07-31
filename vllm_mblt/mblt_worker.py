@@ -101,6 +101,19 @@ def _normalize_model_kwargs_for_hf_config(
     return normalized
 
 
+def _positive_int_attr(root: object, path: str) -> Optional[int]:
+    value = root
+    for attr in path.split("."):
+        value = getattr(value, attr, None)
+        if value is None:
+            return None
+    try:
+        int_value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return int_value if int_value > 0 else None
+
+
 @dataclass
 class RequestState:
     is_prefill: bool
@@ -1682,10 +1695,32 @@ class MbltWorker(WorkerBase):
         if num_prompt_logprobs is None:
             return None
         if num_prompt_logprobs == -1:
-            if self.model is None:
-                raise RuntimeError("Model is not initialized.")
-            return int(self.model.config.vocab_size)
+            return self._resolve_vocab_size()
         return int(num_prompt_logprobs)
+
+    def _resolve_vocab_size(self) -> int:
+        if self.model is None:
+            raise RuntimeError("Model is not initialized.")
+
+        candidates = (
+            (getattr(self.model, "config", None), "vocab_size", "model.config.vocab_size"),
+            (getattr(self.model, "config", None), "text_config.vocab_size", "model.config.text_config.vocab_size"),
+            (getattr(self.model_config, "hf_config", None), "vocab_size", "model_config.hf_config.vocab_size"),
+            (
+                getattr(self.model_config, "hf_config", None),
+                "text_config.vocab_size",
+                "model_config.hf_config.text_config.vocab_size",
+            ),
+        )
+        for root, path, _source in candidates:
+            if root is None:
+                continue
+            vocab_size = _positive_int_attr(root, path)
+            if vocab_size is not None:
+                return vocab_size
+
+        searched = ", ".join(source for _root, _path, source in candidates)
+        raise RuntimeError(f"Unable to resolve a positive vocab_size for MBLT sampling state. Checked: {searched}.")
 
     def _should_recompute_prompt_logprobs_from_start(self, req_state: RequestState) -> bool:
         return (
@@ -2794,10 +2829,12 @@ class MbltWorker(WorkerBase):
             if max_num_logprobs < 0:
                 max_num_logprobs = 0
 
+        vocab_size = self._resolve_vocab_size()
+
         return CachedSamplingState(
             temperature=float(sampling_params.temperature),
             top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k if sampling_params.top_k > 0 else self.model.config.vocab_size),
+            top_k=int(sampling_params.top_k if sampling_params.top_k > 0 else vocab_size),
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
@@ -2823,7 +2860,7 @@ class MbltWorker(WorkerBase):
 
         prompt_token_ids = torch.full(
             (len(prompt_token_ids_list), max_prompt_len),
-            fill_value=self.model.config.vocab_size,
+            fill_value=self._resolve_vocab_size(),
             dtype=torch.int64,
         )
         for row, token_ids in enumerate(prompt_token_ids_list):
