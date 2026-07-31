@@ -15,9 +15,11 @@ def _make_vllm_config(
     *,
     loader_core_mode=None,
     loader_extra_config=None,
+    hf_config=None,
     hf_core_mode=None,
     hf_model_type="qwen2",
     max_batch_size=None,
+    text_config=None,
     scheduler_max_num_batched_tokens=2048,
     scheduler_max_num_seqs=None,
     scheduler_max_num_partial_prefills=1,
@@ -26,6 +28,14 @@ def _make_vllm_config(
 ):
     if loader_extra_config is None:
         loader_extra_config = {"core_mode": loader_core_mode} if loader_core_mode is not None else {}
+    if hf_config is None:
+        hf_config = SimpleNamespace(
+            model_type=hf_model_type,
+            npu_prefill_chunk_size=npu_prefill_chunk_size,
+            max_batch_size=max_batch_size,
+            text_config=text_config,
+            core_mode=hf_core_mode,
+        )
     return SimpleNamespace(
         parallel_config=SimpleNamespace(worker_cls=None),
         cache_config=SimpleNamespace(block_size=None, enable_prefix_caching=None),
@@ -37,16 +47,17 @@ def _make_vllm_config(
             max_long_partial_prefills=scheduler_max_long_partial_prefills,
             long_prefill_token_threshold=scheduler_long_prefill_token_threshold,
         ),
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(
-                model_type=hf_model_type,
-                npu_prefill_chunk_size=npu_prefill_chunk_size,
-                max_batch_size=max_batch_size,
-                core_mode=hf_core_mode,
-            )
-        ),
+        model_config=SimpleNamespace(hf_config=hf_config),
         load_config=SimpleNamespace(model_loader_extra_config=loader_extra_config),
     )
+
+
+class _ToDictConfig:
+    def __init__(self, values):
+        self._values = values
+
+    def to_dict(self):
+        return self._values
 
 
 class TestMbltPlatformPrefill:
@@ -115,6 +126,48 @@ class TestMbltPlatformPrefill:
         )
 
         assert resolve_model_max_batch_size(config) == 4
+
+    def test_resolves_vlm_text_config_max_batch_size_without_top_level_value(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={},
+            hf_model_type="mobilint-qwen3_vl",
+            text_config=SimpleNamespace(max_batch_size=16),
+        )
+
+        assert resolve_model_max_batch_size(config) == 16
+
+    def test_platform_uses_vlm_text_config_max_batch_size_for_scheduler_limit(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={},
+            hf_model_type="mobilint-qwen3_vl",
+            text_config=SimpleNamespace(max_batch_size=16),
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.scheduler_config.max_num_seqs == 16
+
+    def test_resolves_vlm_dict_text_config_max_batch_size_without_top_level_value(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={},
+            hf_config={"model_type": "mobilint-qwen3_vl", "text_config": {"max_batch_size": 16}},
+        )
+
+        assert resolve_model_max_batch_size(config) == 16
+
+    def test_resolves_vlm_to_dict_text_config_npu_max_batch_size_without_top_level_value(self) -> None:
+        config = _make_vllm_config(
+            {"global4": 256},
+            loader_extra_config={},
+            hf_config=_ToDictConfig(
+                {"model_type": "mobilint-qwen3_vl", "text_config": {"npu_max_batch_size": 16}}
+            ),
+        )
+
+        assert resolve_model_max_batch_size(config) == 16
 
     def test_uses_loader_text_core_mode_for_max_batch_size_mapping(self) -> None:
         config = _make_vllm_config(

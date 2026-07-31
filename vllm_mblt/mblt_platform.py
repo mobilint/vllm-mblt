@@ -56,10 +56,41 @@ def _get_hf_config(vllm_config: "VllmConfig") -> object:
     return getattr(model_config, "hf_config", None)
 
 
+def _to_config_dict(config: object) -> dict | None:
+    if isinstance(config, dict):
+        return config
+
+    to_dict = getattr(config, "to_dict", None)
+    if callable(to_dict):
+        try:
+            config_dict = to_dict()
+        except Exception:
+            return None
+        return config_dict if isinstance(config_dict, dict) else None
+
+    return None
+
+
+def _get_config_field_value(config: object, field_name: str) -> object:
+    if config is None:
+        return None
+
+    if isinstance(config, dict) and field_name in config:
+        return config[field_name]
+
+    value = getattr(config, field_name, None)
+    if value is not None:
+        return value
+
+    config_dict = _to_config_dict(config)
+    if isinstance(config_dict, dict) and field_name in config_dict:
+        return config_dict[field_name]
+
+    return None
+
+
 def _is_multimodal_hf_config(hf_config: object) -> bool:
-    model_type = getattr(hf_config, "model_type", None)
-    if not isinstance(model_type, str) and isinstance(hf_config, dict):
-        model_type = hf_config.get("model_type")
+    model_type = _get_config_field_value(hf_config, "model_type")
     return isinstance(model_type, str) and model_type in _MULTIMODAL_HF_MODEL_TYPES
 
 
@@ -92,25 +123,23 @@ def _get_model_config_value(vllm_config: "VllmConfig", *field_names: str) -> obj
     if hf_config is None:
         return None
 
-    config_dict = None
-    to_dict = getattr(hf_config, "to_dict", None)
-    if callable(to_dict):
-        try:
-            config_dict = to_dict()
-        except Exception:
-            config_dict = None
-
     for field_name in field_names:
-        if isinstance(hf_config, dict) and field_name in hf_config:
-            return hf_config[field_name]
-
-        value = getattr(hf_config, field_name, None)
+        value = _get_config_field_value(hf_config, field_name)
         if value is not None:
             return value
 
-        if isinstance(config_dict, dict) and field_name in config_dict:
-            return config_dict[field_name]
+    return None
 
+
+def _get_text_model_config_value(vllm_config: "VllmConfig", *field_names: str) -> object:
+    text_config = _get_config_field_value(_get_hf_config(vllm_config), "text_config")
+    if text_config is None:
+        return None
+
+    for field_name in field_names:
+        value = _get_config_field_value(text_config, field_name)
+        if value is not None:
+            return value
     return None
 
 
@@ -200,6 +229,21 @@ def resolve_model_max_batch_size(
         override = _coerce_positive_int(extra_config.get("max_batch_size"))
         if override is not None:
             return override
+
+    if prefer_text_runtime:
+        raw_text_max_batch_size = _get_text_model_config_value(
+            vllm_config,
+            "max_batch_size",
+            "npu_max_batch_size",
+        )
+        resolved_text_max_batch_size = _resolve_model_config_positive_int(
+            vllm_config,
+            raw_text_max_batch_size,
+            field_name="text_config.max_batch_size",
+            prefer_text_core_mode=True,
+        )
+        if resolved_text_max_batch_size is not None:
+            return resolved_text_max_batch_size
 
     raw_max_batch_size = _get_model_config_value(
         vllm_config,
