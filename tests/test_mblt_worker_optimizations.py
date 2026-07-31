@@ -2477,21 +2477,113 @@ class TestMbltWorkerOptimizations:
         np.testing.assert_array_equal(infer_inputs[1], deepstack_embeds)
         assert captured["kwargs"] == {"cache_size": 7}
 
-    def test_batch_vlm_fails_fast_until_artifacts_are_available(self) -> None:
+    def test_batch_vlm_no_longer_fails_fast_for_qwen3_vl(self) -> None:
         worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), [1, 2])
         req_state.is_multimodal = True
         req_state.prompt_deepstack_embeds = np.zeros((2, 3, 4), dtype=np.float32)
-        with pytest.raises(RuntimeError, match="VLM batch execution is not supported"):
-            worker._ensure_batch_vlm_supported(req_state)
+        worker._ensure_batch_vlm_supported(req_state)
 
-    def test_batch_vlm_without_deepstack_fails_fast_until_artifacts_are_available(self) -> None:
+    def test_infer_logits_batch_passes_qwen3_vl_deepstack_inputs_and_params(self) -> None:
         worker = self._make_worker()
-        req_state = self._make_request_state(worker, SamplingParams.from_optional(), [1, 2])
-        req_state.is_multimodal = True
-        req_state.prompt_deepstack_embeds = None
-        with pytest.raises(RuntimeError, match="VLM batch execution is not supported"):
-            worker._ensure_batch_vlm_supported(req_state)
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        captured = {}
+
+        def infer(inputs, **kwargs):
+            captured["inputs"] = inputs
+            captured["params"] = kwargs["params"]
+            return [np.arange(2 * 5, dtype=np.float32).reshape(2, 5)]
+
+        worker.cache_model = SimpleNamespace(
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(
+                get_model_input_shape=lambda: [(1, -1, 4), (2, -1, 4)]
+            ),
+            infer=infer,
+        )
+        input_a = np.full((2, 4), 1.0, dtype=np.float32)
+        input_b = np.full((1, 4), 2.0, dtype=np.float32)
+        deepstack_a = np.full((2, 2, 4), 3.0, dtype=np.float32)
+
+        logits = worker._infer_logits_batch(
+            [input_a, input_b],
+            cache_sizes=[5, 7],
+            cache_ids=[1, 2],
+            deepstack_embeds_batch=[deepstack_a, None],
+        )
+
+        assert [tuple(row.shape) for row in logits] == [(5,), (5,)]
+        assert len(captured["inputs"]) == 2
+        np.testing.assert_array_equal(captured["inputs"][0], np.expand_dims(np.concatenate([input_a, input_b]), 0))
+        assert captured["inputs"][1].shape == (2, 3, 4)
+        np.testing.assert_array_equal(captured["inputs"][1][:, :2, :], deepstack_a)
+        np.testing.assert_array_equal(captured["inputs"][1][:, 2:, :], np.zeros((2, 1, 4), dtype=np.float32))
+        assert [
+            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
+            for param in captured["params"]
+        ] == [(2, 5, 1), (1, 7, 2)]
+
+    def test_text_only_batch_input_shape_remains_rank4(self) -> None:
+        worker = self._make_worker()
+        captured = {}
+
+        def infer(inputs, **kwargs):
+            captured["inputs"] = inputs
+            captured["params"] = kwargs["params"]
+            return [np.arange(2 * 5, dtype=np.float32).reshape(2, 5)]
+
+        worker.cache_model = SimpleNamespace(
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(get_model_input_shape=lambda: [(1, 1, -1, 4)]),
+            infer=infer,
+        )
+
+        worker._infer_logits_batch(
+            [
+                np.full((2, 4), 1.0, dtype=np.float32),
+                np.full((1, 4), 2.0, dtype=np.float32),
+            ],
+            cache_sizes=[0, 3],
+            cache_ids=[1, 2],
+        )
+
+        assert len(captured["inputs"]) == 1
+        assert captured["inputs"][0].shape == (1, 1, 3, 4)
+        assert [
+            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
+            for param in captured["params"]
+        ] == [(2, 0, 1), (1, 3, 2)]
+
+    def test_max_batch_size_one_vlm_still_uses_single_request_infer_inputs(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 1
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker._infer_output_buffers = None
+        captured = {}
+
+        def infer(inputs, **kwargs):
+            captured["inputs"] = inputs
+            captured["kwargs"] = kwargs
+            return [np.arange(1 * 2 * 5, dtype=np.float32).reshape(1, 2, 5)]
+
+        worker.cache_model = SimpleNamespace(
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(
+                get_model_input_shape=lambda: [(1, -1, 4), (2, -1, 4)]
+            ),
+            infer=infer,
+            get_model_output_shape=lambda: [],
+        )
+
+        input_embeds = np.ones((2, 4), dtype=np.float32)
+        deepstack_embeds = np.full((2, 2, 4), 3.0, dtype=np.float32)
+        worker._infer_logits(input_embeds, deepstack_embeds, cache_size=9)
+
+        assert len(captured["inputs"]) == 2
+        np.testing.assert_array_equal(captured["inputs"][0], np.expand_dims(input_embeds, axis=0))
+        np.testing.assert_array_equal(captured["inputs"][1], deepstack_embeds)
+        assert captured["kwargs"] == {"cache_size": 9}
 
     def test_init_uses_text_runtime_max_batch_size_for_cache_slots(self, monkeypatch) -> None:
         def worker_base_init(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False):

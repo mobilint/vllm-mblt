@@ -176,6 +176,7 @@ class PromptLogprobMicrostepState:
 class NormalBatchChunkState:
     output_index: int
     input_embeds: np.ndarray
+    deepstack_embeds: Optional[np.ndarray]
     cache_id: int
     cache_size: int
     offset: int = 0
@@ -1118,19 +1119,14 @@ class MbltWorker(WorkerBase):
             return pieces[0]
         return np.concatenate(pieces, axis=1)
 
-    @staticmethod
-    def _ensure_batch_vlm_supported(req_state: RequestState) -> None:
-        # VLM batch execution is intentionally not implemented yet. Mobilint
-        # batch-compiled VLM artifacts are not available at the moment, so the
-        # batch path below only supports text-only language-model inputs. Keep
-        # this fail-fast guard near the batch scheduling path to avoid silently
-        # calling qbruntime with missing or unsupported VLM-specific inputs.
+    def _ensure_batch_vlm_supported(self, req_state: RequestState) -> None:
         if getattr(req_state, "is_multimodal", False):
-            raise RuntimeError(
-                "VLM batch execution is not supported yet. "
-                "Batch-compiled VLM artifacts are not available, so run VLM "
-                "models with max_batch_size=1 until batch VLM support is added."
-            )
+            if req_state.prompt_deepstack_embeds is not None and not self._supports_deepstack_input():
+                raise RuntimeError("Deepstack batch VLM inputs are only supported for Qwen3-VL models.")
+            if not self._is_multimodal_model():
+                raise RuntimeError(
+                    "Batch VLM execution is only supported for Mobilint Qwen2-VL and Qwen3-VL model types."
+                )
 
     @staticmethod
     def _cache_model_input_shapes(cache_model: Any) -> list[tuple[int, ...]]:
@@ -1199,6 +1195,87 @@ class MbltWorker(WorkerBase):
                     f"expected={expected_shape}, got={tuple(deepstack_embeds.shape)}."
                 )
         return [batched_input, deepstack_embeds.astype(np.float32, copy=False)]
+
+    def _build_batch_infer_inputs(
+        self,
+        input_embeds_batch: list[np.ndarray],
+        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]],
+    ) -> list[np.ndarray]:
+        cache_model = self._get_cache_model()
+        input_shapes = self._cache_model_input_shapes(cache_model)
+        has_deepstack_input = len(input_shapes) >= 2
+        if deepstack_embeds_batch is not None and len(deepstack_embeds_batch) != len(input_embeds_batch):
+            raise RuntimeError(
+                "Batched deepstack inputs must match input embeddings: "
+                f"input_embeds={len(input_embeds_batch)}, deepstack={len(deepstack_embeds_batch)}"
+            )
+        if deepstack_embeds_batch is not None and not has_deepstack_input:
+            if any(deepstack_embeds is not None for deepstack_embeds in deepstack_embeds_batch):
+                raise RuntimeError("Batched deepstack embeddings require a dual-input Qwen3-VL MXQ.")
+
+        concat_input = np.concatenate(input_embeds_batch, axis=0).astype(
+            np.float32,
+            copy=False,
+        )
+        text_input = np.expand_dims(concat_input, axis=0)
+
+        if not has_deepstack_input:
+            while text_input.ndim < 4:
+                text_input = np.expand_dims(text_input, axis=0)
+            return [text_input]
+
+        if not self._supports_deepstack_input():
+            if deepstack_embeds_batch is not None and any(
+                deepstack_embeds is not None for deepstack_embeds in deepstack_embeds_batch
+            ):
+                raise RuntimeError("Deepstack embeddings are only supported for Qwen3-VL models.")
+            while text_input.ndim < 4:
+                text_input = np.expand_dims(text_input, axis=0)
+            return [text_input]
+
+        deepstack_shape = input_shapes[1]
+        if len(deepstack_shape) != 3:
+            raise RuntimeError(
+                "Dual-input batch model deepstack input must have rank 3 "
+                f"(layers, packed_tokens, hidden), but got shape={deepstack_shape}."
+            )
+        expected_layers, expected_seq_len, expected_hidden = deepstack_shape
+        if expected_layers <= 0:
+            raise RuntimeError(
+                "Dual-input batch model deepstack layer dimension must be fixed and positive, "
+                f"but got shape={deepstack_shape}."
+            )
+
+        hidden_size = int(concat_input.shape[-1])
+        packed_tokens = int(concat_input.shape[0])
+        if expected_seq_len > 0 and expected_seq_len != packed_tokens:
+            raise RuntimeError(
+                "Dual-input batch model deepstack packed-token dimension mismatch: "
+                f"expected={expected_seq_len}, packed_tokens={packed_tokens}, shape={deepstack_shape}."
+            )
+        if expected_hidden > 0 and expected_hidden != hidden_size:
+            raise RuntimeError(
+                "Dual-input batch model deepstack hidden dimension mismatch: "
+                f"expected={expected_hidden}, hidden_size={hidden_size}, shape={deepstack_shape}."
+            )
+
+        deepstack_chunks: list[np.ndarray] = []
+        for i, input_embeds in enumerate(input_embeds_batch):
+            seq_len = int(input_embeds.shape[0])
+            deepstack_embeds = None if deepstack_embeds_batch is None else deepstack_embeds_batch[i]
+            if deepstack_embeds is None:
+                deepstack_embeds = np.zeros((int(expected_layers), seq_len, hidden_size), dtype=np.float32)
+            else:
+                expected_shape = (int(expected_layers), seq_len, hidden_size)
+                if tuple(deepstack_embeds.shape) != expected_shape:
+                    raise RuntimeError(
+                        "Batched deepstack embedding shape mismatch for dual-input model: "
+                        f"expected={expected_shape}, got={tuple(deepstack_embeds.shape)}."
+                    )
+                deepstack_embeds = deepstack_embeds.astype(np.float32, copy=False)
+            deepstack_chunks.append(deepstack_embeds)
+
+        return [text_input, np.concatenate(deepstack_chunks, axis=1)]
 
     @staticmethod
     def _last_token_logits(logits: np.ndarray) -> np.ndarray:
@@ -1402,6 +1479,7 @@ class MbltWorker(WorkerBase):
         input_embeds_batch: list[np.ndarray],
         cache_sizes: list[int],
         cache_ids: list[int],
+        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
     ) -> list[np.ndarray]:
         if not input_embeds_batch:
             return []
@@ -1414,14 +1492,8 @@ class MbltWorker(WorkerBase):
             cache_ids=cache_ids,
         )
 
-        concat_input = np.concatenate(input_embeds_batch, axis=0).astype(
-            np.float32,
-            copy=False,
-        )
-        while concat_input.ndim < 4:
-            concat_input = np.expand_dims(concat_input, axis=0)
-
-        infer_output = cache_model.infer([concat_input], params=params)
+        infer_inputs = self._build_batch_infer_inputs(input_embeds_batch, deepstack_embeds_batch)
+        infer_output = cache_model.infer(infer_inputs, params=params)
 
         logits = infer_output[0] if isinstance(infer_output, (list, tuple)) else infer_output
         logits_np = np.asarray(logits)
@@ -1452,6 +1524,7 @@ class MbltWorker(WorkerBase):
         input_embeds_batch: list[np.ndarray],
         cache_sizes: list[int],
         cache_ids: list[int],
+        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
     ) -> list[InferenceLogits]:
         if not input_embeds_batch:
             return []
@@ -1464,14 +1537,8 @@ class MbltWorker(WorkerBase):
             cache_ids=cache_ids,
         )
 
-        concat_input = np.concatenate(input_embeds_batch, axis=0).astype(
-            np.float32,
-            copy=False,
-        )
-        while concat_input.ndim < 4:
-            concat_input = np.expand_dims(concat_input, axis=0)
-
-        infer_output = cache_model.infer([concat_input], params=params)
+        infer_inputs = self._build_batch_infer_inputs(input_embeds_batch, deepstack_embeds_batch)
+        infer_output = cache_model.infer(infer_inputs, params=params)
         logits = infer_output[0] if isinstance(infer_output, (list, tuple)) else infer_output
         logits_np = np.asarray(logits)
         if logits_np.ndim == 3:
@@ -1509,16 +1576,20 @@ class MbltWorker(WorkerBase):
         input_embeds_batch: list[np.ndarray],
         cache_sizes: list[int],
         cache_ids: list[int],
+        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
     ) -> dict[int, InferenceLogits]:
         if not output_indices:
             return {}
-        if not (
-            len(output_indices) == len(input_embeds_batch) == len(cache_sizes) == len(cache_ids)
-        ):
+        if not (len(output_indices) == len(input_embeds_batch) == len(cache_sizes) == len(cache_ids)):
             raise RuntimeError(
                 "Normal batch chunk inputs must have identical lengths: "
                 f"indices={len(output_indices)}, input_embeds={len(input_embeds_batch)}, "
                 f"cache_sizes={len(cache_sizes)}, cache_ids={len(cache_ids)}"
+            )
+        if deepstack_embeds_batch is not None and len(deepstack_embeds_batch) != len(input_embeds_batch):
+            raise RuntimeError(
+                "Normal batch deepstack inputs must match input embeddings: "
+                f"input_embeds={len(input_embeds_batch)}, deepstack={len(deepstack_embeds_batch)}"
             )
 
         token_cap = self._normal_batch_chunk_token_cap()
@@ -1526,13 +1597,15 @@ class MbltWorker(WorkerBase):
             NormalBatchChunkState(
                 output_index=output_index,
                 input_embeds=input_embeds,
+                deepstack_embeds=None if deepstack_embeds_batch is None else deepstack_embeds,
                 cache_size=cache_size,
                 cache_id=cache_id,
                 full_sequence_logits=[],
             )
-            for output_index, input_embeds, cache_size, cache_id in zip(
+            for output_index, input_embeds, deepstack_embeds, cache_size, cache_id in zip(
                 output_indices,
                 input_embeds_batch,
+                [None] * len(input_embeds_batch) if deepstack_embeds_batch is None else deepstack_embeds_batch,
                 cache_sizes,
                 cache_ids,
             )
@@ -1546,6 +1619,7 @@ class MbltWorker(WorkerBase):
             for batch_start in range(0, len(active_states), self.max_batch_size):
                 batch_states = active_states[batch_start : batch_start + self.max_batch_size]
                 chunk_embeds_batch: list[np.ndarray] = []
+                chunk_deepstack_batch: list[Optional[np.ndarray]] = []
                 chunk_cache_sizes: list[int] = []
                 chunk_cache_ids: list[int] = []
                 for state in batch_states:
@@ -1556,16 +1630,25 @@ class MbltWorker(WorkerBase):
                     chunk_start = state.offset
                     chunk_end = chunk_start + chunk_len
                     chunk_embeds_batch.append(state.input_embeds[chunk_start:chunk_end])
+                    chunk_deepstack_batch.append(
+                        None
+                        if state.deepstack_embeds is None
+                        else state.deepstack_embeds[:, chunk_start:chunk_end, :]
+                    )
                     chunk_cache_sizes.append(state.cache_size)
                     chunk_cache_ids.append(state.cache_id)
 
                 if not chunk_embeds_batch:
                     continue
 
+                infer_kwargs: dict[str, object] = {}
+                if any(deepstack_embeds is not None for deepstack_embeds in chunk_deepstack_batch):
+                    infer_kwargs["deepstack_embeds_batch"] = chunk_deepstack_batch
                 logits_batch = self._infer_logits_batch_with_sequence(
                     input_embeds_batch=chunk_embeds_batch,
                     cache_sizes=chunk_cache_sizes,
                     cache_ids=chunk_cache_ids,
+                    **infer_kwargs,
                 )
                 for state, chunk_embeds, inference_logits in zip(batch_states, chunk_embeds_batch, logits_batch):
                     chunk_len = int(chunk_embeds.shape[0])
@@ -1748,12 +1831,14 @@ class MbltWorker(WorkerBase):
                 else None
             )
             if cache_id is not None:
+                infer_kwargs: dict[str, object] = {}
                 if input_deepstack is not None:
-                    raise RuntimeError("Batch prompt-logprob fallback does not support deepstack embeddings.")
+                    infer_kwargs["deepstack_embeds_batch"] = [input_deepstack]
                 logits = self._infer_logits_batch(
                     input_embeds_batch=[input_embeds],
                     cache_sizes=[fallback_cache_size],
                     cache_ids=[cache_id],
+                    **infer_kwargs,
                 )[0]
             else:
                 logits = self._infer_logits(input_embeds, input_deepstack, cache_size=fallback_cache_size)
@@ -1793,9 +1878,6 @@ class MbltWorker(WorkerBase):
         first_prompt_pos = max(1, start_idx + 1, req_state.next_prompt_logprob_pos)
         if prompt_end <= first_prompt_pos:
             return None
-        if req_state.prompt_deepstack_embeds is not None:
-            raise RuntimeError("Batch prompt-logprob fallback does not support deepstack embeddings.")
-
         return PromptLogprobFallbackReplayState(
             output_index=output_index,
             req_state=req_state,
@@ -1843,6 +1925,7 @@ class MbltWorker(WorkerBase):
             for batch_start in range(0, len(active_states), self.max_batch_size):
                 batch_states = active_states[batch_start : batch_start + self.max_batch_size]
                 input_embeds_batch: list[np.ndarray] = []
+                deepstack_embeds_batch: list[Optional[np.ndarray]] = []
                 cache_sizes: list[int] = []
                 cache_ids: list[int] = []
 
@@ -1856,14 +1939,24 @@ class MbltWorker(WorkerBase):
                         input_end = prompt_pos
 
                     input_embeds = state.req_state.prompt_embeds[input_start:input_end]
+                    input_deepstack = (
+                        state.req_state.prompt_deepstack_embeds[:, input_start:input_end, :]
+                        if state.req_state.prompt_deepstack_embeds is not None
+                        else None
+                    )
                     input_embeds_batch.append(input_embeds)
+                    deepstack_embeds_batch.append(input_deepstack)
                     cache_sizes.append(state.fallback_cache_size)
                     cache_ids.append(state.cache_id)
 
+                infer_kwargs: dict[str, object] = {}
+                if any(deepstack_embeds is not None for deepstack_embeds in deepstack_embeds_batch):
+                    infer_kwargs["deepstack_embeds_batch"] = deepstack_embeds_batch
                 logits_batch = self._infer_logits_batch(
                     input_embeds_batch=input_embeds_batch,
                     cache_sizes=cache_sizes,
                     cache_ids=cache_ids,
+                    **infer_kwargs,
                 )
 
                 for state, input_embeds, logits in zip(batch_states, input_embeds_batch, logits_batch):
@@ -1934,13 +2027,21 @@ class MbltWorker(WorkerBase):
                     self._build_input_embeds(state.req_state, state.cache_size, state.cache_size + 1)
                     for state in batch_states
                 ]
+                deepstack_embeds_batch = [
+                    self._build_deepstack_input_embeds(state.req_state, state.cache_size, state.cache_size + 1)
+                    for state in batch_states
+                ]
                 cache_sizes = [state.cache_size for state in batch_states]
                 cache_ids = [state.cache_id for state in batch_states]
 
+                infer_kwargs: dict[str, object] = {}
+                if any(deepstack_embeds is not None for deepstack_embeds in deepstack_embeds_batch):
+                    infer_kwargs["deepstack_embeds_batch"] = deepstack_embeds_batch
                 logits_batch = self._infer_logits_batch(
                     input_embeds_batch=input_embeds_batch,
                     cache_sizes=cache_sizes,
                     cache_ids=cache_ids,
+                    **infer_kwargs,
                 )
 
                 for state, logits in zip(batch_states, logits_batch):
@@ -2935,6 +3036,7 @@ class MbltWorker(WorkerBase):
                 )
 
             input_embeds_batch: list[np.ndarray] = []
+            deepstack_embeds_batch: list[Optional[np.ndarray]] = []
             cache_sizes: list[int] = []
             cache_ids: list[int] = []
             microstep_indices: list[int] = []
@@ -2957,6 +3059,7 @@ class MbltWorker(WorkerBase):
                     print_debug=print_debug,
                 )
                 input_embeds = self._build_input_embeds(req_state, cache_size, scheduled_end)
+                deepstack_embeds = self._build_deepstack_input_embeds(req_state, cache_size, scheduled_end)
                 sequence_length = int(input_embeds.shape[0])
                 next_cache_size = cache_size + sequence_length
                 req_state.is_prefill = scheduled_end < req_state.prompt_len
@@ -2967,6 +3070,7 @@ class MbltWorker(WorkerBase):
                 next_cache_sizes.append(next_cache_size)
                 sequence_lengths.append(sequence_length)
                 input_embeds_batch.append(input_embeds)
+                deepstack_embeds_batch.append(deepstack_embeds)
                 cache_sizes.append(cache_size)
                 cache_ids.append(slot_id)
 
@@ -2997,6 +3101,7 @@ class MbltWorker(WorkerBase):
                     input_embeds_batch=[input_embeds_batch[i] for i in normal_indices],
                     cache_sizes=[cache_sizes[i] for i in normal_indices],
                     cache_ids=[cache_ids[i] for i in normal_indices],
+                    deepstack_embeds_batch=[deepstack_embeds_batch[i] for i in normal_indices],
                 )
                 for i, inference_logits in normal_logits.items():
                     batched_logits[i] = inference_logits
