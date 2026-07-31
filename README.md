@@ -270,6 +270,34 @@ Model artifacts are available through Mobilint model repositories such as the
 - Reuse live cache for same-request continuous decode.
 - Keep finished-session snapshots for prefix reuse.
 - Evict finished snapshots with an LRU cap of 16 sessions.
+- Load matched snapshots only when the worker-side cost model expects the
+  one-cache-id load to beat recomputing the matched prefix.
+
+The prefix-cache load threshold is enabled by default. During model warmup the
+worker tries to measure optimistic one-cache-id prefill costs for 1, 2, 4, and
+8 KV blocks; for batch MXQs this still submits exactly one active `cache_id`.
+Real snapshot loads and dumps update per-`cache_id` EWMA timings. A snapshot is
+loaded only when `load_ms < prefill_ms * 0.9`; otherwise the snapshot remains
+stored and the prompt is recomputed. The policy can be adjusted with environment
+variables or equivalent model loader extra config keys:
+
+- `VLLM_MBLT_PREFIX_CACHE_AUTO_THRESHOLD` / `prefix_cache_auto_threshold`
+  defaults to enabled. Set `0` to disable measured thresholding.
+- `VLLM_MBLT_PREFIX_CACHE_MIN_HIT_TOKENS` / `prefix_cache_min_hit_tokens`
+  sets a manual minimum matched-token count before any snapshot load.
+- `VLLM_MBLT_PREFIX_CACHE_LOAD_MARGIN` / `prefix_cache_load_margin` defaults
+  to `0.9`.
+- `VLLM_MBLT_PREFIX_CACHE_CALIBRATE` defaults to enabled. Set `0` to skip
+  startup prefill calibration.
+
+VLM prefix caching currently covers the language-model KV cache only. For
+single-request VLM execution (`max_batch_size=1`), the worker may load a
+compatible LM KV prefix snapshot and run only the uncached text/embedding
+suffix. Image/video feature extraction is not cached by this layer: image
+requests still rebuild vision features through the model's multimodal feature
+hooks before the LM prefill/decode step. Batch-compiled VLM execution is not
+supported yet; use VLM models with `max_batch_size=1` until Mobilint batch VLM
+artifacts and worker support are added.
 
 Implementation file: [`vllm_mblt/mblt_worker.py`](vllm_mblt/mblt_worker.py)
 

@@ -1,8 +1,10 @@
+import hashlib
 import math
 import os
+import statistics
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional
 
 import numpy as np
 import torch
@@ -30,6 +32,8 @@ from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.runtime_cache import (
     KVBlockIds,
     MbltRuntimeCacheManager,
+    PromptEmbedCacheIdentity,
+    RuntimeCacheLoadResult,
     RuntimeCacheRequest,
     append_block_ids,
     first_seq_blocks,
@@ -105,6 +109,7 @@ class RequestState:
     cached_sampling_state: "CachedSamplingState"
     block_ids: KVBlockIds
     first_seq_blocks: tuple[int, ...]
+    first_seq_block_hashes: Optional[tuple[Hashable, ...]]
     num_computed_tokens: int
     num_output_tokens: int
     prompt_embeds: np.ndarray
@@ -114,6 +119,8 @@ class RequestState:
     prompt_token_ids: list[int]
     cache_slot_id: Optional[int]
     vlm_session_id: Optional[str]
+    multimodal_cache_identity: Optional[Hashable] = None
+    explicit_prompt_embeds: bool = False
     next_prompt_logprob_pos: int = 1
     in_progress_prompt_logprobs: Optional[LogprobsTensors] = None
 
@@ -176,6 +183,134 @@ class NormalBatchChunkState:
     last_token_logits: Optional[np.ndarray] = None
 
 
+class PrefixCacheCostModel:
+    """Worker-side policy for deciding if a matched runtime snapshot is worth loading."""
+
+    DEFAULT_MARGIN = 0.9
+    DEFAULT_EWMA_ALPHA = 0.3
+
+    def __init__(
+        self,
+        *,
+        block_size: int,
+        auto_threshold_enabled: bool = True,
+        manual_min_hit_tokens: Optional[int] = None,
+        margin: float = DEFAULT_MARGIN,
+        ewma_alpha: float = DEFAULT_EWMA_ALPHA,
+    ) -> None:
+        self.block_size = max(1, int(block_size))
+        self.auto_threshold_enabled = bool(auto_threshold_enabled)
+        self.manual_min_hit_tokens = (
+            max(0, int(manual_min_hit_tokens)) if manual_min_hit_tokens is not None else None
+        )
+        self.margin = float(margin)
+        if self.margin <= 0:
+            self.margin = self.DEFAULT_MARGIN
+        self.ewma_alpha = min(1.0, max(0.0, float(ewma_alpha)))
+        self.prefill_ms_by_tokens: dict[int, float] = {}
+        self.load_ms_by_cache_id: dict[int | None, float] = {}
+        self.dump_ms_by_cache_id: dict[int | None, float] = {}
+
+    @classmethod
+    def from_config(cls, config: object, *, block_size: int) -> "PrefixCacheCostModel":
+        def _config_value(name: str) -> object:
+            for root in (
+                getattr(getattr(config, "load_config", None), "model_loader_extra_config", None),
+                getattr(config, "model_loader_extra_config", None),
+                getattr(getattr(config, "model_config", None), "model_kwargs", None),
+                getattr(getattr(config, "model_config", None), "hf_overrides", None),
+            ):
+                if isinstance(root, dict) and name in root:
+                    return root[name]
+            return None
+
+        auto_value = os.getenv("VLLM_MBLT_PREFIX_CACHE_AUTO_THRESHOLD")
+        if auto_value is None:
+            auto_value = _config_value("prefix_cache_auto_threshold")
+        auto_enabled = True if auto_value is None else str(auto_value) not in {"0", "false", "FALSE", "False"}
+
+        manual_value = os.getenv("VLLM_MBLT_PREFIX_CACHE_MIN_HIT_TOKENS")
+        if manual_value is None:
+            manual_value = _config_value("prefix_cache_min_hit_tokens")
+        try:
+            manual_min_hit_tokens = None if manual_value in (None, "") else int(manual_value)
+        except (TypeError, ValueError):
+            manual_min_hit_tokens = None
+
+        margin_value = os.getenv("VLLM_MBLT_PREFIX_CACHE_LOAD_MARGIN")
+        if margin_value is None:
+            margin_value = _config_value("prefix_cache_load_margin")
+        try:
+            margin = cls.DEFAULT_MARGIN if margin_value in (None, "") else float(margin_value)
+        except (TypeError, ValueError):
+            margin = cls.DEFAULT_MARGIN
+
+        return cls(
+            block_size=block_size,
+            auto_threshold_enabled=auto_enabled,
+            manual_min_hit_tokens=manual_min_hit_tokens,
+            margin=margin,
+        )
+
+    def observe_prefill(self, num_tokens: int, elapsed_ms: float) -> None:
+        num_tokens = max(1, int(num_tokens))
+        elapsed_ms = max(0.0, float(elapsed_ms))
+        previous = self.prefill_ms_by_tokens.get(num_tokens)
+        if previous is None:
+            self.prefill_ms_by_tokens[num_tokens] = elapsed_ms
+        else:
+            self.prefill_ms_by_tokens[num_tokens] = self._ewma(previous, elapsed_ms)
+
+    def observe_load(self, cache_id: int | None, elapsed_ms: float) -> None:
+        self._observe_cache_io(self.load_ms_by_cache_id, cache_id, elapsed_ms)
+
+    def observe_dump(self, cache_id: int | None, elapsed_ms: float) -> None:
+        self._observe_cache_io(self.dump_ms_by_cache_id, cache_id, elapsed_ms)
+
+    def should_load(self, *, matched_tokens: int, cache_id: int | None = None) -> bool:
+        matched_tokens = max(0, int(matched_tokens))
+        if matched_tokens <= 0:
+            return False
+        if self.manual_min_hit_tokens is not None and matched_tokens < self.manual_min_hit_tokens:
+            return False
+        if not self.auto_threshold_enabled:
+            return True
+
+        load_ms = self.load_ms(cache_id)
+        prefill_ms = self.prefill_ms(matched_tokens)
+        if load_ms is None or prefill_ms is None:
+            return True
+        return load_ms < prefill_ms * self.margin
+
+    def prefill_ms(self, matched_tokens: int) -> Optional[float]:
+        if not self.prefill_ms_by_tokens:
+            return None
+        matched_tokens = max(1, int(matched_tokens))
+        measured = sorted(self.prefill_ms_by_tokens.items())
+        for tokens, elapsed_ms in measured:
+            if matched_tokens <= tokens:
+                return elapsed_ms * (matched_tokens / tokens)
+        tokens, elapsed_ms = measured[-1]
+        return elapsed_ms * (matched_tokens / tokens)
+
+    def load_ms(self, cache_id: int | None = None) -> Optional[float]:
+        if cache_id in self.load_ms_by_cache_id:
+            return self.load_ms_by_cache_id[cache_id]
+        if None in self.load_ms_by_cache_id:
+            return self.load_ms_by_cache_id[None]
+        if not self.load_ms_by_cache_id:
+            return None
+        return statistics.median(self.load_ms_by_cache_id.values())
+
+    def _observe_cache_io(self, values: dict[int | None, float], cache_id: int | None, elapsed_ms: float) -> None:
+        elapsed_ms = max(0.0, float(elapsed_ms))
+        previous = values.get(cache_id)
+        values[cache_id] = elapsed_ms if previous is None else self._ewma(previous, elapsed_ms)
+
+    def _ewma(self, previous: float, sample: float) -> float:
+        return previous * (1.0 - self.ewma_alpha) + sample * self.ewma_alpha
+
+
 class MbltWorker(WorkerBase):
     MAX_FINISHED_CACHE_SNAPSHOTS = 16
 
@@ -207,6 +342,10 @@ class MbltWorker(WorkerBase):
             max_finished_snapshots=self.MAX_FINISHED_CACHE_SNAPSHOTS,
             dump_runtime_cache=self._dump_runtime_cache,
             load_runtime_cache=self._load_runtime_cache,
+        )
+        self.prefix_cache_cost_model = PrefixCacheCostModel.from_config(
+            self.vllm_config,
+            block_size=self._kv_block_size(),
         )
         self.sampler = Sampler(logprobs_mode="raw_logits")
         self.empty_logits_processors = LogitsProcessors(None)
@@ -246,10 +385,23 @@ class MbltWorker(WorkerBase):
         return self.max_batch_size > 1
 
     def _kv_block_size(self) -> int:
-        configured = self.vllm_config.cache_config.block_size
+        configured = getattr(getattr(self.vllm_config, "cache_config", None), "block_size", None)
         if configured is None:
+            runtime_cache = getattr(self, "runtime_cache", None)
+            if runtime_cache is not None:
+                return int(getattr(runtime_cache, "block_size", 128))
             return 128
         return int(configured)
+
+    def _ensure_prefix_cache_cost_model(self) -> PrefixCacheCostModel:
+        cost_model = getattr(self, "prefix_cache_cost_model", None)
+        if cost_model is None:
+            cost_model = PrefixCacheCostModel.from_config(
+                self.vllm_config,
+                block_size=self._kv_block_size(),
+            )
+            self.prefix_cache_cost_model = cost_model
+        return cost_model
 
     def _num_blocks_per_request(self) -> int:
         return max(1, math.ceil(self.max_seq_len / self._kv_block_size()))
@@ -266,6 +418,56 @@ class MbltWorker(WorkerBase):
 
     def _first_seq_blocks(self, block_ids: KVBlockIds) -> tuple[int, ...]:
         return first_seq_blocks(block_ids)
+
+    def _extract_first_seq_block_hashes(
+        self,
+        source: object,
+        *,
+        candidates: tuple[str, ...] = ("block_hashes", "kv_block_hashes", "block_hash_ids"),
+    ) -> Optional[tuple[Hashable, ...]]:
+        for attr in candidates:
+            block_hashes = getattr(source, attr, None)
+            if block_hashes is None:
+                continue
+            if not block_hashes:
+                return ()
+            if isinstance(block_hashes[0], list):
+                return tuple(block_hashes[0])
+            return tuple(block_hashes)
+        return None
+
+    def _extract_indexed_first_seq_block_hashes(
+        self,
+        source: object,
+        index: int,
+        *,
+        candidates: tuple[str, ...],
+    ) -> Optional[tuple[Hashable, ...]]:
+        for attr in candidates:
+            block_hashes_by_req = getattr(source, attr, None)
+            if block_hashes_by_req is None:
+                continue
+            if not block_hashes_by_req:
+                return ()
+            try:
+                block_hashes = block_hashes_by_req[index]
+            except IndexError:
+                return None
+            if not block_hashes:
+                return ()
+            if isinstance(block_hashes[0], list):
+                return tuple(block_hashes[0])
+            return tuple(block_hashes)
+        return None
+
+    def _append_first_seq_block_hashes(
+        self,
+        current_hashes: Optional[tuple[Hashable, ...]],
+        new_hashes: Optional[tuple[Hashable, ...]],
+    ) -> Optional[tuple[Hashable, ...]]:
+        if current_hashes is None or new_hashes is None:
+            return None
+        return current_hashes + new_hashes
 
     def _get_cache_model(self) -> Any:
         if self.cache_model is None:
@@ -373,6 +575,69 @@ class MbltWorker(WorkerBase):
 
         positions_by_session[session_id] = position
 
+    @staticmethod
+    def _fingerprint_multimodal_value(value: object) -> tuple[str, tuple[int, ...], str, str] | None:
+        if value is None:
+            return None
+        value = getattr(value, "data", value)
+        try:
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().cpu()
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                array = tensor.numpy()
+            else:
+                array = np.asarray(value)
+        except (TypeError, ValueError, RuntimeError):
+            return None
+
+        if array.dtype == object:
+            return None
+        if not array.flags.c_contiguous:
+            array = np.ascontiguousarray(array)
+
+        digest = hashlib.sha256()
+        digest.update(str(array.dtype).encode("utf-8"))
+        digest.update(repr(tuple(int(dim) for dim in array.shape)).encode("utf-8"))
+        digest.update(array.tobytes())
+        return ("sha256", tuple(int(dim) for dim in array.shape), str(array.dtype), digest.hexdigest())
+
+    @classmethod
+    def _multimodal_feature_content_fingerprint(cls, feature: MultiModalFeatureSpec) -> Hashable | None:
+        modality = str(getattr(feature, "modality", ""))
+        if modality.startswith("image"):
+            value_keys = ("pixel_values", "image_grid_thw")
+        elif modality.startswith("video"):
+            value_keys = ("pixel_values_videos", "video_grid_thw")
+        else:
+            return None
+
+        fingerprints: list[tuple[str, tuple[str, tuple[int, ...], str, str] | None]] = []
+        for key in value_keys:
+            value = cls._extract_multimodal_value(feature, key)
+            fingerprint = cls._fingerprint_multimodal_value(value)
+            if fingerprint is None:
+                return None
+            fingerprints.append((key, fingerprint))
+
+        return (modality, tuple(fingerprints))
+
+    @classmethod
+    def _build_vlm_multimodal_cache_identity(
+        cls,
+        session_id: str,
+        mm_features: Optional[list[MultiModalFeatureSpec]],
+    ) -> Hashable | None:
+        if not mm_features:
+            return None
+
+        entries = []
+        for feature in mm_features:
+            position = cls._multimodal_position_signature(feature.mm_position)
+            fingerprint = cls._multimodal_feature_content_fingerprint(feature)
+            entries.append((str(getattr(feature, "modality", "")), position, fingerprint))
+        return ("vlm", str(session_id), tuple(entries))
+
     def _get_cache_slot(self, req_id: str) -> int:
         return self.runtime_cache.get_slot(req_id)
 
@@ -395,6 +660,63 @@ class MbltWorker(WorkerBase):
         else:
             cache_model.load_cache_memory(blobs, cache_id=slot_id)
         return True
+
+    def _timed_load_runtime_cache(self, blobs: list[Any], slot_id: Optional[int] = None) -> bool:
+        load_runtime_cache = getattr(self.runtime_cache, "_load_runtime_cache_fn", None) or self._load_runtime_cache
+        start = time.perf_counter()
+        loaded = load_runtime_cache(blobs, slot_id)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self._ensure_prefix_cache_cost_model().observe_load(slot_id, elapsed_ms)
+        return loaded
+
+    def _timed_dump_runtime_cache(self, slot_id: Optional[int] = None) -> Optional[list[Any]]:
+        dump_runtime_cache = getattr(self.runtime_cache, "_dump_runtime_cache_fn", None) or self._dump_runtime_cache
+        start = time.perf_counter()
+        blobs = dump_runtime_cache(slot_id)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self._ensure_prefix_cache_cost_model().observe_dump(slot_id, elapsed_ms)
+        return blobs
+
+    def _calibrate_prefix_cache_prefill_costs(self) -> None:
+        cost_model = self._ensure_prefix_cache_cost_model()
+        if not cost_model.auto_threshold_enabled:
+            return
+        if os.getenv("VLLM_MBLT_PREFIX_CACHE_CALIBRATE", "1") in {"0", "false", "FALSE", "False"}:
+            return
+        if self.input_embeddings is None or self.cache_model is None:
+            return
+        if not callable(getattr(self.input_embeddings, "__call__", None)):
+            return
+
+        block_size = self._kv_block_size()
+        bucket_blocks = (1, 2, 4, 8)
+        bucket_tokens = [
+            tokens
+            for tokens in (block_size * blocks for blocks in bucket_blocks)
+            if tokens <= self.max_seq_len
+        ]
+        if not bucket_tokens:
+            bucket_tokens = [min(block_size, self.max_seq_len)]
+
+        for num_tokens in bucket_tokens:
+            try:
+                embeds = self._embed_token_ids([0] * num_tokens)
+                samples_ms: list[float] = []
+                for sample_index in range(3):
+                    start = time.perf_counter()
+                    if self._is_batch_model():
+                        self._infer_logits_batch([embeds], cache_sizes=[0], cache_ids=[1])
+                    else:
+                        self._infer_logits(embeds, None, cache_size=0)
+                    elapsed_ms = (time.perf_counter() - start) * 1000.0
+                    if sample_index > 0:
+                        samples_ms.append(elapsed_ms)
+                if samples_ms:
+                    cost_model.observe_prefill(num_tokens, statistics.median(samples_ms))
+            except Exception as exc:
+                logger.debug("Skipping Mobilint prefix-cache prefill calibration: %s", exc)
+                break
+        self._infer_output_buffers = None
 
     def _make_batch_params(
         self,
@@ -1878,13 +2200,17 @@ class MbltWorker(WorkerBase):
             return 0
 
         target_tokens = req_state.num_computed_tokens
-        result = self.runtime_cache.load_for_request(
+        result = self._load_snapshot_for_request_with_cost_policy(
             RuntimeCacheRequest(
                 req_id=req_id,
                 block_ids=req_state.block_ids,
                 first_seq_blocks=req_state.first_seq_blocks,
                 num_computed_tokens=target_tokens,
+                first_seq_block_hashes=req_state.first_seq_block_hashes,
                 cache_slot_id=slot_id,
+                cache_token_ids=self._cache_token_ids(req_state, target_tokens),
+                multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
+                prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
             )
         )
         if print_debug:
@@ -1896,9 +2222,85 @@ class MbltWorker(WorkerBase):
                 print(f"[cache] req={req_id} load-own matched={result.matched_tokens}/{target_tokens}")
             elif result.action == "load-shared":
                 print(f"[cache] req={req_id} load-shared matched={result.matched_tokens}/{target_tokens}")
+            elif result.action == "skip-cost":
+                print(f"[cache] req={req_id} skip-load-cost matched={result.matched_tokens}/{target_tokens}")
             else:
                 print(f"[cache] req={req_id} cache-miss fallback matched=0/{target_tokens}")
         return result.matched_tokens
+
+    def _load_snapshot_for_request_with_cost_policy(
+        self,
+        request: RuntimeCacheRequest,
+    ) -> RuntimeCacheLoadResult:
+        target_tokens = request.num_computed_tokens
+        if target_tokens <= 0:
+            self.runtime_cache.clear_loaded_request()
+            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True, action="skip-empty")
+
+        self.runtime_cache.observe_request_blocks(
+            request.req_id,
+            request.block_ids,
+            first_seq_block_hashes=request.first_seq_block_hashes,
+        )
+
+        if self.runtime_cache.loaded_req_id == request.req_id:
+            return RuntimeCacheLoadResult(
+                matched_tokens=target_tokens,
+                reused_live_cache=True,
+                action="reuse-live",
+                snapshot_req_id=request.req_id,
+            )
+
+        match = self.runtime_cache.choose_snapshot(request)
+        if match.snapshot is None or match.matched_tokens <= 0:
+            self.runtime_cache.clear_loaded_request()
+            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+
+        if not self._ensure_prefix_cache_cost_model().should_load(
+            matched_tokens=match.matched_tokens,
+            cache_id=None,
+        ):
+            self.runtime_cache.clear_loaded_request()
+            return RuntimeCacheLoadResult(
+                matched_tokens=0,
+                cache_miss=True,
+                loaded_snapshot_req_id=match.req_id,
+                is_own_snapshot=match.is_own_snapshot,
+                action="skip-cost",
+                snapshot_req_id=match.req_id,
+            )
+
+        match = self.runtime_cache.verify_prompt_embed_match(request, match)
+        if match.snapshot is None or match.matched_tokens <= 0:
+            self.runtime_cache.clear_loaded_request()
+            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+        if not self._ensure_prefix_cache_cost_model().should_load(
+            matched_tokens=match.matched_tokens,
+            cache_id=None,
+        ):
+            self.runtime_cache.clear_loaded_request()
+            return RuntimeCacheLoadResult(
+                matched_tokens=0,
+                cache_miss=True,
+                loaded_snapshot_req_id=match.req_id,
+                is_own_snapshot=match.is_own_snapshot,
+                action="skip-cost",
+                snapshot_req_id=match.req_id,
+            )
+
+        if self._timed_load_runtime_cache(match.snapshot.blobs, None):
+            self.runtime_cache.mark_loaded_request(request.req_id)
+            return RuntimeCacheLoadResult(
+                matched_tokens=match.matched_tokens,
+                loaded=True,
+                loaded_snapshot_req_id=match.req_id,
+                is_own_snapshot=match.is_own_snapshot,
+                action="load-own" if match.is_own_snapshot else "load-shared",
+                snapshot_req_id=match.req_id,
+            )
+
+        self.runtime_cache.clear_loaded_request()
+        return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
 
     def _load_snapshot_for_batch_slot(
         self,
@@ -1916,15 +2318,18 @@ class MbltWorker(WorkerBase):
             return 0
 
         target_tokens = req_state.num_computed_tokens
-        result = self.runtime_cache.load_for_slot(
+        result = self._load_snapshot_for_slot_with_cost_policy(
             RuntimeCacheRequest(
                 req_id=req_id,
                 block_ids=req_state.block_ids,
                 first_seq_blocks=req_state.first_seq_blocks,
                 num_computed_tokens=target_tokens,
+                first_seq_block_hashes=req_state.first_seq_block_hashes,
                 cache_slot_id=slot_id,
-            ),
-            slot_id=slot_id,
+                cache_token_ids=self._cache_token_ids(req_state, target_tokens),
+                multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
+                prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
+            )
         )
         if print_debug:
             if result.action == "reuse-live":
@@ -1936,9 +2341,88 @@ class MbltWorker(WorkerBase):
                     f"[cache] req={req_id} slot={slot_id} "
                     f"load-shared matched={result.matched_tokens}/{target_tokens}"
                 )
+            elif result.action == "skip-cost":
+                print(
+                    f"[cache] req={req_id} slot={slot_id} "
+                    f"skip-load-cost matched={result.matched_tokens}/{target_tokens}"
+                )
             else:
                 print(f"[cache] req={req_id} slot={slot_id} cache-miss fallback matched=0/{target_tokens}")
         return result.matched_tokens
+
+    def _load_snapshot_for_slot_with_cost_policy(
+        self,
+        request: RuntimeCacheRequest,
+    ) -> RuntimeCacheLoadResult:
+        slot_id = request.cache_slot_id
+        if slot_id is None:
+            raise RuntimeError(f"Batch execution requires a cache slot for req_id={request.req_id}.")
+
+        target_tokens = request.num_computed_tokens
+        if target_tokens <= 0:
+            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True, action="skip-empty")
+
+        self.runtime_cache.observe_request_blocks(
+            request.req_id,
+            request.block_ids,
+            first_seq_block_hashes=request.first_seq_block_hashes,
+        )
+
+        if self.runtime_cache.live_slot_owner(slot_id) == request.req_id:
+            return RuntimeCacheLoadResult(
+                matched_tokens=target_tokens,
+                reused_live_cache=True,
+                action="reuse-live",
+                snapshot_req_id=request.req_id,
+            )
+
+        match = self.runtime_cache.choose_snapshot(request)
+        if match.snapshot is not None and match.matched_tokens > 0:
+            if not self._ensure_prefix_cache_cost_model().should_load(
+                matched_tokens=match.matched_tokens,
+                cache_id=slot_id,
+            ):
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                return RuntimeCacheLoadResult(
+                    matched_tokens=0,
+                    cache_miss=True,
+                    loaded_snapshot_req_id=match.req_id,
+                    is_own_snapshot=match.is_own_snapshot,
+                    action="skip-cost",
+                    snapshot_req_id=match.req_id,
+                )
+
+            match = self.runtime_cache.verify_prompt_embed_match(request, match)
+            if match.snapshot is None or match.matched_tokens <= 0:
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+            if not self._ensure_prefix_cache_cost_model().should_load(
+                matched_tokens=match.matched_tokens,
+                cache_id=slot_id,
+            ):
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                return RuntimeCacheLoadResult(
+                    matched_tokens=0,
+                    cache_miss=True,
+                    loaded_snapshot_req_id=match.req_id,
+                    is_own_snapshot=match.is_own_snapshot,
+                    action="skip-cost",
+                    snapshot_req_id=match.req_id,
+                )
+
+            if self._timed_load_runtime_cache(match.snapshot.blobs, slot_id):
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                return RuntimeCacheLoadResult(
+                    matched_tokens=match.matched_tokens,
+                    loaded=True,
+                    loaded_snapshot_req_id=match.req_id,
+                    is_own_snapshot=match.is_own_snapshot,
+                    action="load-own" if match.is_own_snapshot else "load-shared",
+                    snapshot_req_id=match.req_id,
+                )
+
+        self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+        return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
 
     def _dump_snapshot(
         self,
@@ -1948,14 +2432,8 @@ class MbltWorker(WorkerBase):
         slot_id: Optional[int] = None,
         print_debug: bool = False,
     ) -> bool:
-        snapshot = self.runtime_cache.dump_and_store_snapshot(
-            req_id=req_id,
-            block_ids=req_state.block_ids,
-            first_seq_blocks=req_state.first_seq_blocks,
-            num_tokens=next_num_tokens,
-            slot_id=slot_id,
-        )
-        if snapshot is None:
+        blobs = self._timed_dump_runtime_cache(slot_id)
+        if blobs is None:
             if self._is_batch_model() and not self._warned_batch_cache_snapshot_unsupported:
                 logger.warning(
                     "Batch cache runtime does not expose slot-scoped dump/load APIs. "
@@ -1963,6 +2441,18 @@ class MbltWorker(WorkerBase):
                 )
                 self._warned_batch_cache_snapshot_unsupported = True
             return False
+
+        self.runtime_cache.store_snapshot(
+            req_id=req_id,
+            blobs=blobs,
+            block_ids=req_state.block_ids,
+            first_seq_blocks=req_state.first_seq_blocks,
+            first_seq_block_hashes=req_state.first_seq_block_hashes,
+            num_tokens=next_num_tokens,
+            cache_token_ids=self._cache_token_ids(req_state, next_num_tokens),
+            multimodal_cache_identity=self._cache_multimodal_identity(req_state, next_num_tokens),
+            prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
+        )
         if print_debug:
             num_blocks = len(req_state.first_seq_blocks)
             print(
@@ -1970,6 +2460,66 @@ class MbltWorker(WorkerBase):
                 f"blocks={num_blocks} snapshots={self.runtime_cache.snapshot_count()}"
             )
         return True
+
+    @staticmethod
+    def _cache_token_ids(req_state: RequestState, num_tokens: int) -> tuple[int, ...] | None:
+        token_ids = list(req_state.prompt_token_ids) + list(req_state.output_token_ids)
+        num_tokens = max(0, int(num_tokens))
+        if len(token_ids) < num_tokens:
+            return None
+        return tuple(token_ids[:num_tokens])
+
+    @staticmethod
+    def _cache_multimodal_identity(req_state: RequestState, num_tokens: int) -> Hashable | None:
+        if not req_state.is_multimodal:
+            return None
+        if req_state.multimodal_cache_identity is None:
+            return None
+        if max(0, int(num_tokens)) <= 0:
+            return None
+        return req_state.multimodal_cache_identity
+
+    @staticmethod
+    def _fingerprint_prompt_embed_prefix(
+        prompt_embeds: np.ndarray,
+        num_tokens: int,
+    ) -> Hashable | None:
+        num_tokens = max(0, int(num_tokens))
+        if num_tokens <= 0 or num_tokens > int(prompt_embeds.shape[0]):
+            return None
+        prefix = prompt_embeds[:num_tokens]
+        if prefix.dtype == object:
+            return None
+        if not prefix.flags.c_contiguous:
+            prefix = np.ascontiguousarray(prefix)
+        digest = hashlib.sha256()
+        digest.update(str(prefix.dtype).encode("utf-8"))
+        digest.update(repr(tuple(int(dim) for dim in prefix.shape)).encode("utf-8"))
+        digest.update(prefix.tobytes())
+        return ("sha256", tuple(int(dim) for dim in prefix.shape), str(prefix.dtype), digest.hexdigest())
+
+    def _make_prompt_embed_cache_identity(
+        self,
+        req_state: RequestState,
+    ) -> PromptEmbedCacheIdentity | None:
+        if not req_state.explicit_prompt_embeds:
+            return None
+        prompt_len = max(0, int(req_state.prompt_len))
+        if prompt_len <= 0:
+            return None
+        prompt_embeds = req_state.prompt_embeds
+        fingerprints: dict[int, Hashable | None] = {}
+
+        def fingerprint_for_prefix(num_tokens: int) -> Hashable | None:
+            num_tokens = max(0, int(num_tokens))
+            if num_tokens not in fingerprints:
+                fingerprints[num_tokens] = self._fingerprint_prompt_embed_prefix(prompt_embeds, num_tokens)
+            return fingerprints[num_tokens]
+
+        return PromptEmbedCacheIdentity(
+            prompt_len=prompt_len,
+            fingerprint_for_prefix=fingerprint_for_prefix,
+        )
 
     def _finalize_finished_request(
         self,
@@ -2092,6 +2642,7 @@ class MbltWorker(WorkerBase):
         )
         self._reset_cache_slots()
         self._infer_output_buffers = None
+        self._calibrate_prefix_cache_prefill_costs()
         self._log_init_stage("load_model:done")
         return
 
@@ -2268,6 +2819,12 @@ class MbltWorker(WorkerBase):
             )
 
             normalized_block_ids = self._normalize_block_ids(new_req.block_ids)
+            first_seq_block_hashes = self._extract_first_seq_block_hashes(new_req)
+            self.runtime_cache.observe_request_blocks(
+                new_req.req_id,
+                normalized_block_ids,
+                first_seq_block_hashes=first_seq_block_hashes,
+            )
             prompt_embeds_np = self._to_cpu_float32_numpy(prompt_embeds)
             prompt_deepstack_embeds_np = (
                 self._to_cpu_float32_numpy(prompt_deepstack_embeds) if prompt_deepstack_embeds is not None else None
@@ -2284,6 +2841,7 @@ class MbltWorker(WorkerBase):
                 ),
                 block_ids=normalized_block_ids,
                 first_seq_blocks=self._first_seq_blocks(normalized_block_ids),
+                first_seq_block_hashes=first_seq_block_hashes,
                 num_computed_tokens=new_req.num_computed_tokens,
                 num_output_tokens=0,
                 prompt_embeds=prompt_embeds_np,
@@ -2293,6 +2851,11 @@ class MbltWorker(WorkerBase):
                 prompt_token_ids=new_req.prompt_token_ids or [],
                 cache_slot_id=cache_slot_id,
                 vlm_session_id=vlm_session_id,
+                multimodal_cache_identity=self._build_vlm_multimodal_cache_identity(
+                    vlm_session_id,
+                    new_req.mm_features,
+                ),
+                explicit_prompt_embeds=new_req.prompt_embeds is not None,
             )
 
         # Continue cached requests
@@ -2305,14 +2868,29 @@ class MbltWorker(WorkerBase):
 
             new_block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[i]
             if new_block_ids is not None:
+                new_block_hashes = self._extract_indexed_first_seq_block_hashes(
+                    scheduler_output.scheduled_cached_reqs,
+                    i,
+                    candidates=("new_block_hashes", "new_kv_block_hashes", "new_block_hash_ids"),
+                )
                 if req_id in scheduler_output.scheduled_cached_reqs.resumed_req_ids:
                     cached_request_state.block_ids = self._normalize_block_ids(new_block_ids)
+                    cached_request_state.first_seq_block_hashes = new_block_hashes
                 else:
                     cached_request_state.block_ids = self._append_block_ids(
                         cached_request_state.block_ids,
                         new_block_ids,
                     )
+                    cached_request_state.first_seq_block_hashes = self._append_first_seq_block_hashes(
+                        cached_request_state.first_seq_block_hashes,
+                        new_block_hashes,
+                    )
                 cached_request_state.first_seq_blocks = self._first_seq_blocks(cached_request_state.block_ids)
+                self.runtime_cache.observe_request_blocks(
+                    req_id,
+                    cached_request_state.block_ids,
+                    first_seq_block_hashes=cached_request_state.first_seq_block_hashes,
+                )
 
         batch_size = len(scheduler_output.num_scheduled_tokens)
 

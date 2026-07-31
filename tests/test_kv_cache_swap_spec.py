@@ -64,6 +64,7 @@ def _make_request_state(
         cached_sampling_state=worker._make_cached_sampling_state(sampling_params, prompt_token_ids),
         block_ids=block_ids,
         first_seq_blocks=tuple(block_ids[0]) if block_ids else (),
+        first_seq_block_hashes=None,
         num_computed_tokens=num_computed_tokens,
         num_output_tokens=0,
         prompt_embeds=np.zeros((prompt_len, 2), dtype=np.float32),

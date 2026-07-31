@@ -14,6 +14,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_mblt.mblt_worker import (
     InferenceLogits,
     MbltWorker,
+    PrefixCacheCostModel,
     RequestState,
     _is_multimodal_hf_config,
     _is_qwen3_vl_hf_config,
@@ -132,6 +133,70 @@ class TestMbltWorkerOptimizations:
         )
         assert getattr(worker, "_vlm_image_positions_by_session", {}) == {}
 
+    def test_vlm_multimodal_cache_identity_includes_image_content_fingerprint(self) -> None:
+        image_a = self._make_mm_feature(
+            "image",
+            offset=1,
+            length=2,
+            data={
+                "pixel_values": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                "image_grid_thw": torch.tensor([1, 1, 2]),
+            },
+        )
+        image_b = self._make_mm_feature(
+            "image",
+            offset=1,
+            length=2,
+            data={
+                "pixel_values": torch.tensor([[1.0, 2.0], [3.0, 5.0]]),
+                "image_grid_thw": torch.tensor([1, 1, 2]),
+            },
+        )
+
+        identity_a = MbltWorker._build_vlm_multimodal_cache_identity("session-a", [image_a])
+        identity_b = MbltWorker._build_vlm_multimodal_cache_identity("session-a", [image_b])
+
+        assert identity_a != identity_b
+
+    def test_vlm_multimodal_cache_identity_is_stable_for_same_image_content(self) -> None:
+        data = {
+            "pixel_values": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "image_grid_thw": torch.tensor([1, 1, 2]),
+        }
+
+        identity_a = MbltWorker._build_vlm_multimodal_cache_identity(
+            "session-a",
+            [self._make_mm_feature("image", offset=1, length=2, data=data)],
+        )
+        identity_b = MbltWorker._build_vlm_multimodal_cache_identity(
+            "session-a",
+            [
+                self._make_mm_feature(
+                    "image",
+                    offset=1,
+                    length=2,
+                    data={key: value.clone() for key, value in data.items()},
+                )
+            ],
+        )
+
+        assert identity_a == identity_b
+
+    def test_vlm_multimodal_cache_identity_marks_unfingerprintable_feature_unresolved(self) -> None:
+        identity = MbltWorker._build_vlm_multimodal_cache_identity(
+            "session-a",
+            [
+                self._make_mm_feature(
+                    "image",
+                    offset=1,
+                    length=2,
+                    data={"pixel_values": object(), "image_grid_thw": torch.tensor([1, 1, 2])},
+                )
+            ],
+        )
+
+        assert identity == ("vlm", "session-a", (("image", (1, 2, None), None),))
+
     def _make_worker(self) -> MbltWorker:
         worker = MbltWorker.__new__(MbltWorker)
         worker.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen2"))
@@ -147,6 +212,7 @@ class TestMbltWorkerOptimizations:
         worker.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
         worker.sampler = Sampler(logprobs_mode="raw_logits")
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
         worker.input_embeddings = SimpleNamespace()
         worker.print_debug = False
         worker._warned_last_logit_prompt_logprobs = False
@@ -168,6 +234,29 @@ class TestMbltWorkerOptimizations:
             kv_connector_metadata=None,
         )
 
+    def _make_new_request(
+        self,
+        req_id: str,
+        prompt_embeds: torch.Tensor,
+        mm_features: list[SimpleNamespace],
+        *,
+        num_computed_tokens: int = 0,
+        block_ids: tuple[list[int], ...] | None = None,
+        block_hashes: tuple[object, ...] | None = None,
+        session_id: str | None = None,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            req_id=req_id,
+            sampling_params=SamplingParams.from_optional(temperature=0.0),
+            prompt_token_ids=list(range(int(prompt_embeds.shape[0]))),
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
+            block_ids=block_ids or ([11],),
+            block_hashes=block_hashes,
+            num_computed_tokens=num_computed_tokens,
+            session_id=session_id,
+        )
+
     def _make_request_state(
         self,
         worker: MbltWorker,
@@ -183,6 +272,7 @@ class TestMbltWorkerOptimizations:
             cached_sampling_state=worker._make_cached_sampling_state(sampling_params, prompt_token_ids),
             block_ids=([],),
             first_seq_blocks=(),
+            first_seq_block_hashes=None,
             num_computed_tokens=0,
             num_output_tokens=0,
             prompt_embeds=np.empty((0, 1), dtype=np.float32),
@@ -195,10 +285,18 @@ class TestMbltWorkerOptimizations:
         )
 
     def _make_mm_feature(
-        self, modality: str = "image", *, offset: int = 1, length: int = 2, is_embed: torch.Tensor | None = None
+        self,
+        modality: str = "image",
+        *,
+        offset: int = 1,
+        length: int = 2,
+        is_embed: torch.Tensor | None = None,
+        data: dict[str, object] | None = None,
     ) -> SimpleNamespace:
         return SimpleNamespace(
-            modality=modality, data={}, mm_position=SimpleNamespace(offset=offset, length=length, is_embed=is_embed)
+            modality=modality,
+            data=data or {},
+            mm_position=SimpleNamespace(offset=offset, length=length, is_embed=is_embed),
         )
 
     def test_snapshot_index_can_prefer_shallower_prefix_with_more_tokens(self) -> None:
@@ -231,6 +329,367 @@ class TestMbltWorkerOptimizations:
         snapshot, matched_tokens = match
         assert snapshot is short_shared
         assert matched_tokens == 256
+
+    def test_llm_prefix_cache_does_not_load_reused_physical_blocks_for_different_prompt_tokens(self) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.store_snapshot(
+            req_id="old-content",
+            blobs=["stale-runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            num_tokens=4,
+            cache_token_ids=(101, 102, 103, 104),
+        )
+        load_calls = []
+        worker.runtime_cache.set_io_adapters(
+            load_runtime_cache=lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+        req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            [201, 202, 203, 204],
+        )
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.num_computed_tokens = 4
+
+        cache_size = worker._load_snapshot_if_needed("new-content", req_state)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.loaded_req_id is None
+
+    def test_short_prefix_hit_skips_load_and_keeps_snapshot(self) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=16,
+            cache_token_ids=tuple(range(16)),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 16
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.get_snapshot("shared") is not None
+        assert worker.runtime_cache.loaded_req_id is None
+
+    def test_long_prefix_hit_loads_and_returns_suffix_start(self) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=128,
+            cache_token_ids=tuple(range(128)),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(160)))
+        req_state.block_ids = ([10, 11],)
+        req_state.first_seq_blocks = (10, 11)
+        req_state.first_seq_block_hashes = ("shared-block", "suffix-block")
+        req_state.num_computed_tokens = 128
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 128
+        assert load_calls == [(["runtime-cache"], None)]
+        assert worker.runtime_cache.loaded_req_id == "request"
+
+    def test_explicit_prompt_embeds_with_same_tokens_but_different_content_do_not_load(self) -> None:
+        worker = self._make_worker()
+        old_embeds = np.zeros((128, 4), dtype=np.float32)
+        new_embeds = old_embeds.copy()
+        new_embeds[17, 2] = 1.0
+        old_req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
+        old_req_state.prompt_embeds = old_embeds
+        old_req_state.prompt_len = 128
+        old_req_state.explicit_prompt_embeds = True
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=128,
+            cache_token_ids=tuple(range(128)),
+            prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
+        req_state.prompt_embeds = new_embeds
+        req_state.prompt_len = 128
+        req_state.explicit_prompt_embeds = True
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 128
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.loaded_req_id is None
+
+    def test_explicit_prompt_embeds_with_identical_content_load(self) -> None:
+        worker = self._make_worker()
+        prompt_embeds = np.arange(128 * 4, dtype=np.float32).reshape(128, 4)
+        old_req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
+        old_req_state.prompt_embeds = prompt_embeds
+        old_req_state.prompt_len = 128
+        old_req_state.explicit_prompt_embeds = True
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=128,
+            cache_token_ids=tuple(range(128)),
+            prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
+        req_state.prompt_embeds = prompt_embeds.copy()
+        req_state.prompt_len = 128
+        req_state.explicit_prompt_embeds = True
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 128
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 128
+        assert load_calls == [(["runtime-cache"], None)]
+
+    def test_short_explicit_prompt_embed_hit_skips_fingerprint_when_cost_policy_skips(
+        self,
+        monkeypatch,
+    ) -> None:
+        worker = self._make_worker()
+        calls = []
+
+        def fingerprint(prompt_embeds, num_tokens):
+            calls.append((prompt_embeds.shape, int(num_tokens)))
+            return ("unexpected",)
+
+        monkeypatch.setattr(worker, "_fingerprint_prompt_embed_prefix", fingerprint)
+        old_req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
+        old_req_state.prompt_embeds = np.zeros((16, 4), dtype=np.float32)
+        old_req_state.prompt_len = 16
+        old_req_state.explicit_prompt_embeds = True
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=16,
+            cache_token_ids=tuple(range(16)),
+            prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
+        req_state.prompt_embeds = np.zeros((16, 4), dtype=np.float32)
+        req_state.prompt_len = 16
+        req_state.explicit_prompt_embeds = True
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 16
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert calls == []
+
+    def test_explicit_prompt_embed_generated_suffix_reuses_after_prompt_boundary(self) -> None:
+        worker = self._make_worker()
+        prompt_embeds = np.arange(4 * 4, dtype=np.float32).reshape(4, 4)
+        old_req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            [101, 102, 103, 104],
+            output_token_ids=[201, 202],
+        )
+        old_req_state.prompt_embeds = prompt_embeds
+        old_req_state.prompt_len = 4
+        old_req_state.explicit_prompt_embeds = True
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10, 11],),
+            first_seq_blocks=(10, 11),
+            first_seq_block_hashes=("shared-a", "shared-b"),
+            num_tokens=6,
+            cache_token_ids=worker._cache_token_ids(old_req_state, 6),
+            prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(
+            block_size=128,
+            auto_threshold_enabled=False,
+        )
+        req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            [301, 302, 303, 304],
+            output_token_ids=[201, 202],
+        )
+        req_state.prompt_embeds = prompt_embeds.copy()
+        req_state.prompt_len = 4
+        req_state.explicit_prompt_embeds = True
+        req_state.block_ids = ([10, 11],)
+        req_state.first_seq_blocks = (10, 11)
+        req_state.first_seq_block_hashes = ("shared-a", "shared-b")
+        req_state.num_computed_tokens = 6
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 6
+        assert load_calls == [(["runtime-cache"], None)]
+
+    def test_batch_prefix_cache_threshold_applies_per_cache_id(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            num_tokens=16,
+            cache_token_ids=tuple(range(16)),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(1, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 16
+        req_state.cache_slot_id = 1
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state, slot_id=1)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.live_slot_owner(1) == "request"
+        assert worker.runtime_cache.get_snapshot("shared") is not None
+
+    def test_prefix_cache_manual_override_and_auto_disable(self, monkeypatch) -> None:
+        cost_model = PrefixCacheCostModel(
+            block_size=128,
+            auto_threshold_enabled=True,
+            manual_min_hit_tokens=64,
+        )
+        cost_model.observe_prefill(128, 20.0)
+        cost_model.observe_load(None, 1.0)
+        assert not cost_model.should_load(matched_tokens=16)
+        assert cost_model.should_load(matched_tokens=128)
+
+        cost_model = PrefixCacheCostModel(
+            block_size=128,
+            auto_threshold_enabled=False,
+            manual_min_hit_tokens=None,
+        )
+        cost_model.observe_prefill(128, 1.0)
+        cost_model.observe_load(None, 100.0)
+        assert cost_model.should_load(matched_tokens=16)
+
+        config_model = PrefixCacheCostModel.from_config(
+            SimpleNamespace(
+                load_config=SimpleNamespace(
+                    model_loader_extra_config={
+                        "prefix_cache_auto_threshold": "0",
+                        "prefix_cache_min_hit_tokens": "32",
+                        "prefix_cache_load_margin": "0.8",
+                    }
+                ),
+                model_config=SimpleNamespace(model_kwargs={}, hf_overrides={}),
+            ),
+            block_size=128,
+        )
+        assert not config_model.auto_threshold_enabled
+        assert config_model.manual_min_hit_tokens == 32
+        assert config_model.margin == 0.8
+
+        monkeypatch.setenv("VLLM_MBLT_PREFIX_CACHE_MIN_HIT_TOKENS", "96")
+        env_model = PrefixCacheCostModel.from_config(SimpleNamespace(), block_size=128)
+        assert env_model.manual_min_hit_tokens == 96
+
+    def test_prefix_cache_calibration_uses_one_active_batch_cache_id(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 4
+        worker.max_seq_len = 128
+        worker.input_embeddings = torch.nn.Embedding(1, 4)
+        calls = []
+
+        def infer(inputs, *, params):
+            calls.extend((int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params)
+            total_tokens = sum(int(param.sequence_length) for param in params)
+            return [np.zeros((1, total_tokens, 8), dtype=np.float32)]
+
+        worker.cache_model = SimpleNamespace(infer=infer)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+
+        worker._calibrate_prefix_cache_prefill_costs()
+
+        assert calls
+        assert all(call == (128, 0, 1) for call in calls)
+        assert worker.prefix_cache_cost_model.prefill_ms(128) is not None
+
+    def test_llm_prefix_cache_dump_saves_prompt_and_generated_token_identity(self) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.set_io_adapters(dump_runtime_cache=lambda slot_id: ["runtime-cache"])
+        req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            [101, 102],
+            output_token_ids=[201, 202],
+        )
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+
+        dumped = worker._dump_snapshot("req", req_state, next_num_tokens=4)
+
+        assert dumped
+        snapshot = worker.runtime_cache.get_snapshot("req")
+        assert snapshot is not None
+        assert snapshot.cache_token_ids == (101, 102, 201, 202)
 
     def test_sampling_metadata_reuses_request_generator_and_enables_penalties(self) -> None:
         worker = self._make_worker()
@@ -1745,6 +2204,162 @@ class TestMbltWorkerOptimizations:
         torch.testing.assert_close(merged[1:3], image_embeds)
         torch.testing.assert_close(base_prompt_embeds, torch.arange(20, dtype=torch.float32).reshape(5, 4))
         assert deepstack is None
+
+    def test_single_request_vlm_reuses_lm_kv_prefix_and_runs_suffix_only(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen2_vl")
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", vocab_size=32000)
+        worker.req_states = {}
+        worker._infer_output_buffers = None
+        worker.runtime_cache.set_io_adapters(
+            dump_runtime_cache=lambda _slot_id: ["unused"],
+            load_runtime_cache=lambda blobs, _slot_id: blobs == ["lm-kv-prefix"],
+        )
+        base_prompt_embeds = torch.arange(130 * 4, dtype=torch.float32).reshape(130, 4)
+        feature = SimpleNamespace(
+            modality="image",
+            data={"pixel_values": torch.zeros(1, 3), "image_grid_thw": torch.tensor([1, 1, 1])},
+            mm_position=SimpleNamespace(offset=4, length=2, is_embed=None),
+        )
+        image_embeds = torch.full((2, 4), 9.0)
+        cached_prompt_embeds = base_prompt_embeds.clone()
+        cached_prompt_embeds[4:6] = image_embeds
+        cached_req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            list(range(130)),
+        )
+        cached_req_state.prompt_embeds = cached_prompt_embeds.numpy()
+        cached_req_state.prompt_len = 130
+        cached_req_state.explicit_prompt_embeds = True
+        cached_prompt_embed_identity = worker._make_prompt_embed_cache_identity(cached_req_state)
+        assert cached_prompt_embed_identity is not None
+        worker.runtime_cache.store_snapshot(
+            req_id="shared-text-prefix",
+            blobs=["lm-kv-prefix"],
+            block_ids=([11],),
+            first_seq_blocks=(11,),
+            num_tokens=128,
+            cache_token_ids=tuple(range(128)),
+            multimodal_cache_identity=MbltWorker._build_vlm_multimodal_cache_identity(
+                "vlm-session",
+                [feature],
+            ),
+            prompt_embed_cache_identity=cached_prompt_embed_identity,
+        )
+
+        image_feature_calls: list[dict[str, torch.Tensor]] = []
+
+        def get_image_features(**kwargs):
+            image_feature_calls.append(kwargs)
+            return image_embeds
+
+        infer_calls: list[tuple[int, int, np.ndarray]] = []
+
+        def infer(inputs, *, cache_size, outputs=None):
+            input_embeds = np.asarray(inputs[0] if isinstance(inputs, list) else inputs)
+            infer_calls.append((int(input_embeds.shape[1]), int(cache_size), input_embeds.copy()))
+            return [np.full((1, 16), 1.0, dtype=np.float32)]
+
+        worker.model.get_image_features = get_image_features
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(1, 16)],
+            get_num_model_variants=lambda: 0,
+        )
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        new_req = self._make_new_request(
+            "vlm-hit",
+            base_prompt_embeds,
+            [feature],
+            num_computed_tokens=128,
+            block_ids=([11, 12],),
+            session_id="vlm-session",
+        )
+        scheduler_output = self._make_scheduler_output({"vlm-hit": 2})
+        scheduler_output.scheduled_new_reqs = [new_req]
+
+        output = worker.execute_model(scheduler_output)
+
+        assert output is not None
+        assert image_feature_calls and tuple(image_feature_calls[0]["image_grid_thw"].shape) == (1, 3)
+        assert [(sequence_length, cache_size) for sequence_length, cache_size, _inputs in infer_calls] == [(2, 128)]
+        np.testing.assert_array_equal(infer_calls[0][2][0], base_prompt_embeds[128:130].numpy())
+        snapshot = worker.runtime_cache.get_snapshot("shared-text-prefix")
+        assert snapshot is not None
+        request_prompt_embed_identity = worker._make_prompt_embed_cache_identity(worker.req_states["vlm-hit"])
+        assert request_prompt_embed_identity is not None
+        assert snapshot.prompt_embed_cache_identity is not None
+        assert request_prompt_embed_identity.fingerprint(128) == snapshot.prompt_embed_cache_identity.fingerprint(128)
+        assert worker.req_states["vlm-hit"].num_computed_tokens == 130
+        assert worker.runtime_cache.loaded_req_id == "vlm-hit"
+
+    def test_repeated_image_vlm_requests_still_rebuild_vision_embeddings(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen2_vl")
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", vocab_size=32000)
+        worker.req_states = {}
+        worker._infer_output_buffers = None
+        worker.runtime_cache.set_io_adapters(
+            dump_runtime_cache=lambda _slot_id: ["live-kv"],
+            load_runtime_cache=lambda _blobs, _slot_id: True,
+        )
+
+        image_feature_call_count = 0
+
+        def get_image_features(**_kwargs):
+            nonlocal image_feature_call_count
+            image_feature_call_count += 1
+            return torch.full((2, 4), float(image_feature_call_count))
+
+        infer_inputs: list[np.ndarray] = []
+
+        def infer(inputs, *, cache_size, outputs=None):
+            del cache_size, outputs
+            infer_inputs.append(np.asarray(inputs[0] if isinstance(inputs, list) else inputs).copy())
+            return [np.full((1, 16), 1.0, dtype=np.float32)]
+
+        worker.model.get_image_features = get_image_features
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(1, 16)],
+            get_num_model_variants=lambda: 0,
+        )
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        for index, req_id in enumerate(("vlm-first", "vlm-second"), start=1):
+            prompt_embeds = torch.zeros(6, 4)
+            feature = SimpleNamespace(
+                modality="image",
+                data={"pixel_values": torch.full((1, 3), float(index)), "image_grid_thw": torch.tensor([1, 1, 1])},
+                mm_position=SimpleNamespace(offset=2, length=2, is_embed=None),
+            )
+            scheduler_output = self._make_scheduler_output({req_id: 6})
+            scheduler_output.scheduled_new_reqs = [
+                self._make_new_request(
+                    req_id,
+                    prompt_embeds,
+                    [feature],
+                    block_ids=([20 + index],),
+                    session_id=f"vlm-session-{index}",
+                )
+            ]
+
+            assert worker.execute_model(scheduler_output) is not None
+
+        assert image_feature_call_count == 2
+        assert len(infer_inputs) == 2
+        np.testing.assert_array_equal(infer_inputs[0][0, 2:4], np.full((2, 4), 1.0, dtype=np.float32))
+        np.testing.assert_array_equal(infer_inputs[1][0, 2:4], np.full((2, 4), 2.0, dtype=np.float32))
 
     def test_build_deepstack_input_embeds_pads_decode_tokens(self) -> None:
         worker = self._make_worker()

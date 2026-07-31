@@ -2,6 +2,7 @@ import pytest
 
 from vllm_mblt.runtime_cache import (
     MbltRuntimeCacheManager,
+    PromptEmbedCacheIdentity,
     RuntimeCacheRequest,
     append_block_ids,
     first_seq_blocks,
@@ -24,14 +25,22 @@ def _request(
     blocks: tuple[int, ...],
     tokens: int,
     *,
+    block_hashes: tuple[object, ...] | None = None,
     cache_slot_id: int | None = None,
+    cache_token_ids: tuple[int, ...] | list[int] | None = None,
+    multimodal_cache_identity: object | None = None,
+    prompt_embed_cache_identity: PromptEmbedCacheIdentity | None = None,
 ) -> RuntimeCacheRequest:
     return RuntimeCacheRequest(
         req_id=req_id,
         block_ids=(list(blocks),),
         first_seq_blocks=blocks,
         num_computed_tokens=tokens,
+        first_seq_block_hashes=block_hashes,
         cache_slot_id=cache_slot_id,
+        cache_token_ids=tuple(cache_token_ids) if cache_token_ids is not None else None,
+        multimodal_cache_identity=multimodal_cache_identity,
+        prompt_embed_cache_identity=prompt_embed_cache_identity,
     )
 
 
@@ -42,6 +51,10 @@ def _store_snapshot(
     tokens: int,
     *,
     blobs: list[object] | None = None,
+    cache_token_ids: tuple[int, ...] | list[int] | None = None,
+    block_hashes: tuple[object, ...] | None = None,
+    multimodal_cache_identity: object | None = None,
+    prompt_embed_cache_identity: PromptEmbedCacheIdentity | None = None,
 ) -> None:
     block_tuple = tuple(blocks)
     block_ids = (list(block_tuple),)
@@ -50,8 +63,29 @@ def _store_snapshot(
         blobs=blobs if blobs is not None else [f"blob:{req_id}"],
         block_ids=block_ids,
         first_seq_blocks=first_seq_blocks(block_ids),
+        first_seq_block_hashes=block_hashes,
         num_tokens=tokens,
+        cache_token_ids=cache_token_ids,
+        multimodal_cache_identity=multimodal_cache_identity,
+        prompt_embed_cache_identity=prompt_embed_cache_identity,
     )
+
+
+def _prompt_embed_identity(prompt_len: int, fingerprints: dict[int, object]) -> PromptEmbedCacheIdentity:
+    return PromptEmbedCacheIdentity(
+        prompt_len=prompt_len,
+        fingerprint_for_prefix=lambda num_tokens: fingerprints.get(int(num_tokens)),
+    )
+
+
+def _vlm_identity(
+    session_id: str,
+    *,
+    offset: int = 2,
+    length: int = 2,
+    content: object = "image-a",
+) -> tuple[object, ...]:
+    return ("vlm", session_id, (("image", (offset, length, None), content),))
 
 
 class TestRuntimeCacheBlockHelpers:
@@ -154,6 +188,443 @@ class TestMbltRuntimeCacheManagerSnapshots:
         assert snapshot is None
         assert matched_tokens == 0
 
+    def test_prefix_snapshot_rejects_reused_physical_blocks_with_different_tokens(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "old-content",
+            (10, 11),
+            8,
+            cache_token_ids=(101, 102, 103, 104, 105, 106, 107, 108),
+        )
+
+        match = manager.choose_snapshot(
+            _request(
+                "new-content",
+                (10, 11),
+                8,
+                cache_token_ids=(201, 202, 203, 204, 205, 206, 207, 208),
+            )
+        )
+
+        assert match.snapshot is None
+        assert match.matched_tokens == 0
+
+    def test_hashed_snapshot_does_not_match_reused_physical_block_ids(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "old", (1, 2), 8, block_hashes=("old-a", "old-b"))
+
+        match = manager.choose_snapshot(_request("new", (1, 2), 8, block_hashes=("new-a", "new-b")))
+
+        assert match.snapshot is None
+        assert match.matched_tokens == 0
+
+    def test_prefix_snapshot_selection_skips_incompatible_reused_block_candidate(self) -> None:
+        manager = _make_manager(block_size=4)
+        shared_blocks = (10, 11)
+        _store_snapshot(
+            manager,
+            "wrong-content",
+            shared_blocks,
+            8,
+            cache_token_ids=(101, 102, 103, 104, 105, 106, 107, 108),
+        )
+        _store_snapshot(
+            manager,
+            "right-content",
+            shared_blocks,
+            8,
+            cache_token_ids=(201, 202, 203, 204, 205, 206, 207, 208),
+        )
+
+        match = manager.choose_snapshot(
+            _request(
+                "new-content",
+                shared_blocks,
+                8,
+                cache_token_ids=(201, 202, 203, 204, 205, 206, 207, 208),
+            )
+        )
+
+        assert match.req_id == "right-content"
+        assert match.snapshot is manager.get_snapshot("right-content")
+        assert match.matched_tokens == 8
+
+    def test_hashless_snapshot_is_not_invalidated_before_token_identity_check(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "old", (1, 2), 8, cache_token_ids=tuple(range(8)))
+
+        evicted = manager.observe_request_blocks("new", ([1, 3],))
+
+        assert evicted == []
+        assert manager.get_snapshot("old") is not None
+        match = manager.choose_snapshot(_request("new", (1, 2), 8, cache_token_ids=tuple(range(8))))
+        assert match.snapshot is manager.get_snapshot("old")
+        assert match.matched_tokens == 8
+
+    def test_hashless_load_invalidates_stale_snapshot_before_restore(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "old", (1, 2), 8, cache_token_ids=tuple(range(8)))
+        load_calls = []
+
+        result = manager.load_snapshot_for_request(
+            _request("new", (1, 2), 8, cache_token_ids=tuple(range(100, 108))),
+            lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+        assert load_calls == []
+        assert manager.get_snapshot("old") is None
+
+    def test_real_vllm_0112_hashless_shared_prefix_restores_with_token_identity(self) -> None:
+        manager = _make_manager(block_size=4)
+        token_ids = (10, 11, 12, 13, 14, 15, 16, 17)
+        _store_snapshot(manager, "finished-a", (1, 2), 8, cache_token_ids=token_ids)
+        manager.mark_snapshot_finished("finished-a")
+
+        new_request_data = type(
+            "NewRequestData0112",
+            (),
+            {
+                "__annotations__": {
+                    "req_id": str,
+                    "prompt_token_ids": list[int],
+                    "mm_features": object,
+                    "sampling_params": object,
+                    "pooling_params": object,
+                    "block_ids": object,
+                    "num_computed_tokens": int,
+                    "lora_request": object,
+                    "prompt_embeds": object,
+                }
+            },
+        )()
+        new_request_data.req_id = "new-b"
+        new_request_data.prompt_token_ids = list(token_ids)
+        new_request_data.block_ids = ([1, 2],)
+        new_request_data.num_computed_tokens = 8
+
+        manager.observe_request_blocks(new_request_data.req_id, new_request_data.block_ids)
+        result = manager.load_snapshot_for_request(
+            _request(
+                new_request_data.req_id,
+                tuple(new_request_data.block_ids[0]),
+                new_request_data.num_computed_tokens,
+                cache_token_ids=tuple(new_request_data.prompt_token_ids),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.loaded
+        assert result.loaded_snapshot_req_id == "finished-a"
+        assert result.matched_tokens == 8
+
+    def test_explicit_prompt_embed_identity_rejects_same_tokens_with_different_embeds(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "old",
+            (1, 2),
+            8,
+            cache_token_ids=tuple(range(8)),
+            prompt_embed_cache_identity=_prompt_embed_identity(8, {8: ("embed", "old")}),
+        )
+
+        loaded = []
+        result = manager.load_snapshot_for_request(
+            _request(
+                "new",
+                (1, 2),
+                8,
+                cache_token_ids=tuple(range(8)),
+                prompt_embed_cache_identity=_prompt_embed_identity(8, {8: ("embed", "new")}),
+            ),
+            lambda blobs, slot_id: loaded.append((blobs, slot_id)) or True,
+        )
+
+        assert result.cache_miss
+        assert loaded == []
+
+    def test_explicit_prompt_embed_identity_allows_identical_embed_prefix(self) -> None:
+        manager = _make_manager(block_size=4)
+        fingerprint = ("embed", "same")
+        _store_snapshot(
+            manager,
+            "old",
+            (1, 2),
+            8,
+            cache_token_ids=tuple(range(8)),
+            prompt_embed_cache_identity=_prompt_embed_identity(8, {8: fingerprint}),
+        )
+
+        loaded = []
+        result = manager.load_snapshot_for_request(
+            _request(
+                "new",
+                (1, 2),
+                8,
+                cache_token_ids=tuple(range(8)),
+                prompt_embed_cache_identity=_prompt_embed_identity(8, {8: fingerprint}),
+            ),
+            lambda blobs, slot_id: loaded.append((blobs, slot_id)) or True,
+        )
+
+        assert result.loaded
+        assert result.loaded_snapshot_req_id == "old"
+        assert result.matched_tokens == 8
+        assert loaded == [(["blob:old"], None)]
+
+    def test_explicit_prompt_embed_generated_suffix_uses_token_ids_after_prompt(self) -> None:
+        manager = _make_manager(block_size=4)
+        fingerprint = ("embed", "same-prompt")
+        _store_snapshot(
+            manager,
+            "old",
+            (1, 2),
+            6,
+            cache_token_ids=(101, 102, 103, 104, 201, 202),
+            prompt_embed_cache_identity=_prompt_embed_identity(4, {4: fingerprint}),
+        )
+
+        loaded = []
+        result = manager.load_snapshot_for_request(
+            _request(
+                "new",
+                (1, 2),
+                6,
+                cache_token_ids=(301, 302, 303, 304, 201, 202),
+                prompt_embed_cache_identity=_prompt_embed_identity(4, {4: fingerprint}),
+            ),
+            lambda blobs, slot_id: loaded.append((blobs, slot_id)) or True,
+        )
+
+        assert result.loaded
+        assert result.matched_tokens == 6
+        assert loaded == [(["blob:old"], None)]
+
+    def test_explicit_prompt_embed_generated_suffix_mismatch_caps_to_prompt(self) -> None:
+        manager = _make_manager(block_size=4)
+        fingerprint = ("embed", "same-prompt")
+        _store_snapshot(
+            manager,
+            "old",
+            (1, 2),
+            6,
+            cache_token_ids=(101, 102, 103, 104, 201, 202),
+            prompt_embed_cache_identity=_prompt_embed_identity(4, {4: fingerprint}),
+        )
+
+        loaded = []
+        result = manager.load_snapshot_for_request(
+            _request(
+                "new",
+                (1, 2),
+                6,
+                cache_token_ids=(301, 302, 303, 304, 201, 999),
+                prompt_embed_cache_identity=_prompt_embed_identity(4, {4: fingerprint}),
+            ),
+            lambda blobs, slot_id: loaded.append((blobs, slot_id)) or True,
+        )
+
+        assert result.loaded
+        assert result.matched_tokens == 5
+        assert loaded == [(["blob:old"], None)]
+
+    def test_real_vllm_0112_cached_request_reused_physical_block_with_different_tokens_is_removed(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "old-content", (7,), 4, cache_token_ids=(1, 2, 3, 4))
+        cached_request_data = type(
+            "CachedRequestData0112",
+            (),
+            {
+                "__annotations__": {
+                    "req_ids": list[str],
+                    "resumed_req_ids": set[str],
+                    "new_token_ids": list[list[int]],
+                    "all_token_ids": dict[str, list[int]],
+                    "new_block_ids": object,
+                    "num_computed_tokens": list[int],
+                    "num_output_tokens": list[int],
+                }
+            },
+        )()
+        cached_request_data.req_ids = ["new-content"]
+        cached_request_data.all_token_ids = {"new-content": [9, 2, 3, 4]}
+        cached_request_data.new_block_ids = [([7],)]
+        cached_request_data.num_computed_tokens = [4]
+
+        manager.observe_request_blocks(cached_request_data.req_ids[0], cached_request_data.new_block_ids[0])
+        result = manager.load_snapshot_for_request(
+            _request(
+                cached_request_data.req_ids[0],
+                tuple(cached_request_data.new_block_ids[0][0]),
+                cached_request_data.num_computed_tokens[0],
+                cache_token_ids=tuple(cached_request_data.all_token_ids["new-content"]),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert manager.get_snapshot("old-content") is None
+
+    def test_hashless_multimodal_identity_mismatch_is_rejected(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=("vlm", "session-a", (0, 2, None)),
+        )
+
+        manager.observe_request_blocks("vlm-new", ([30],))
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=("vlm", "session-b", (0, 2, None)),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert manager.get_snapshot("vlm-old") is None
+
+    def test_identityless_snapshot_is_rejected_when_vlm_prefix_overlaps_embedding(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=None,
+        )
+
+        manager.observe_request_blocks("vlm-new", ([30],))
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=_vlm_identity("session-a", offset=0, length=2),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+
+    def test_identityless_snapshot_can_match_text_only_prefix_before_vlm_embedding(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=None,
+        )
+
+        match = manager.choose_snapshot(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=_vlm_identity("session-a", offset=4, length=2),
+            )
+        )
+
+        assert match.req_id == "vlm-old"
+        assert match.matched_tokens == 4
+
+    def test_same_vlm_identity_reuses_snapshot(self) -> None:
+        manager = _make_manager(block_size=4)
+        identity = _vlm_identity("session-a", offset=2, length=2, content="same-image")
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=identity,
+        )
+
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=identity,
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.loaded
+        assert result.loaded_snapshot_req_id == "vlm-old"
+        assert result.matched_tokens == 4
+
+    def test_same_session_position_with_different_vlm_content_rejects_snapshot(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=_vlm_identity("session-a", offset=0, length=2, content="image-a"),
+        )
+
+        manager.observe_request_blocks("vlm-new", ([30],))
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=_vlm_identity("session-a", offset=0, length=2, content="image-b"),
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+        assert manager.get_snapshot("vlm-old") is None
+
+    def test_unresolved_vlm_identity_trims_reuse_before_embedding_overlap(self) -> None:
+        manager = _make_manager(block_size=4)
+        unresolved_identity = _vlm_identity("session-a", offset=2, length=2, content=None)
+        _store_snapshot(
+            manager,
+            "vlm-old",
+            (30,),
+            4,
+            cache_token_ids=(1, 2, 3, 4),
+            multimodal_cache_identity=unresolved_identity,
+        )
+
+        result = manager.load_snapshot_for_request(
+            _request(
+                "vlm-new",
+                (30,),
+                4,
+                cache_token_ids=(1, 2, 3, 4),
+                multimodal_cache_identity=unresolved_identity,
+            ),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.loaded
+        assert result.loaded_snapshot_req_id == "vlm-old"
+        assert result.matched_tokens == 2
+
     def test_snapshot_update_and_removal_refresh_prefix_index(self) -> None:
         manager = _make_manager(block_size=4)
         _store_snapshot(manager, "req", (1, 2), 8)
@@ -248,11 +719,11 @@ class TestMbltRuntimeCacheManagerRuntimeDecisions:
 
     def test_single_cache_loads_useful_shared_prefix_snapshot(self) -> None:
         manager = _make_manager(block_size=4)
-        _store_snapshot(manager, "shared", (1, 2, 3), 12)
+        _store_snapshot(manager, "shared", (1, 2, 3), 12, block_hashes=("a", "b", "c"))
         load_calls = []
 
         result = manager.load_snapshot_for_request(
-            _request("req", (1, 2, 9), 10),
+            _request("req", (1, 2, 9), 10, block_hashes=("a", "b", "z")),
             lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
         )
 
@@ -272,6 +743,32 @@ class TestMbltRuntimeCacheManagerRuntimeDecisions:
         assert result.matched_tokens == 0
         assert result.cache_miss
         assert manager.loaded_req_id is None
+
+    def test_single_cache_does_not_load_snapshot_for_reused_blocks_with_different_tokens(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(
+            manager,
+            "old-content",
+            (10, 11),
+            8,
+            blobs=["stale-runtime-cache"],
+            cache_token_ids=(101, 102, 103, 104, 105, 106, 107, 108),
+        )
+        load_calls = []
+
+        result = manager.load_snapshot_for_request(
+            _request(
+                "new-content",
+                (10, 11),
+                8,
+                cache_token_ids=(201, 202, 203, 204, 205, 206, 207, 208),
+            ),
+            lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+        assert load_calls == []
 
     def test_dump_snapshot_if_needed_uses_injected_callable_and_block_boundary_policy(self) -> None:
         manager = _make_manager(block_size=4)
@@ -303,6 +800,17 @@ class TestMbltRuntimeCacheManagerRuntimeDecisions:
         assert not not_dumped
         assert dump_calls == [None, None]
         assert manager.get_snapshot("req").blobs == ["blob:req:5"]
+
+    def test_dump_snapshot_if_needed_saves_token_identity_for_reused_block_detection(self) -> None:
+        manager = _make_manager(block_size=4)
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (10, 11), 8, cache_token_ids=(101, 102, 103, 104, 105, 106, 107, 108)),
+            lambda slot_id: ["blob:req"],
+        )
+
+        assert dumped
+        assert manager.get_snapshot("req").cache_token_ids == (101, 102, 103, 104, 105, 106, 107, 108)
 
     def test_dump_live_request_before_switch_dumps_current_owner_when_needed(self) -> None:
         manager = _make_manager(block_size=4)
@@ -375,9 +883,9 @@ class TestMbltRuntimeCacheManagerSlots:
         assert reused.matched_tokens == 4
         assert load_calls == []
 
-        _store_snapshot(manager, "other", (7, 8), 8)
+        _store_snapshot(manager, "other", (7, 8), 8, block_hashes=("a", "b"))
         loaded = manager.load_snapshot_for_slot(
-            _request("new", (7, 9), 8, cache_slot_id=slot_id),
+            _request("new", (7, 9), 8, block_hashes=("a", "z"), cache_slot_id=slot_id),
             lambda blobs, load_slot_id: load_calls.append((blobs, load_slot_id)) or True,
         )
 
