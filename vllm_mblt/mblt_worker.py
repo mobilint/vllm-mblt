@@ -32,6 +32,7 @@ from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.runtime_cache import (
     KVBlockIds,
     MbltRuntimeCacheManager,
+    PromptEmbedCacheIdentity,
     RuntimeCacheLoadResult,
     RuntimeCacheRequest,
     append_block_ids,
@@ -119,6 +120,7 @@ class RequestState:
     cache_slot_id: Optional[int]
     vlm_session_id: Optional[str]
     multimodal_cache_identity: Optional[Hashable] = None
+    explicit_prompt_embeds: bool = False
     next_prompt_logprob_pos: int = 1
     in_progress_prompt_logprobs: Optional[LogprobsTensors] = None
 
@@ -2208,6 +2210,7 @@ class MbltWorker(WorkerBase):
                 cache_slot_id=slot_id,
                 cache_token_ids=self._cache_token_ids(req_state, target_tokens),
                 multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
+                prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
             )
         )
         if print_debug:
@@ -2267,6 +2270,24 @@ class MbltWorker(WorkerBase):
                 snapshot_req_id=match.req_id,
             )
 
+        match = self.runtime_cache.verify_prompt_embed_match(request, match)
+        if match.snapshot is None or match.matched_tokens <= 0:
+            self.runtime_cache.clear_loaded_request()
+            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+        if not self._ensure_prefix_cache_cost_model().should_load(
+            matched_tokens=match.matched_tokens,
+            cache_id=None,
+        ):
+            self.runtime_cache.clear_loaded_request()
+            return RuntimeCacheLoadResult(
+                matched_tokens=0,
+                cache_miss=True,
+                loaded_snapshot_req_id=match.req_id,
+                is_own_snapshot=match.is_own_snapshot,
+                action="skip-cost",
+                snapshot_req_id=match.req_id,
+            )
+
         if self._timed_load_runtime_cache(match.snapshot.blobs, None):
             self.runtime_cache.mark_loaded_request(request.req_id)
             return RuntimeCacheLoadResult(
@@ -2307,6 +2328,7 @@ class MbltWorker(WorkerBase):
                 cache_slot_id=slot_id,
                 cache_token_ids=self._cache_token_ids(req_state, target_tokens),
                 multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
+                prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
             )
         )
         if print_debug:
@@ -2370,6 +2392,24 @@ class MbltWorker(WorkerBase):
                     snapshot_req_id=match.req_id,
                 )
 
+            match = self.runtime_cache.verify_prompt_embed_match(request, match)
+            if match.snapshot is None or match.matched_tokens <= 0:
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+            if not self._ensure_prefix_cache_cost_model().should_load(
+                matched_tokens=match.matched_tokens,
+                cache_id=slot_id,
+            ):
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                return RuntimeCacheLoadResult(
+                    matched_tokens=0,
+                    cache_miss=True,
+                    loaded_snapshot_req_id=match.req_id,
+                    is_own_snapshot=match.is_own_snapshot,
+                    action="skip-cost",
+                    snapshot_req_id=match.req_id,
+                )
+
             if self._timed_load_runtime_cache(match.snapshot.blobs, slot_id):
                 self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
                 return RuntimeCacheLoadResult(
@@ -2411,6 +2451,7 @@ class MbltWorker(WorkerBase):
             num_tokens=next_num_tokens,
             cache_token_ids=self._cache_token_ids(req_state, next_num_tokens),
             multimodal_cache_identity=self._cache_multimodal_identity(req_state, next_num_tokens),
+            prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
         )
         if print_debug:
             num_blocks = len(req_state.first_seq_blocks)
@@ -2437,6 +2478,48 @@ class MbltWorker(WorkerBase):
         if max(0, int(num_tokens)) <= 0:
             return None
         return req_state.multimodal_cache_identity
+
+    @staticmethod
+    def _fingerprint_prompt_embed_prefix(
+        prompt_embeds: np.ndarray,
+        num_tokens: int,
+    ) -> Hashable | None:
+        num_tokens = max(0, int(num_tokens))
+        if num_tokens <= 0 or num_tokens > int(prompt_embeds.shape[0]):
+            return None
+        prefix = prompt_embeds[:num_tokens]
+        if prefix.dtype == object:
+            return None
+        if not prefix.flags.c_contiguous:
+            prefix = np.ascontiguousarray(prefix)
+        digest = hashlib.sha256()
+        digest.update(str(prefix.dtype).encode("utf-8"))
+        digest.update(repr(tuple(int(dim) for dim in prefix.shape)).encode("utf-8"))
+        digest.update(prefix.tobytes())
+        return ("sha256", tuple(int(dim) for dim in prefix.shape), str(prefix.dtype), digest.hexdigest())
+
+    def _make_prompt_embed_cache_identity(
+        self,
+        req_state: RequestState,
+    ) -> PromptEmbedCacheIdentity | None:
+        if not req_state.explicit_prompt_embeds:
+            return None
+        prompt_len = max(0, int(req_state.prompt_len))
+        if prompt_len <= 0:
+            return None
+        prompt_embeds = req_state.prompt_embeds
+        fingerprints: dict[int, Hashable | None] = {}
+
+        def fingerprint_for_prefix(num_tokens: int) -> Hashable | None:
+            num_tokens = max(0, int(num_tokens))
+            if num_tokens not in fingerprints:
+                fingerprints[num_tokens] = self._fingerprint_prompt_embed_prefix(prompt_embeds, num_tokens)
+            return fingerprints[num_tokens]
+
+        return PromptEmbedCacheIdentity(
+            prompt_len=prompt_len,
+            fingerprint_for_prefix=fingerprint_for_prefix,
+        )
 
     def _finalize_finished_request(
         self,
@@ -2772,6 +2855,7 @@ class MbltWorker(WorkerBase):
                     vlm_session_id,
                     new_req.mm_features,
                 ),
+                explicit_prompt_embeds=new_req.prompt_embeds is not None,
             )
 
         # Continue cached requests

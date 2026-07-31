@@ -12,6 +12,20 @@ LoadRuntimeCache = RuntimeCacheLoadFn
 
 
 @dataclass
+class PromptEmbedCacheIdentity:
+    prompt_len: int
+    fingerprint_for_prefix: Callable[[int], Hashable | None]
+
+    def fingerprint(self, num_tokens: int) -> Hashable | None:
+        num_tokens = max(0, int(num_tokens))
+        if num_tokens <= 0:
+            return None
+        if num_tokens > self.prompt_len:
+            return None
+        return self.fingerprint_for_prefix(num_tokens)
+
+
+@dataclass
 class RuntimeCacheSnapshot:
     blobs: list[Any]
     block_ids: KVBlockIds
@@ -20,6 +34,7 @@ class RuntimeCacheSnapshot:
     cache_token_ids: tuple[int, ...] | None = None
     multimodal_cache_identity: Hashable | None = None
     first_seq_block_hashes: tuple[Hashable, ...] | None = None
+    prompt_embed_cache_identity: PromptEmbedCacheIdentity | None = None
 
 
 @dataclass
@@ -32,6 +47,7 @@ class RuntimeCacheRequest:
     cache_token_ids: tuple[int, ...] | None = None
     multimodal_cache_identity: Hashable | None = None
     first_seq_block_hashes: tuple[Hashable, ...] | None = None
+    prompt_embed_cache_identity: PromptEmbedCacheIdentity | None = None
 
 
 @dataclass
@@ -243,6 +259,7 @@ class MbltRuntimeCacheManager:
         first_seq_block_ids: tuple[int, ...] | None = None,
         cache_token_ids: tuple[int, ...] | list[int] | None = None,
         multimodal_cache_identity: Hashable | None = None,
+        prompt_embed_cache_identity: PromptEmbedCacheIdentity | None = None,
     ) -> RuntimeCacheSnapshot:
         return self.store_snapshot(
             req_id=req_id,
@@ -252,6 +269,7 @@ class MbltRuntimeCacheManager:
             num_tokens=num_tokens,
             cache_token_ids=cache_token_ids,
             multimodal_cache_identity=multimodal_cache_identity,
+            prompt_embed_cache_identity=prompt_embed_cache_identity,
         )
 
     def store_snapshot(
@@ -265,6 +283,7 @@ class MbltRuntimeCacheManager:
         num_tokens: int,
         cache_token_ids: tuple[int, ...] | list[int] | None = None,
         multimodal_cache_identity: Hashable | None = None,
+        prompt_embed_cache_identity: PromptEmbedCacheIdentity | None = None,
     ) -> RuntimeCacheSnapshot:
         self.finished_snapshot_lru.pop(req_id, None)
         snapshot = RuntimeCacheSnapshot(
@@ -275,6 +294,7 @@ class MbltRuntimeCacheManager:
             num_tokens=max(0, int(num_tokens)),
             cache_token_ids=tuple(cache_token_ids) if cache_token_ids is not None else None,
             multimodal_cache_identity=multimodal_cache_identity,
+            prompt_embed_cache_identity=prompt_embed_cache_identity,
         )
         self.snapshots[req_id] = snapshot
         if snapshot.first_seq_block_hashes is None:
@@ -354,6 +374,7 @@ class MbltRuntimeCacheManager:
         slot_id: int | None = None,
         cache_token_ids: tuple[int, ...] | list[int] | None = None,
         multimodal_cache_identity: Hashable | None = None,
+        prompt_embed_cache_identity: PromptEmbedCacheIdentity | None = None,
     ) -> RuntimeCacheSnapshot | None:
         if self._dump_runtime_cache_fn is None:
             raise RuntimeError("Runtime cache dump adapter is not configured.")
@@ -369,6 +390,7 @@ class MbltRuntimeCacheManager:
             num_tokens=num_tokens,
             cache_token_ids=cache_token_ids,
             multimodal_cache_identity=multimodal_cache_identity,
+            prompt_embed_cache_identity=prompt_embed_cache_identity,
         )
 
     def choose_prefix_snapshot(
@@ -418,10 +440,12 @@ class MbltRuntimeCacheManager:
                 ):
                     stale_req_ids.add(req_id)
                     continue
-                token_matched_tokens = token_compatible_tokens(
+                token_matched_tokens = token_compatible_tokens_for_prompt_embeds(
                     matched_tokens,
                     request.cache_token_ids if request is not None else None,
                     snapshot.cache_token_ids,
+                    request.prompt_embed_cache_identity if request is not None else None,
+                    snapshot.prompt_embed_cache_identity,
                 )
                 matched_tokens = multimodal_compatible_tokens(
                     token_matched_tokens,
@@ -468,6 +492,8 @@ class MbltRuntimeCacheManager:
                 snapshot_token_ids=own_snapshot.cache_token_ids,
                 target_multimodal_identity=request.multimodal_cache_identity,
                 snapshot_multimodal_identity=own_snapshot.multimodal_cache_identity,
+                target_prompt_embed_identity=request.prompt_embed_cache_identity,
+                snapshot_prompt_embed_identity=own_snapshot.prompt_embed_cache_identity,
             )
             if matched_tokens >= target_tokens:
                 return RuntimeCacheSnapshotMatch(
@@ -478,6 +504,32 @@ class MbltRuntimeCacheManager:
                 )
 
         return self.choose_prefix_snapshot(request)
+
+    def verify_prompt_embed_match(
+        self,
+        request: RuntimeCacheRequest,
+        match: RuntimeCacheSnapshotMatch,
+    ) -> RuntimeCacheSnapshotMatch:
+        if match.snapshot is None or match.matched_tokens <= 0:
+            return match
+
+        matched_tokens = prompt_embed_compatible_tokens(
+            match.matched_tokens,
+            request.prompt_embed_cache_identity,
+            match.snapshot.prompt_embed_cache_identity,
+            request.cache_token_ids,
+            match.snapshot.cache_token_ids,
+        )
+        if matched_tokens <= 0:
+            return RuntimeCacheSnapshotMatch(snapshot=None, matched_tokens=0)
+        if matched_tokens == match.matched_tokens:
+            return match
+        return RuntimeCacheSnapshotMatch(
+            snapshot=match.snapshot,
+            matched_tokens=matched_tokens,
+            req_id=match.req_id,
+            is_own_snapshot=match.is_own_snapshot,
+        )
 
     def compatible_tokens(
         self,
@@ -490,6 +542,8 @@ class MbltRuntimeCacheManager:
         snapshot_token_ids: tuple[int, ...] | None = None,
         target_multimodal_identity: Hashable | None = None,
         snapshot_multimodal_identity: Hashable | None = None,
+        target_prompt_embed_identity: PromptEmbedCacheIdentity | None = None,
+        snapshot_prompt_embed_identity: PromptEmbedCacheIdentity | None = None,
     ) -> int:
         matched_tokens = prefix_compatible_tokens(
             target_blocks,
@@ -498,7 +552,13 @@ class MbltRuntimeCacheManager:
             snapshot_tokens,
             self.block_size,
         )
-        matched_tokens = token_compatible_tokens(matched_tokens, target_token_ids, snapshot_token_ids)
+        matched_tokens = token_compatible_tokens_for_prompt_embeds(
+            matched_tokens,
+            target_token_ids,
+            snapshot_token_ids,
+            target_prompt_embed_identity,
+            snapshot_prompt_embed_identity,
+        )
         return multimodal_compatible_tokens(matched_tokens, target_multimodal_identity, snapshot_multimodal_identity)
 
     def required_blocks(self, num_tokens: int) -> int:
@@ -534,6 +594,7 @@ class MbltRuntimeCacheManager:
             num_tokens=request.num_computed_tokens,
             cache_token_ids=request.cache_token_ids,
             multimodal_cache_identity=request.multimodal_cache_identity,
+            prompt_embed_cache_identity=request.prompt_embed_cache_identity,
         )
         return True
 
@@ -575,6 +636,7 @@ class MbltRuntimeCacheManager:
             )
 
         match = self.choose_snapshot(request)
+        match = self.verify_prompt_embed_match(request, match)
         if match.snapshot is None or match.matched_tokens <= 0:
             self.clear_loaded_request()
             return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
@@ -627,6 +689,7 @@ class MbltRuntimeCacheManager:
             )
 
         match = self.choose_snapshot(request)
+        match = self.verify_prompt_embed_match(request, match)
         if match.snapshot is not None and match.matched_tokens > 0:
             load_runtime_cache = load_runtime_cache or self._load_runtime_cache_fn
             if load_runtime_cache is None:
@@ -656,6 +719,7 @@ class MbltRuntimeCacheManager:
                 cache_token_ids=request.cache_token_ids,
                 multimodal_cache_identity=request.multimodal_cache_identity,
                 cache_slot_id=slot_id,
+                prompt_embed_cache_identity=request.prompt_embed_cache_identity,
             )
         return self.load_snapshot_for_slot(request)
 
@@ -760,6 +824,94 @@ def token_compatible_tokens(
     common_tokens = 0
     for target_token_id, snapshot_token_id in zip(target_token_ids, snapshot_token_ids):
         if target_token_id != snapshot_token_id:
+            break
+        common_tokens += 1
+        if common_tokens >= matched_tokens:
+            break
+    return min(matched_tokens, common_tokens)
+
+
+def token_compatible_tokens_for_prompt_embeds(
+    matched_tokens: int,
+    target_token_ids: tuple[int, ...] | None,
+    snapshot_token_ids: tuple[int, ...] | None,
+    target_identity: PromptEmbedCacheIdentity | None,
+    snapshot_identity: PromptEmbedCacheIdentity | None,
+) -> int:
+    if target_identity is None and snapshot_identity is None:
+        return token_compatible_tokens(matched_tokens, target_token_ids, snapshot_token_ids)
+    if matched_tokens <= 0:
+        return 0
+    if target_identity is None or snapshot_identity is None:
+        return 0
+
+    target_prompt_len = max(0, int(target_identity.prompt_len))
+    snapshot_prompt_len = max(0, int(snapshot_identity.prompt_len))
+    embed_limit = min(target_prompt_len, snapshot_prompt_len)
+    if embed_limit <= 0:
+        return 0
+    if matched_tokens <= embed_limit:
+        return matched_tokens
+    if target_prompt_len != snapshot_prompt_len:
+        return embed_limit
+    if target_token_ids is None or snapshot_token_ids is None:
+        return embed_limit
+
+    common_tokens = target_prompt_len
+    for idx in range(target_prompt_len, min(matched_tokens, len(target_token_ids), len(snapshot_token_ids))):
+        if target_token_ids[idx] != snapshot_token_ids[idx]:
+            break
+        common_tokens += 1
+        if common_tokens >= matched_tokens:
+            break
+    return min(matched_tokens, common_tokens)
+
+
+def prompt_embed_compatible_tokens(
+    matched_tokens: int,
+    target_identity: PromptEmbedCacheIdentity | None,
+    snapshot_identity: PromptEmbedCacheIdentity | None,
+    target_token_ids: tuple[int, ...] | None,
+    snapshot_token_ids: tuple[int, ...] | None,
+) -> int:
+    if matched_tokens <= 0:
+        return 0
+    if target_identity is None and snapshot_identity is None:
+        return token_compatible_tokens(matched_tokens, target_token_ids, snapshot_token_ids)
+
+    # Explicit prompt embeddings replace token embeddings from position 0, so
+    # any cross-request reuse touching that prefix must prove byte-identical
+    # embedding content. If only one side has explicit embeddings, exact
+    # equivalence to token-derived embeddings is not available here.
+    if target_identity is None or snapshot_identity is None:
+        return 0
+
+    target_prompt_len = max(0, int(target_identity.prompt_len))
+    snapshot_prompt_len = max(0, int(snapshot_identity.prompt_len))
+    embed_tokens = min(matched_tokens, target_prompt_len, snapshot_prompt_len)
+    if embed_tokens <= 0:
+        return 0
+
+    target_fingerprint = target_identity.fingerprint(embed_tokens)
+    snapshot_fingerprint = snapshot_identity.fingerprint(embed_tokens)
+    if target_fingerprint is None or snapshot_fingerprint is None:
+        return 0
+    if target_fingerprint != snapshot_fingerprint:
+        return 0
+
+    embed_limit = min(target_prompt_len, snapshot_prompt_len)
+    if matched_tokens <= embed_limit:
+        return matched_tokens
+
+    if target_prompt_len != snapshot_prompt_len:
+        return embed_limit
+
+    if target_token_ids is None or snapshot_token_ids is None:
+        return embed_limit
+
+    common_tokens = target_prompt_len
+    for idx in range(target_prompt_len, min(matched_tokens, len(target_token_ids), len(snapshot_token_ids))):
+        if target_token_ids[idx] != snapshot_token_ids[idx]:
             break
         common_tokens += 1
         if common_tokens >= matched_tokens:

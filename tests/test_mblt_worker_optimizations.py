@@ -414,6 +414,171 @@ class TestMbltWorkerOptimizations:
         assert load_calls == [(["runtime-cache"], None)]
         assert worker.runtime_cache.loaded_req_id == "request"
 
+    def test_explicit_prompt_embeds_with_same_tokens_but_different_content_do_not_load(self) -> None:
+        worker = self._make_worker()
+        old_embeds = np.zeros((128, 4), dtype=np.float32)
+        new_embeds = old_embeds.copy()
+        new_embeds[17, 2] = 1.0
+        old_req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
+        old_req_state.prompt_embeds = old_embeds
+        old_req_state.prompt_len = 128
+        old_req_state.explicit_prompt_embeds = True
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=128,
+            cache_token_ids=tuple(range(128)),
+            prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
+        req_state.prompt_embeds = new_embeds
+        req_state.prompt_len = 128
+        req_state.explicit_prompt_embeds = True
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 128
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.loaded_req_id is None
+
+    def test_explicit_prompt_embeds_with_identical_content_load(self) -> None:
+        worker = self._make_worker()
+        prompt_embeds = np.arange(128 * 4, dtype=np.float32).reshape(128, 4)
+        old_req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
+        old_req_state.prompt_embeds = prompt_embeds
+        old_req_state.prompt_len = 128
+        old_req_state.explicit_prompt_embeds = True
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=128,
+            cache_token_ids=tuple(range(128)),
+            prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
+        req_state.prompt_embeds = prompt_embeds.copy()
+        req_state.prompt_len = 128
+        req_state.explicit_prompt_embeds = True
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 128
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 128
+        assert load_calls == [(["runtime-cache"], None)]
+
+    def test_short_explicit_prompt_embed_hit_skips_fingerprint_when_cost_policy_skips(
+        self,
+        monkeypatch,
+    ) -> None:
+        worker = self._make_worker()
+        calls = []
+
+        def fingerprint(prompt_embeds, num_tokens):
+            calls.append((prompt_embeds.shape, int(num_tokens)))
+            return ("unexpected",)
+
+        monkeypatch.setattr(worker, "_fingerprint_prompt_embed_prefix", fingerprint)
+        old_req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
+        old_req_state.prompt_embeds = np.zeros((16, 4), dtype=np.float32)
+        old_req_state.prompt_len = 16
+        old_req_state.explicit_prompt_embeds = True
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10],),
+            first_seq_blocks=(10,),
+            first_seq_block_hashes=("shared-block",),
+            num_tokens=16,
+            cache_token_ids=tuple(range(16)),
+            prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
+        worker.prefix_cache_cost_model.observe_load(None, 5.0)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
+        req_state.prompt_embeds = np.zeros((16, 4), dtype=np.float32)
+        req_state.prompt_len = 16
+        req_state.explicit_prompt_embeds = True
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.first_seq_block_hashes = ("shared-block",)
+        req_state.num_computed_tokens = 16
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert calls == []
+
+    def test_explicit_prompt_embed_generated_suffix_reuses_after_prompt_boundary(self) -> None:
+        worker = self._make_worker()
+        prompt_embeds = np.arange(4 * 4, dtype=np.float32).reshape(4, 4)
+        old_req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            [101, 102, 103, 104],
+            output_token_ids=[201, 202],
+        )
+        old_req_state.prompt_embeds = prompt_embeds
+        old_req_state.prompt_len = 4
+        old_req_state.explicit_prompt_embeds = True
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=["runtime-cache"],
+            block_ids=([10, 11],),
+            first_seq_blocks=(10, 11),
+            first_seq_block_hashes=("shared-a", "shared-b"),
+            num_tokens=6,
+            cache_token_ids=worker._cache_token_ids(old_req_state, 6),
+            prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
+        )
+        load_calls = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(
+            block_size=128,
+            auto_threshold_enabled=False,
+        )
+        req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            [301, 302, 303, 304],
+            output_token_ids=[201, 202],
+        )
+        req_state.prompt_embeds = prompt_embeds.copy()
+        req_state.prompt_len = 4
+        req_state.explicit_prompt_embeds = True
+        req_state.block_ids = ([10, 11],)
+        req_state.first_seq_blocks = (10, 11)
+        req_state.first_seq_block_hashes = ("shared-a", "shared-b")
+        req_state.num_computed_tokens = 6
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 6
+        assert load_calls == [(["runtime-cache"], None)]
+
     def test_batch_prefix_cache_threshold_applies_per_cache_id(self) -> None:
         worker = self._make_worker()
         worker.max_batch_size = 2
