@@ -2221,6 +2221,19 @@ class TestMbltWorkerOptimizations:
             data={"pixel_values": torch.zeros(1, 3), "image_grid_thw": torch.tensor([1, 1, 1])},
             mm_position=SimpleNamespace(offset=4, length=2, is_embed=None),
         )
+        image_embeds = torch.full((2, 4), 9.0)
+        cached_prompt_embeds = base_prompt_embeds.clone()
+        cached_prompt_embeds[4:6] = image_embeds
+        cached_req_state = self._make_request_state(
+            worker,
+            SamplingParams.from_optional(),
+            list(range(130)),
+        )
+        cached_req_state.prompt_embeds = cached_prompt_embeds.numpy()
+        cached_req_state.prompt_len = 130
+        cached_req_state.explicit_prompt_embeds = True
+        cached_prompt_embed_identity = worker._make_prompt_embed_cache_identity(cached_req_state)
+        assert cached_prompt_embed_identity is not None
         worker.runtime_cache.store_snapshot(
             req_id="shared-text-prefix",
             blobs=["lm-kv-prefix"],
@@ -2232,10 +2245,10 @@ class TestMbltWorkerOptimizations:
                 "vlm-session",
                 [feature],
             ),
+            prompt_embed_cache_identity=cached_prompt_embed_identity,
         )
 
         image_feature_calls: list[dict[str, torch.Tensor]] = []
-        image_embeds = torch.full((2, 4), 9.0)
 
         def get_image_features(**kwargs):
             image_feature_calls.append(kwargs)
@@ -2277,6 +2290,12 @@ class TestMbltWorkerOptimizations:
         assert image_feature_calls and tuple(image_feature_calls[0]["image_grid_thw"].shape) == (1, 3)
         assert [(sequence_length, cache_size) for sequence_length, cache_size, _inputs in infer_calls] == [(2, 128)]
         np.testing.assert_array_equal(infer_calls[0][2][0], base_prompt_embeds[128:130].numpy())
+        snapshot = worker.runtime_cache.get_snapshot("shared-text-prefix")
+        assert snapshot is not None
+        request_prompt_embed_identity = worker._make_prompt_embed_cache_identity(worker.req_states["vlm-hit"])
+        assert request_prompt_embed_identity is not None
+        assert snapshot.prompt_embed_cache_identity is not None
+        assert request_prompt_embed_identity.fingerprint(128) == snapshot.prompt_embed_cache_identity.fingerprint(128)
         assert worker.req_states["vlm-hit"].num_computed_tokens == 130
         assert worker.runtime_cache.loaded_req_id == "vlm-hit"
 
