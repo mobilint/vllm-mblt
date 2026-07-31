@@ -3133,6 +3133,8 @@ class MbltWorker(WorkerBase):
             batched_logits: list[Optional[InferenceLogits]] = [None for _ in req_ids]
 
             if normal_indices:
+                # Batch-compiled MXQs require BatchParam even when only one request
+                # is currently active; keep active batch size 1 on the batch helper.
                 normal_logits = self._infer_normal_logits_batch_chunked(
                     output_indices=normal_indices,
                     input_embeds_batch=[input_embeds_batch[i] for i in normal_indices],

@@ -2558,6 +2558,104 @@ class TestMbltWorkerOptimizations:
             for param in captured["params"]
         ] == [(2, 5, 1), (1, 7, 2)]
 
+    def test_batch_compiled_single_qwen3_vl_execute_uses_batch_params_and_deepstack(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 16
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=16, block_size=128)
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.req_states = {}
+        worker._infer_output_buffers = None
+
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(temperature=0.0), list(range(82)))
+        req_state.prompt_len = 82
+        req_state.prompt_embeds = np.ones((82, 4), dtype=np.float32)
+        req_state.prompt_deepstack_embeds = np.full((2, 82, 4), 3.0, dtype=np.float32)
+        req_state.is_multimodal = True
+        worker.req_states = {"vlm": req_state}
+
+        captured = {}
+
+        def infer(inputs, **kwargs):
+            captured["inputs"] = inputs
+            captured["kwargs"] = kwargs
+            return [np.zeros((1, 82, 8), dtype=np.float32)]
+
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(1, -1, 8)],
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(
+                get_model_input_shape=lambda: [(1, -1, 4), (2, -1, 4)]
+            ),
+        )
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+        worker._infer_logits_with_sequence = lambda *_args, **_kwargs: pytest.fail(
+            "batch-compiled single request used cache_size-only infer"
+        )
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        output = worker.execute_model(self._make_scheduler_output({"vlm": 82}))
+
+        assert output is not None
+        assert output.sampled_token_ids[output.req_id_to_index["vlm"]].tolist() == [7]
+        assert tuple(captured["inputs"][0].shape) == (1, 82, 4)
+        assert tuple(captured["inputs"][1].shape) == (2, 82, 4)
+        np.testing.assert_array_equal(captured["inputs"][1], req_state.prompt_deepstack_embeds)
+        assert "cache_size" not in captured["kwargs"]
+        assert [
+            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
+            for param in captured["kwargs"]["params"]
+        ] == [(82, 0, 0)]
+
+    def test_batch_compiled_single_text_execute_uses_batch_params(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 16
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=16, block_size=128)
+        worker.req_states = {}
+
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(temperature=0.0), [1, 2, 3, 4, 5])
+        req_state.prompt_len = 5
+        req_state.prompt_embeds = np.ones((5, 4), dtype=np.float32)
+        worker.req_states = {"text": req_state}
+
+        captured = {}
+
+        def infer(inputs, **kwargs):
+            captured["inputs"] = inputs
+            captured["kwargs"] = kwargs
+            return [np.zeros((1, 8), dtype=np.float32)]
+
+        worker.cache_model = SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(16, 8)],
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(get_model_input_shape=lambda: [(1, 1, -1, 4)]),
+        )
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+        worker._infer_logits_with_sequence = lambda *_args, **_kwargs: pytest.fail(
+            "batch-compiled single request used cache_size-only infer"
+        )
+        worker._make_sampling_metadata = lambda _states: None
+        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
+            sampled_token_ids=torch.tensor([[9]], dtype=torch.int64),
+            logprobs_tensors=None,
+        )
+
+        output = worker.execute_model(self._make_scheduler_output({"text": 5}))
+
+        assert output is not None
+        assert output.sampled_token_ids[output.req_id_to_index["text"]].tolist() == [9]
+        assert tuple(captured["inputs"][0].shape) == (1, 1, 5, 4)
+        assert "cache_size" not in captured["kwargs"]
+        assert [
+            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
+            for param in captured["kwargs"]["params"]
+        ] == [(5, 0, 0)]
+
     def test_text_only_batch_input_shape_remains_rank4(self) -> None:
         worker = self._make_worker()
         captured = {}
