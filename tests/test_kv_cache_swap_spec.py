@@ -69,6 +69,8 @@ def _make_request_state(
         num_output_tokens=0,
         prompt_embeds=np.zeros((prompt_len, 2), dtype=np.float32),
         prompt_deepstack_embeds=None,
+        prompt_rope_embeds=None,
+        mrope_position_delta=0,
         is_multimodal=False,
         prompt_len=prompt_len,
         prompt_token_ids=prompt_token_ids,
