@@ -290,14 +290,19 @@ variables or equivalent model loader extra config keys:
 - `VLLM_MBLT_PREFIX_CACHE_CALIBRATE` defaults to enabled. Set `0` to skip
   startup prefill calibration.
 
-VLM prefix caching currently covers the language-model KV cache only. For
-single-request VLM execution (`max_batch_size=1`), the worker may load a
-compatible LM KV prefix snapshot and run only the uncached text/embedding
-suffix. Image/video feature extraction is not cached by this layer: image
-requests still rebuild vision features through the model's multimodal feature
-hooks before the LM prefill/decode step. Batch-compiled VLM execution is not
-supported yet; use VLM models with `max_batch_size=1` until Mobilint batch VLM
-artifacts and worker support are added.
+VLM prefix caching currently covers the language-model KV cache only. The
+worker may load a compatible LM KV prefix snapshot and run only the uncached
+text/embedding suffix. Image/video feature extraction is not cached by this
+layer: image requests still rebuild vision features through the model's
+multimodal feature hooks before the LM prefill/decode step.
+
+Batch-compiled VLM text backends (`max_batch_size > 1`) are supported for
+Mobilint Qwen2-VL and Qwen3-VL model types. With `mblt-model-zoo>=2.3.0`,
+Qwen3-VL dynamic-vision Batch16 artifacts such as
+`mobilint/Qwen3-VL-8B-Instruct-Batch16` forward packed text embeddings plus
+the matching packed RoPE and deepstack tensors to the 3-input text MXQ.
+Unsupported multimodal model types fail before runtime inference with a clear
+error.
 
 Implementation file: [`vllm_mblt/mblt_worker.py`](vllm_mblt/mblt_worker.py)
 

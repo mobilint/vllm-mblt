@@ -24,7 +24,7 @@ keywords = [
 ]
 dependencies = [
     "vllm>=0.11.2,<=0.11.2",
-    "mblt-model-zoo[transformers]>=2.1.0",
+    "mblt-model-zoo[transformers]>=2.3.0",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
