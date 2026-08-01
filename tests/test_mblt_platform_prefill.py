@@ -159,6 +159,19 @@ class TestMbltPlatformPrefill:
 
         assert resolve_npu_prefill_chunk_size(config) == 32
 
+    def test_resolves_vlm_text_config_core_mode_for_prefill_chunk_size_mapping(self) -> None:
+        config = _make_vllm_config(
+            None,
+            loader_extra_config={},
+            hf_model_type="mobilint-qwen3_vl",
+            text_config=SimpleNamespace(
+                core_mode="single",
+                npu_prefill_chunk_size={"single": 32},
+            ),
+        )
+
+        assert resolve_npu_prefill_chunk_size(config) == 32
+
     def test_platform_uses_vlm_text_config_prefill_chunk_size_for_scheduler_limit(self) -> None:
         config = _make_vllm_config(
             None,
@@ -182,6 +195,21 @@ class TestMbltPlatformPrefill:
             hf_config={
                 "model_type": "mobilint-qwen3_vl",
                 "text_config": {"npu_prefill_chunk_size": 32},
+            },
+        )
+
+        assert resolve_npu_prefill_chunk_size(config) == 32
+
+    def test_resolves_vlm_dict_text_config_core_mode_for_prefill_chunk_size_mapping(self) -> None:
+        config = _make_vllm_config(
+            None,
+            loader_extra_config={},
+            hf_config={
+                "model_type": "mobilint-qwen3_vl",
+                "text_config": {
+                    "core_mode": "single",
+                    "npu_prefill_chunk_size": {"single": 32},
+                },
             },
         )
 

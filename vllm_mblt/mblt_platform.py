@@ -110,6 +110,15 @@ def _resolve_core_mode(vllm_config: "VllmConfig", *, prefer_text_core_mode: bool
         if isinstance(configured_core_mode, str) and configured_core_mode:
             return configured_core_mode
 
+    if prefer_text_core_mode:
+        configured_text_core_mode = _get_text_model_config_value(
+            vllm_config,
+            "core_mode",
+            "text_core_mode",
+        )
+        if isinstance(configured_text_core_mode, str) and configured_text_core_mode:
+            return configured_text_core_mode
+
     hf_config = _get_hf_config(vllm_config)
     configured_core_mode = getattr(hf_config, "core_mode", None)
     if isinstance(configured_core_mode, str) and configured_core_mode:
