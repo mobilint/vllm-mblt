@@ -2259,6 +2259,30 @@ class TestMbltWorkerOptimizations:
         assert tuple(captured["rope_kwargs"]["image_grid_thw"].shape) == (1, 3)
         assert captured["rope_kwargs"]["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
 
+    def test_build_rope_embeddings_passes_context_tensor_to_rotary_embedding(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        captured = {}
+
+        def rotary_emb(x, position_ids):
+            captured["device"] = x.device
+            captured["dtype"] = x.dtype
+            return position_ids[0].to(dtype=x.dtype, device=x.device).unsqueeze(-1).repeat(1, 1, 2)
+
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl"),
+            get_language_model=lambda: SimpleNamespace(rotary_emb=rotary_emb),
+        )
+        position_ids = torch.arange(3, dtype=torch.long).view(1, 1, -1).expand(3, 1, -1)
+
+        rope = worker._build_rope_embeddings_from_position_ids(position_ids)
+
+        assert captured == {"device": torch.device("cpu"), "dtype": torch.float32}
+        np.testing.assert_array_equal(
+            rope,
+            np.asarray([[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]], dtype=np.float32),
+        )
+
     def test_build_rope_input_embeds_uses_prompt_rows_and_mrope_delta_for_decode(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")

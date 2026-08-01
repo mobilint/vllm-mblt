@@ -1156,7 +1156,8 @@ class MbltWorker(WorkerBase):
                 "Qwen3-VL 3-input text MXQ requires a callable language_model.rotary_emb "
                 "to build RoPE input tensors."
             )
-        return np.asarray(rotary_emb(None, position_ids), dtype=np.float32)
+        rotary_context = torch.empty((), device=position_ids.device, dtype=torch.float32)
+        return np.asarray(rotary_emb(rotary_context, position_ids), dtype=np.float32)
 
     def _build_prompt_rope_embeds(
         self,
