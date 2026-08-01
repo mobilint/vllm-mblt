@@ -181,12 +181,27 @@ def _resolve_model_config_positive_int(
 
 
 def resolve_npu_prefill_chunk_size(vllm_config: "VllmConfig") -> int | None:
+    prefer_text_runtime = _prefer_text_runtime(vllm_config)
+    if prefer_text_runtime:
+        raw_text_chunk_size = _get_text_model_config_value(
+            vllm_config,
+            "npu_prefill_chunk_size",
+        )
+        resolved_text_chunk_size = _resolve_model_config_positive_int(
+            vllm_config,
+            raw_text_chunk_size,
+            field_name="text_config.npu_prefill_chunk_size",
+            prefer_text_core_mode=True,
+        )
+        if resolved_text_chunk_size is not None:
+            return resolved_text_chunk_size
+
     raw_chunk_size = _get_model_config_value(vllm_config, "npu_prefill_chunk_size")
     return _resolve_model_config_positive_int(
         vllm_config,
         raw_chunk_size,
         field_name="npu_prefill_chunk_size",
-        prefer_text_core_mode=_prefer_text_runtime(vllm_config),
+        prefer_text_core_mode=prefer_text_runtime,
     )
 
 

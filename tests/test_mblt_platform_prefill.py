@@ -149,6 +149,44 @@ class TestMbltPlatformPrefill:
 
         assert config.scheduler_config.max_num_seqs == 16
 
+    def test_resolves_vlm_text_config_prefill_chunk_size_without_top_level_value(self) -> None:
+        config = _make_vllm_config(
+            None,
+            loader_extra_config={},
+            hf_model_type="mobilint-qwen3_vl",
+            text_config=SimpleNamespace(npu_prefill_chunk_size=32),
+        )
+
+        assert resolve_npu_prefill_chunk_size(config) == 32
+
+    def test_platform_uses_vlm_text_config_prefill_chunk_size_for_scheduler_limit(self) -> None:
+        config = _make_vllm_config(
+            None,
+            loader_extra_config={},
+            hf_model_type="mobilint-qwen3_vl",
+            text_config=SimpleNamespace(
+                max_batch_size=16,
+                npu_prefill_chunk_size=32,
+            ),
+        )
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.scheduler_config.max_num_batched_tokens == 32 * 16
+        assert config.scheduler_config.long_prefill_token_threshold == 32
+
+    def test_resolves_vlm_dict_text_config_prefill_chunk_size_without_top_level_value(self) -> None:
+        config = _make_vllm_config(
+            None,
+            loader_extra_config={},
+            hf_config={
+                "model_type": "mobilint-qwen3_vl",
+                "text_config": {"npu_prefill_chunk_size": 32},
+            },
+        )
+
+        assert resolve_npu_prefill_chunk_size(config) == 32
+
     def test_resolves_vlm_dict_text_config_max_batch_size_without_top_level_value(self) -> None:
         config = _make_vllm_config(
             {"global4": 256},
