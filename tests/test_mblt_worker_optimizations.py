@@ -2517,8 +2517,30 @@ class TestMbltWorkerOptimizations:
         assert tuple(infer_inputs[1].shape) == (3, 5, 4)
         np.testing.assert_array_equal(infer_inputs[1], np.zeros((3, 5, 4), dtype=np.float32))
 
-    def test_build_infer_inputs_passes_rope_then_deepstack_for_qwen3_vl_three_input_model(self) -> None:
+    def test_build_infer_inputs_passes_deepstack_then_rope_for_nonbatch_qwen3_vl_three_input_model(self) -> None:
         worker = self._make_worker()
+        worker.max_batch_size = 1
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.cache_model = SimpleNamespace(
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(
+                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 4), (1, -1, 6)]
+            ),
+        )
+        input_embeds = np.ones((5, 4), dtype=np.float32)
+        rope_embeds = np.full((1, 5, 6), 2.0, dtype=np.float32)
+        deepstack_embeds = np.full((3, 5, 4), 3.0, dtype=np.float32)
+
+        infer_inputs = worker._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
+
+        assert isinstance(infer_inputs, list)
+        assert [tuple(item.shape) for item in infer_inputs] == [(1, 5, 4), (3, 5, 4), (1, 5, 6)]
+        np.testing.assert_array_equal(infer_inputs[1], deepstack_embeds)
+        np.testing.assert_array_equal(infer_inputs[2], rope_embeds)
+
+    def test_build_infer_inputs_passes_rope_then_deepstack_for_batch_qwen3_vl_three_input_model(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 16
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
         worker.cache_model = SimpleNamespace(
             get_num_model_variants=lambda: 1,
@@ -2543,7 +2565,7 @@ class TestMbltWorkerOptimizations:
         worker.cache_model = SimpleNamespace(
             get_num_model_variants=lambda: 1,
             get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 6), (3, -1, 4)]
+                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 4), (1, -1, 6)]
             ),
         )
 
@@ -3086,3 +3108,39 @@ class TestMbltWorkerOptimizations:
                 },
             )
         ]
+
+    def test_load_model_reconciles_qwen3_vl_dynamic_vision_when_available(self, monkeypatch) -> None:
+        worker = MbltWorker.__new__(MbltWorker)
+        worker.rank = 0
+        worker.local_rank = 0
+        worker.model = None
+        worker.cache_model = None
+        worker._infer_output_buffers = None
+        worker.max_batch_size = 1
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
+        worker.load_config = SimpleNamespace(model_loader_extra_config={})
+        worker.model_config = SimpleNamespace(
+            model="mobilint/Qwen3-VL-8B-Instruct-Batch16",
+            hf_config=SimpleNamespace(model_type="mobilint-qwen3_vl", text_config=SimpleNamespace(max_batch_size=16)),
+            model_kwargs={},
+            hf_overrides={},
+        )
+        worker.vllm_config = SimpleNamespace(
+            load_config=SimpleNamespace(model_loader_extra_config={}), model_config=worker.model_config
+        )
+        calls = []
+        fake_model = SimpleNamespace(
+            eval=lambda: None,
+            get_input_embeddings=lambda: SimpleNamespace(),
+            get_cache_mxq_model=lambda: SimpleNamespace(),
+            sync_dynamic_vision_from_model=lambda: calls.append("sync"),
+        )
+
+        monkeypatch.setattr(
+            "vllm_mblt.mblt_worker.AutoModelForImageTextToText.from_pretrained",
+            lambda *_args, **_kwargs: fake_model,
+        )
+
+        worker.load_model()
+
+        assert calls == ["sync"]

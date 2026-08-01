@@ -297,10 +297,12 @@ layer: image requests still rebuild vision features through the model's
 multimodal feature hooks before the LM prefill/decode step.
 
 Batch-compiled VLM text backends (`max_batch_size > 1`) are supported for
-Mobilint Qwen2-VL and Qwen3-VL model types. Qwen3-VL batch execution forwards
-the packed text embeddings and the matching packed deepstack embeddings to the
-dual-input text MXQ. Unsupported multimodal model types fail before runtime
-inference with a clear error.
+Mobilint Qwen2-VL and Qwen3-VL model types. With `mblt-model-zoo>=2.3.0`,
+Qwen3-VL dynamic-vision Batch16 artifacts such as
+`mobilint/Qwen3-VL-8B-Instruct-Batch16` forward packed text embeddings plus
+the matching packed RoPE and deepstack tensors to the 3-input text MXQ.
+Unsupported multimodal model types fail before runtime inference with a clear
+error.
 
 Implementation file: [`vllm_mblt/mblt_worker.py`](vllm_mblt/mblt_worker.py)
 

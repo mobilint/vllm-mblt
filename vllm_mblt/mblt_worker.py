@@ -1273,6 +1273,18 @@ class MbltWorker(WorkerBase):
             return False
         return len(self._cache_model_input_shapes(self._get_cache_model())) >= 3
 
+    def _qwen3_vl_text_extra_input_order(self) -> tuple[str, str]:
+        """Return the Qwen3-VL 3-input text MXQ extra-input order.
+
+        mblt-model-zoo 2.3.0 ships different 3-input signatures for dynamic
+        Qwen3-VL text artifacts: non-batch uses [inputs, deepstack, rope],
+        while Batch16 uses [inputs, rope, deepstack].
+        """
+
+        if self._is_batch_model():
+            return ("rope", "deepstack")
+        return ("deepstack", "rope")
+
     def _build_infer_inputs(
         self,
         input_embeds: np.ndarray,
@@ -1290,8 +1302,14 @@ class MbltWorker(WorkerBase):
             return batched_input
 
         uses_rope_input = len(input_shapes) >= 3
-        rope_shape = input_shapes[1] if uses_rope_input else None
-        deepstack_shape = input_shapes[2] if uses_rope_input else input_shapes[1]
+        if uses_rope_input:
+            first_extra, second_extra = self._qwen3_vl_text_extra_input_order()
+            extra_shapes = {first_extra: input_shapes[1], second_extra: input_shapes[2]}
+            rope_shape = extra_shapes["rope"]
+            deepstack_shape = extra_shapes["deepstack"]
+        else:
+            rope_shape = None
+            deepstack_shape = input_shapes[1]
         if uses_rope_input:
             if rope_embeds is None:
                 raise RuntimeError("Qwen3-VL 3-input text MXQ requires RoPE embeddings.")
@@ -1360,11 +1378,11 @@ class MbltWorker(WorkerBase):
                     f"expected={expected_shape}, got={tuple(deepstack_embeds.shape)}."
                 )
         if uses_rope_input:
-            return [
-                batched_input,
-                rope_embeds.astype(np.float32, copy=False),
-                deepstack_embeds.astype(np.float32, copy=False),
-            ]
+            extras = {
+                "rope": rope_embeds.astype(np.float32, copy=False),
+                "deepstack": deepstack_embeds.astype(np.float32, copy=False),
+            }
+            return [batched_input, *(extras[name] for name in self._qwen3_vl_text_extra_input_order())]
         return [batched_input, deepstack_embeds.astype(np.float32, copy=False)]
 
     def _build_batch_infer_inputs(
@@ -3011,6 +3029,9 @@ class MbltWorker(WorkerBase):
             trust_remote_code=True,
             **model_kwargs,
         )
+        sync_dynamic_vision_from_model = getattr(self.model, "sync_dynamic_vision_from_model", None)
+        if callable(sync_dynamic_vision_from_model):
+            sync_dynamic_vision_from_model()
         self._log_init_stage(
             "load_model:after_from_pretrained",
             start,
