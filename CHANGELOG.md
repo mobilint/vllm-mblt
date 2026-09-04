@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- `MbltPlatform` now reports `is_pin_memory_available() == False`. The base
+  vLLM `Platform` answers `True` on any non-WSL host, so an MBLT server on
+  plain Linux without an NVIDIA driver made vLLM allocate pinned tensors and
+  `Tensor.pin_memory()` raised `Found no NVIDIA driver on your system`. The
+  sampling-penalty path hit this first (`apply_all_penalties` ->
+  `make_tensor_with_pad`). MBLT runs on the NPU with CPU-side host tensors, so
+  there is nothing to pin, and `CpuPlatform` answers `False` for the same
+  reason.
 - Sampling penalties (`frequency_penalty`, `presence_penalty`,
   `repetition_penalty`) are now applied by default instead of only when CUDA is
   available. vLLM applies them through a pure-torch fallback when the fused

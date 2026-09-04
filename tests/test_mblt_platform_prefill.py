@@ -457,3 +457,28 @@ class TestMbltPlatformPrefill:
 
         assert resolve_npu_prefill_chunk_size(config) == 512
         assert resolve_effective_npu_prefill_chunk_size(config) == 128
+
+    def test_platform_reports_pin_memory_unavailable(self, monkeypatch) -> None:
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        # The base Platform answers False under WSL for unrelated reasons, so
+        # force the non-WSL branch: that is the plain-Linux NPU server, where
+        # the base implementation used to answer True and vLLM then built
+        # pinned tensors on a host with no NVIDIA driver.
+        monkeypatch.setattr("vllm.platforms.interface.in_wsl", lambda: False)
+        # is_pin_memory_available() is @cache'd; drop the memoized WSL answer.
+        is_pin_memory_available.cache_clear()
+        monkeypatch.setattr(
+            is_pin_memory_available,
+            "cache_clear",
+            is_pin_memory_available.cache_clear,
+            raising=False,
+        )
+
+        try:
+            assert MbltPlatform.is_pin_memory_available() is False
+            # Also assert through the helper vLLM actually calls, so the
+            # override is proven to be wired into current_platform.
+            assert is_pin_memory_available() is False
+        finally:
+            is_pin_memory_available.cache_clear()
