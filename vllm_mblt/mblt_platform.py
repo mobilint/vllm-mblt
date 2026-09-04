@@ -317,6 +317,21 @@ class MbltPlatform(Platform):
     device_name = "cpu"
 
     @classmethod
+    def is_pin_memory_available(cls) -> bool:
+        """Pinned host memory is a CUDA facility and is never available here.
+
+        The base `Platform` implementation returns True on any non-WSL host, so
+        an MBLT server on plain Linux without an NVIDIA driver used to answer
+        True. vLLM then builds tensors with `pin_memory=True` and
+        `Tensor.pin_memory()` raises `Found no NVIDIA driver on your system` —
+        for example in the sampling-penalty path
+        (`apply_all_penalties` -> `make_tensor_with_pad`). MBLT executes on the
+        NPU with CPU-side host tensors, so there is nothing to pin, and
+        `CpuPlatform` answers False for the same reason.
+        """
+        return False
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config: ParallelConfig = vllm_config.parallel_config  # type: ignore
         parallel_config.worker_cls = "vllm_mblt.mblt_worker.MbltWorker"

@@ -6,6 +6,7 @@ import torch
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.logprobs import Logprob
 from vllm.sampling_params import SamplingParams
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.engine.logprobs import LogprobsProcessor, create_prompt_logprobs
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -3415,3 +3416,31 @@ class TestMbltWorkerOptimizations:
         # Without the clamp the snapshot would claim 256 tokens and decoding
         # would resume at 256 over 128 tokens of real KV.
         assert cache_size == 128
+
+    def test_sampling_penalties_do_not_require_pinned_memory(self, monkeypatch, request) -> None:
+        # Reproduces the CPU-runner failure: vLLM's penalty path builds its
+        # output-token tensor through make_tensor_with_pad(), which calls
+        # Tensor.pin_memory() whenever the platform claims pinned memory is
+        # available. On a host without an NVIDIA driver that raises
+        # "Found no NVIDIA driver on your system".
+        def _explode(self, *args, **kwargs):
+            raise RuntimeError("Found no NVIDIA driver on your system.")
+
+        monkeypatch.setattr(torch.Tensor, "pin_memory", _explode, raising=True)
+        # Force the plain-Linux branch of Platform.is_pin_memory_available, and
+        # drop the @cache'd answer computed earlier in the process, so this
+        # test fails without the MbltPlatform override even on a WSL host.
+        monkeypatch.setattr("vllm.platforms.interface.in_wsl", lambda: False)
+        is_pin_memory_available.cache_clear()
+        request.addfinalizer(is_pin_memory_available.cache_clear)
+
+        worker = self._make_worker()
+        worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=4))
+        sampling_params = SamplingParams.from_optional(temperature=0.0, repetition_penalty=2.0)
+        req_state = self._make_request_state(worker, sampling_params, [0], output_token_ids=[1])
+        sampling_metadata = worker._make_sampling_metadata([req_state])
+        logits = torch.tensor([[1.0, 4.0, 3.0, 0.5]], dtype=torch.float32)
+
+        sampler_output = worker._sample_next_token(logits=logits, sampling_metadata=sampling_metadata)
+
+        assert int(sampler_output.sampled_token_ids[0, 0].item()) == 2
