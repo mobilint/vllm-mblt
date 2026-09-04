@@ -420,3 +420,40 @@ class TestMbltPlatformPrefill:
 
         assert config.scheduler_config.max_num_seqs == 32
         assert "Clamping scheduler max_num_seqs" not in caplog.text
+
+    def test_auto_core_mode_resolves_the_only_compiled_chunk_size_entry(self) -> None:
+        # A batch LLM compiled at a global scheme advertises core_mode "auto"
+        # and ships one core-mode entry: the mode it was actually compiled for.
+        config = _make_vllm_config({"global8": 512}, hf_core_mode="auto")
+
+        assert resolve_npu_prefill_chunk_size(config) == 512
+
+    def test_auto_core_mode_from_loader_extra_config_resolves_single_entry(self) -> None:
+        config = _make_vllm_config({"global8": 512}, loader_core_mode="auto")
+
+        assert resolve_npu_prefill_chunk_size(config) == 512
+
+    def test_auto_core_mode_prefers_an_explicit_default_entry(self) -> None:
+        config = _make_vllm_config({"global8": 512, "default": 256}, hf_core_mode="auto")
+
+        assert resolve_npu_prefill_chunk_size(config) == 256
+
+    def test_auto_core_mode_does_not_guess_between_multiple_entries(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger="vllm_mblt.mblt_platform")
+        config = _make_vllm_config({"global8": 512, "single": 128}, hf_core_mode="auto")
+
+        assert resolve_npu_prefill_chunk_size(config) is None
+        assert "Could not resolve npu_prefill_chunk_size" in caplog.text
+
+    def test_explicit_core_mode_does_not_borrow_another_modes_chunk_size(self, caplog) -> None:
+        caplog.set_level(logging.WARNING, logger="vllm_mblt.mblt_platform")
+        config = _make_vllm_config({"global8": 512}, hf_core_mode="global4")
+
+        assert resolve_npu_prefill_chunk_size(config) is None
+        assert "Could not resolve npu_prefill_chunk_size" in caplog.text
+
+    def test_auto_core_mode_batch_model_clamps_effective_chunk_size(self) -> None:
+        config = _make_vllm_config({"global8": 512}, hf_core_mode="auto", max_batch_size=16)
+
+        assert resolve_npu_prefill_chunk_size(config) == 512
+        assert resolve_effective_npu_prefill_chunk_size(config) == 128

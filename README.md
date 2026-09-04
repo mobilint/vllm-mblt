@@ -150,6 +150,10 @@ If a model config includes `npu_prefill_chunk_size`, `vllm-mblt` uses it to tune
 - Dict values are selected by `core_mode`.
 - `core_mode` is resolved from `--model-loader-extra-config` first, then from the model config default.
 - The selected value is applied to vLLM's `max_num_batched_tokens` for chunked prefill.
+- A `default` (or `DEFAULT`) key is used when the resolved `core_mode` has no entry.
+- `core_mode: "auto"` is never a dict key. When the resolved `core_mode` is `"auto"` (or is absent) and the
+  dict holds exactly one usable entry, that entry is used — a global-scheme batch mxq ships only the mode it
+  was compiled for. Multiple entries under `"auto"` are not guessed.
 - If no matching value is found, `vllm-mblt` falls back to `128`.
 - For batch-compiled models with `max_batch_size > 1`, the effective chunked prefill limit is clamped to `128`
   to match the qbruntime batch execution limit used by the worker.
@@ -289,6 +293,24 @@ variables or equivalent model loader extra config keys:
   to `0.9`.
 - `VLLM_MBLT_PREFIX_CACHE_CALIBRATE` defaults to enabled. Set `0` to skip
   startup prefill calibration.
+
+The worker also tracks how many tokens each live runtime cache (or batch
+`cache_id` slot) actually holds. A request may continue from a live cache
+without reloading only when that count matches the scheduler's
+`num_computed_tokens`. On a mismatch the worker logs a warning naming the
+request and `cache_id`, drops the ownership claim, and rebuilds the prefix
+instead of decoding against another sequence's KV. Seeing
+`MBLT runtime cache token count holds fewer tokens than the scheduler expects` in the log
+means measurements taken from that server should be re-checked.
+
+### Sampling Penalties
+
+`frequency_penalty`, `presence_penalty`, and `repetition_penalty` are applied
+by default on the CPU-hosted MBLT sampler. Set
+`VLLM_MBLT_ENABLE_SAMPLING_PENALTIES=0` to ignore them instead; the worker then
+logs once which penalties it dropped. Released MBLT packages ship
+`repetition_penalty` in `generation_config.json`, so ignoring them makes NPU
+output generated under different sampling than a GPU reference run.
 
 VLM prefix caching currently covers the language-model KV cache only. The
 worker may load a compatible LM KV prefix snapshot and run only the uncached

@@ -18,6 +18,7 @@ from vllm_mblt.mblt_worker import (
     RequestState,
     _is_multimodal_hf_config,
     _is_qwen3_vl_hf_config,
+    _resolve_enable_sampling_penalties,
 )
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest
 
@@ -3168,3 +3169,167 @@ class TestMbltWorkerOptimizations:
         worker.load_model()
 
         assert calls == ["sync"]
+
+    def test_batch_slot_live_cache_is_reused_when_token_count_matches(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        load_calls: list[object] = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        worker.runtime_cache.mark_slot_owner(1, "request", 16)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.num_computed_tokens = 16
+        req_state.cache_slot_id = 1
+
+        cache_size = worker._load_snapshot_if_needed("request", req_state, slot_id=1)
+
+        assert cache_size == 16
+        assert load_calls == []
+
+    def test_batch_slot_live_cache_mismatch_rebuilds_prefix_and_warns(self, caplog) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        load_calls: list[object] = []
+        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        # The slot holds 8 tokens while the scheduler believes 16 are computed.
+        worker.runtime_cache.mark_slot_owner(1, "request", 8)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.num_computed_tokens = 16
+        req_state.cache_slot_id = 1
+
+        with caplog.at_level("WARNING"):
+            cache_size = worker._load_snapshot_if_needed("request", req_state, slot_id=1)
+
+        assert cache_size == 0
+        assert load_calls == []
+        assert worker.runtime_cache.live_slot_tokens(1) == 0
+        assert worker._live_cache_prefix_incomplete_count == 1
+        assert "holds fewer tokens than the scheduler expects" in caplog.text
+
+    def test_single_cache_live_reuse_mismatch_rebuilds_prefix_and_warns(self, caplog) -> None:
+        worker = self._make_worker()
+        worker.runtime_cache.mark_loaded_request("request", 8)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.num_computed_tokens = 16
+
+        with caplog.at_level("WARNING"):
+            cache_size = worker._load_snapshot_if_needed("request", req_state)
+
+        assert cache_size == 0
+        assert worker.runtime_cache.loaded_req_id is None
+        assert worker._live_cache_prefix_incomplete_count == 1
+        assert "holds fewer tokens than the scheduler expects" in caplog.text
+
+    def test_execute_model_records_live_slot_token_count(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        worker.max_seq_len = 256
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(temperature=0.0), [1, 2, 3, 4])
+        req_state.prompt_embeds = np.zeros((4, 8), dtype=np.float32)
+        req_state.prompt_len = 4
+        req_state.cache_slot_id = 0
+        worker.req_states = {"req": req_state}
+        worker.runtime_cache.req_to_slot = {"req": 0}
+        worker.runtime_cache.slot_to_req = {0: "req"}
+        worker.runtime_cache.free_slots = [1]
+        worker._infer_normal_logits_batch_chunked = lambda **kwargs: {
+            index: InferenceLogits(
+                last_token_logits=np.zeros((32000,), dtype=np.float32),
+                full_sequence_logits=None,
+            )
+            for index in kwargs["output_indices"]
+        }
+
+        output = worker.execute_model(self._make_scheduler_output({"req": 4}))
+
+        assert output.req_ids == ["req"]
+        assert req_state.num_computed_tokens == 4
+        assert worker.runtime_cache.live_slot_owner(0) == "req"
+        assert worker.runtime_cache.live_slot_tokens(0) == 4
+
+    def test_finished_batch_request_without_live_slot_is_not_snapshotted(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        dump_calls: list[object] = []
+        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["stale-blob"]
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
+        req_state.num_computed_tokens = 16
+        req_state.cache_slot_id = 0
+        worker.req_states = {"aborted": req_state}
+        worker.runtime_cache.req_to_slot = {"aborted": 0}
+        worker.runtime_cache.slot_to_req = {0: "aborted"}
+        worker.runtime_cache.free_slots = [1]
+        # Slot 0 is still live for a different request, so "aborted" never ran
+        # and its KV is not in the slot.
+        worker.runtime_cache.mark_slot_owner(0, "other", 32)
+
+        worker._finalize_finished_request("aborted")
+
+        assert dump_calls == []
+        assert worker.runtime_cache.get_snapshot("aborted") is None
+        assert worker.runtime_cache.live_slot_owner(0) == "other"
+
+    def test_finished_batch_request_owning_its_slot_is_snapshotted(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        dump_calls: list[object] = []
+        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["blob"]
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
+        req_state.num_computed_tokens = 16
+        req_state.cache_slot_id = 0
+        worker.req_states = {"done": req_state}
+        worker.runtime_cache.req_to_slot = {"done": 0}
+        worker.runtime_cache.slot_to_req = {0: "done"}
+        worker.runtime_cache.free_slots = [1]
+        worker.runtime_cache.mark_slot_owner(0, "done", 16)
+
+        worker._finalize_finished_request("done")
+
+        assert dump_calls == [0]
+        assert worker.runtime_cache.get_snapshot("done") is not None
+        assert worker.runtime_cache.live_slot_owner(0) is None
+
+    def test_sampling_penalties_are_enabled_by_default(self) -> None:
+        assert _resolve_enable_sampling_penalties(None)
+        assert _resolve_enable_sampling_penalties("1")
+        assert _resolve_enable_sampling_penalties("true")
+        assert not _resolve_enable_sampling_penalties("0")
+        assert not _resolve_enable_sampling_penalties("")
+
+    def test_requested_sampling_penalties_reach_the_sampler_by_default(self) -> None:
+        worker = self._make_worker()
+        sampling_params = SamplingParams.from_optional(
+            frequency_penalty=0.5, presence_penalty=0.2, repetition_penalty=1.1
+        )
+        req_state = self._make_request_state(worker, sampling_params, [1, 2, 3])
+
+        metadata = worker._make_sampling_metadata([req_state])
+
+        assert not metadata.no_penalties
+        assert metadata.frequency_penalties.tolist() == [pytest.approx(0.5)]
+        assert metadata.presence_penalties.tolist() == [pytest.approx(0.2)]
+        assert metadata.repetition_penalties.tolist() == [pytest.approx(1.1)]
+        assert metadata.prompt_token_ids is not None
+
+    def test_repetition_penalty_is_applied_to_logits_on_cpu(self) -> None:
+        worker = self._make_worker()
+        worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=4))
+        sampling_params = SamplingParams.from_optional(temperature=0.0, repetition_penalty=2.0)
+        req_state = self._make_request_state(worker, sampling_params, [0], output_token_ids=[1])
+        sampling_metadata = worker._make_sampling_metadata([req_state])
+        logits = torch.tensor([[1.0, 4.0, 3.0, 0.5]], dtype=torch.float32)
+
+        sampler_output = worker._sample_next_token(logits=logits, sampling_metadata=sampling_metadata)
+
+        # Token 0 is in the prompt and token 1 was generated, so both are
+        # penalised; the unpenalised token 2 must win instead of token 1.
+        assert int(sampler_output.sampled_token_ids[0, 0].item()) == 2
