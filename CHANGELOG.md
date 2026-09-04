@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
 ### Fixed
 
@@ -29,6 +29,8 @@
   instead of silently falling back to the `128` default. Note that accepting
   `"auto"` at model load still requires `normalize_core_mode` in
   `mblt_model_zoo.utils.core_mode` to allow it.
+
+## 0.2.0
 
 ### Breaking Changes
 
