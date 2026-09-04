@@ -81,6 +81,8 @@ class RuntimeCacheLoadResult:
     is_own_snapshot: bool = False
     action: str = "cache-miss"
     snapshot_req_id: str | None = None
+    live_prefix_incomplete: bool = False
+    live_cache_tokens: int | None = None
 
 
 class MbltRuntimeCacheManager:
@@ -121,11 +123,15 @@ class MbltRuntimeCacheManager:
 
         # Single-cache runtime owner.
         self.loaded_req_id: str | None = None
+        # Token count the live single runtime cache is believed to hold for
+        # loaded_req_id. None means the count is not tracked.
+        self.loaded_req_tokens: int | None = None
 
         # Batch cache slot assignment and live slot owners.
         self.req_to_slot: dict[str, int] = {}
         self.slot_to_req: dict[int, str] = {}
         self.slot_live_req: dict[int, str] = {}
+        self.slot_live_tokens: dict[int, int] = {}
         self.free_slots: list[int] = []
         self.reset_slots(max_batch_size=self.max_batch_size)
 
@@ -145,6 +151,7 @@ class MbltRuntimeCacheManager:
     @loaded_cache_req_id.setter
     def loaded_cache_req_id(self, req_id: str | None) -> None:
         self.loaded_req_id = req_id
+        self.loaded_req_tokens = None
 
     @property
     def req_to_cache_slot(self) -> dict[str, int]:
@@ -164,6 +171,7 @@ class MbltRuntimeCacheManager:
         self.req_to_slot = {}
         self.slot_to_req = {}
         self.slot_live_req = {}
+        self.slot_live_tokens = {}
         self.free_slots = list(range(self.max_batch_size))
 
     def _request_index_blocks(self, request: RuntimeCacheRequest) -> tuple[Hashable, ...]:
@@ -224,6 +232,7 @@ class MbltRuntimeCacheManager:
             self.slot_to_req.pop(slot_id, None)
         if self.slot_live_req.get(slot_id) == req_id:
             self.slot_live_req.pop(slot_id, None)
+            self.slot_live_tokens.pop(slot_id, None)
         if slot_id not in self.free_slots:
             self.free_slots.append(slot_id)
             self.free_slots.sort()
@@ -231,15 +240,48 @@ class MbltRuntimeCacheManager:
     def live_slot_owner(self, slot_id: int) -> str | None:
         return self.slot_live_req.get(slot_id)
 
-    def mark_slot_owner(self, slot_id: int, req_id: str) -> None:
+    def live_slot_tokens(self, slot_id: int) -> int | None:
+        return self.slot_live_tokens.get(slot_id)
+
+    def mark_slot_owner(self, slot_id: int, req_id: str, num_tokens: int | None = None) -> None:
         self.slot_live_req[slot_id] = req_id
+        if num_tokens is None:
+            self.slot_live_tokens.pop(slot_id, None)
+        else:
+            self.slot_live_tokens[slot_id] = max(0, int(num_tokens))
+
+    def clear_slot_owner(self, slot_id: int) -> None:
+        self.slot_live_req.pop(slot_id, None)
+        self.slot_live_tokens.pop(slot_id, None)
+
+    def live_slot_prefix_incomplete(self, slot_id: int, target_tokens: int) -> bool:
+        """Report a live batch slot that does not hold the whole request prefix.
+
+        Continuing from a live slot at ``cache_size=target_tokens`` is only
+        correct when the accelerator cache really holds those tokens. Holding
+        more is fine: the owner's token sequence is append-only, so the extra
+        tail is simply overwritten (this is the preempt-and-resume case).
+        Holding fewer means positions the request is about to build on were
+        never computed in this slot, and decoding anyway is what produces
+        fluent-but-wrong output. An untracked slot (None) keeps the previous
+        trust-the-owner behaviour.
+        """
+        live_tokens = self.slot_live_tokens.get(slot_id)
+        return live_tokens is not None and live_tokens < max(0, int(target_tokens))
+
+    def live_request_prefix_incomplete(self, target_tokens: int) -> bool:
+        """Single-cache counterpart of live_slot_prefix_incomplete."""
+        live_tokens = self.loaded_req_tokens
+        return live_tokens is not None and live_tokens < max(0, int(target_tokens))
 
     def clear_loaded_request(self, req_id: str | None = None) -> None:
         if req_id is None or self.loaded_req_id == req_id:
             self.loaded_req_id = None
+            self.loaded_req_tokens = None
 
-    def mark_loaded_request(self, req_id: str) -> None:
+    def mark_loaded_request(self, req_id: str, num_tokens: int | None = None) -> None:
         self.loaded_req_id = req_id
+        self.loaded_req_tokens = None if num_tokens is None else max(0, int(num_tokens))
 
     def get_snapshot(self, req_id: str) -> RuntimeCacheSnapshot | None:
         return self.snapshots.get(req_id)
@@ -572,13 +614,39 @@ class MbltRuntimeCacheManager:
             return False
         return self.required_blocks(next_num_tokens) > self.required_blocks(snapshot.num_tokens)
 
+    def owned_live_cache_tokens(self, req_id: str, slot_id: int | None) -> int | None:
+        """Tokens the live cache is tracked to hold *for this request*.
+
+        Returns None when there is nothing to go on — the count is untracked,
+        or the live cache belongs to another request — so callers keep their
+        previous behaviour instead of acting on a number that is not about
+        ``req_id``.
+        """
+        if slot_id is not None:
+            if self.slot_live_req.get(slot_id) != req_id:
+                return None
+            return self.slot_live_tokens.get(slot_id)
+        if self.loaded_req_id != req_id:
+            return None
+        return self.loaded_req_tokens
+
     def dump_snapshot_if_needed(
         self,
         request: RuntimeCacheRequest,
         dump_runtime_cache: DumpRuntimeCache | None = None,
     ) -> bool:
-        if not self.should_dump_snapshot_after_step(request.req_id, request.num_computed_tokens):
+        num_tokens = max(0, int(request.num_computed_tokens))
+        if not self.should_dump_snapshot_after_step(request.req_id, num_tokens):
             return False
+        # Never label a snapshot with more tokens than its blobs hold: a later
+        # load would report the full match and resume past missing KV.
+        live_tokens = self.owned_live_cache_tokens(request.req_id, request.cache_slot_id)
+        if live_tokens is not None and live_tokens < num_tokens:
+            if live_tokens <= 0:
+                return False
+            if not self.should_dump_snapshot_after_step(request.req_id, live_tokens):
+                return False
+            num_tokens = live_tokens
         dump_runtime_cache = dump_runtime_cache or self._dump_runtime_cache_fn
         if dump_runtime_cache is None:
             raise RuntimeError("Runtime cache dump adapter is not configured.")
@@ -591,7 +659,7 @@ class MbltRuntimeCacheManager:
             block_ids=request.block_ids,
             first_seq_blocks=request.first_seq_blocks,
             first_seq_block_hashes=request.first_seq_block_hashes,
-            num_tokens=request.num_computed_tokens,
+            num_tokens=num_tokens,
             cache_token_ids=request.cache_token_ids,
             multimodal_cache_identity=request.multimodal_cache_identity,
             prompt_embed_cache_identity=request.prompt_embed_cache_identity,
@@ -627,25 +695,41 @@ class MbltRuntimeCacheManager:
             first_seq_block_hashes=request.first_seq_block_hashes,
         )
 
+        live_prefix_incomplete = False
+        live_cache_tokens: int | None = None
         if self.loaded_req_id == request.req_id:
-            return RuntimeCacheLoadResult(
-                matched_tokens=target_tokens,
-                reused_live_cache=True,
-                action="reuse-live",
-                snapshot_req_id=request.req_id,
-            )
+            if not self.live_request_prefix_incomplete(target_tokens):
+                return RuntimeCacheLoadResult(
+                    matched_tokens=target_tokens,
+                    reused_live_cache=True,
+                    action="reuse-live",
+                    snapshot_req_id=request.req_id,
+                    live_cache_tokens=self.loaded_req_tokens,
+                )
+            # The live cache no longer holds this request's prefix. Drop the
+            # ownership claim so the prefix is rebuilt instead of decoded
+            # against stale KV.
+            live_prefix_incomplete = True
+            live_cache_tokens = self.loaded_req_tokens
+            self.clear_loaded_request(request.req_id)
 
         match = self.choose_snapshot(request)
         match = self.verify_prompt_embed_match(request, match)
         if match.snapshot is None or match.matched_tokens <= 0:
             self.clear_loaded_request()
-            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+            return RuntimeCacheLoadResult(
+                matched_tokens=0,
+                cache_miss=True,
+                action="live-prefix-incomplete" if live_prefix_incomplete else "cache-miss",
+                live_prefix_incomplete=live_prefix_incomplete,
+                live_cache_tokens=live_cache_tokens,
+            )
 
         load_runtime_cache = load_runtime_cache or self._load_runtime_cache_fn
         if load_runtime_cache is None:
             raise RuntimeError("Runtime cache load adapter is not configured.")
         if load_runtime_cache(match.snapshot.blobs, None):
-            self.mark_loaded_request(request.req_id)
+            self.mark_loaded_request(request.req_id, match.matched_tokens)
             return RuntimeCacheLoadResult(
                 matched_tokens=match.matched_tokens,
                 loaded=True,
@@ -653,10 +737,17 @@ class MbltRuntimeCacheManager:
                 is_own_snapshot=match.is_own_snapshot,
                 action="load-own" if match.is_own_snapshot else "load-shared",
                 snapshot_req_id=match.req_id,
+                live_prefix_incomplete=live_prefix_incomplete,
+                live_cache_tokens=live_cache_tokens,
             )
 
         self.clear_loaded_request()
-        return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+        return RuntimeCacheLoadResult(
+            matched_tokens=0,
+            cache_miss=True,
+            live_prefix_incomplete=live_prefix_incomplete,
+            live_cache_tokens=live_cache_tokens,
+        )
 
     def load_for_request(self, request: RuntimeCacheRequest) -> RuntimeCacheLoadResult:
         return self.load_snapshot_for_request(request)
@@ -680,13 +771,23 @@ class MbltRuntimeCacheManager:
             first_seq_block_hashes=request.first_seq_block_hashes,
         )
 
+        live_prefix_incomplete = False
+        live_cache_tokens: int | None = None
         if self.live_slot_owner(slot_id) == request.req_id:
-            return RuntimeCacheLoadResult(
-                matched_tokens=target_tokens,
-                reused_live_cache=True,
-                action="reuse-live",
-                snapshot_req_id=request.req_id,
-            )
+            if not self.live_slot_prefix_incomplete(slot_id, target_tokens):
+                return RuntimeCacheLoadResult(
+                    matched_tokens=target_tokens,
+                    reused_live_cache=True,
+                    action="reuse-live",
+                    snapshot_req_id=request.req_id,
+                    live_cache_tokens=self.live_slot_tokens(slot_id),
+                )
+            # The slot no longer holds this request's prefix. Drop the
+            # ownership claim so the prefix is rebuilt instead of decoded
+            # against stale KV.
+            live_prefix_incomplete = True
+            live_cache_tokens = self.live_slot_tokens(slot_id)
+            self.clear_slot_owner(slot_id)
 
         match = self.choose_snapshot(request)
         match = self.verify_prompt_embed_match(request, match)
@@ -695,7 +796,7 @@ class MbltRuntimeCacheManager:
             if load_runtime_cache is None:
                 raise RuntimeError("Runtime cache load adapter is not configured.")
             if load_runtime_cache(match.snapshot.blobs, slot_id):
-                self.mark_slot_owner(slot_id, request.req_id)
+                self.mark_slot_owner(slot_id, request.req_id, match.matched_tokens)
                 return RuntimeCacheLoadResult(
                     matched_tokens=match.matched_tokens,
                     loaded=True,
@@ -703,10 +804,18 @@ class MbltRuntimeCacheManager:
                     is_own_snapshot=match.is_own_snapshot,
                     action="load-own" if match.is_own_snapshot else "load-shared",
                     snapshot_req_id=match.req_id,
+                    live_prefix_incomplete=live_prefix_incomplete,
+                    live_cache_tokens=live_cache_tokens,
                 )
 
-        self.mark_slot_owner(slot_id, request.req_id)
-        return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+        self.mark_slot_owner(slot_id, request.req_id, 0)
+        return RuntimeCacheLoadResult(
+            matched_tokens=0,
+            cache_miss=True,
+            action="live-prefix-incomplete" if live_prefix_incomplete else "cache-miss",
+            live_prefix_incomplete=live_prefix_incomplete,
+            live_cache_tokens=live_cache_tokens,
+        )
 
     def load_for_slot(self, request: RuntimeCacheRequest, slot_id: int | None = None) -> RuntimeCacheLoadResult:
         if slot_id is not None and request.cache_slot_id != slot_id:
@@ -750,6 +859,7 @@ class MbltRuntimeCacheManager:
         self.snapshot_index_root = RuntimeCacheSnapshotIndexNode()
         self.physical_block_owner.clear()
         self.loaded_req_id = None
+        self.loaded_req_tokens = None
         self.reset_slots()
 
 

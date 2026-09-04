@@ -18,6 +18,12 @@ _MULTIMODAL_HF_MODEL_TYPES = frozenset(
     }
 )
 _TRUE_ENV_VALUES = {"1", "true", "TRUE", "True"}
+# A batch LLM compiled at a global scheme mixes core modes inside one mxq (the
+# collective segments target the cluster GlobalCore, the iterative ones Core0),
+# so qbruntime only accepts it under CoreMode.Auto. Such a package declares
+# core_mode "auto" and therefore cannot name a key in a core-mode-indexed map
+# like npu_prefill_chunk_size.
+AUTO_CORE_MODE = "auto"
 
 
 def _mblt_debug_enabled() -> bool:
@@ -179,6 +185,29 @@ def _resolve_model_config_positive_int(
         chunk_size = _coerce_positive_int(raw_value.get(fallback_key))
         if chunk_size is not None:
             return chunk_size
+
+    if core_mode is None or core_mode == AUTO_CORE_MODE:
+        # "auto" is a real core mode for global-scheme batch artifacts, but it
+        # is never a key of a core-mode-indexed map. When the map describes a
+        # single compiled mode, that entry is the artifact's own value; falling
+        # through to the generic default would silently shrink the prefill
+        # chunk size instead.
+        usable_entries = {
+            str(key): value
+            for key, value in raw_value.items()
+            if _coerce_positive_int(value) is not None
+        }
+        if len(usable_entries) == 1:
+            only_key, only_value = next(iter(usable_entries.items()))
+            resolved = _coerce_positive_int(only_value)
+            logger.info(
+                "Resolved %s=%s from the only core-mode entry %r for core_mode=%s.",
+                field_name,
+                resolved,
+                only_key,
+                core_mode,
+            )
+            return resolved
 
     logger.warning(
         "Could not resolve %s from model config for core_mode=%s: %r",

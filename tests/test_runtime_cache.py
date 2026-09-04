@@ -921,3 +921,208 @@ class TestMbltRuntimeCacheManagerSlots:
         assert dumped
         assert dump_calls == [slot_id]
         assert manager.get_snapshot("req").blobs == ["slot-blob"]
+
+
+class TestMbltRuntimeCacheLiveTokenTracking:
+    def test_live_slot_reuse_requires_matching_token_count(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req", 8)
+        load_calls: list[object] = []
+
+        result = manager.load_snapshot_for_slot(
+            _request("req", (1, 2), 8, cache_slot_id=slot_id),
+            lambda blobs, load_slot_id: load_calls.append((blobs, load_slot_id)) or True,
+        )
+
+        assert result.reused_live_cache
+        assert result.matched_tokens == 8
+        assert result.live_cache_tokens == 8
+        assert not result.live_prefix_incomplete
+        assert load_calls == []
+
+    def test_live_slot_reuse_refused_when_token_count_diverges(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        # The slot only holds a 4-token replay while the scheduler believes the
+        # request has 8 computed tokens: continuing from it would decode
+        # against KV that does not belong to this prefix.
+        manager.mark_slot_owner(slot_id, "req", 4)
+        load_calls: list[object] = []
+
+        result = manager.load_snapshot_for_slot(
+            _request("req", (1, 2), 8, cache_slot_id=slot_id),
+            lambda blobs, load_slot_id: load_calls.append((blobs, load_slot_id)) or True,
+        )
+
+        assert not result.reused_live_cache
+        assert result.cache_miss
+        assert result.matched_tokens == 0
+        assert result.live_prefix_incomplete
+        assert result.live_cache_tokens == 4
+        assert result.action == "live-prefix-incomplete"
+        assert load_calls == []
+        # The rebuild starts from an empty prefix, so the tracked count must say so.
+        assert manager.live_slot_owner(slot_id) == "req"
+        assert manager.live_slot_tokens(slot_id) == 0
+
+    def test_live_slot_mismatch_can_still_load_a_compatible_snapshot(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req", 4)
+        _store_snapshot(manager, "req", (1, 2), 8)
+        load_calls: list[object] = []
+
+        result = manager.load_snapshot_for_slot(
+            _request("req", (1, 2), 8, cache_slot_id=slot_id),
+            lambda blobs, load_slot_id: load_calls.append((blobs, load_slot_id)) or True,
+        )
+
+        assert result.loaded
+        assert result.matched_tokens == 8
+        assert result.live_prefix_incomplete
+        assert load_calls == [(["blob:req"], slot_id)]
+        assert manager.live_slot_tokens(slot_id) == 8
+
+    def test_live_slot_with_extra_tokens_is_still_reused(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        # After a preemption the scheduler can report fewer computed tokens than
+        # the slot still holds. The owner's token sequence is append-only, so
+        # positions 0..7 in the slot are this request's and continuing at 8
+        # simply overwrites the stale tail.
+        manager.mark_slot_owner(slot_id, "req", 12)
+        load_calls: list[object] = []
+
+        result = manager.load_snapshot_for_slot(
+            _request("req", (1, 2), 8, cache_slot_id=slot_id),
+            lambda blobs, load_slot_id: load_calls.append((blobs, load_slot_id)) or True,
+        )
+
+        assert result.reused_live_cache
+        assert result.matched_tokens == 8
+        assert not result.live_prefix_incomplete
+        assert load_calls == []
+
+    def test_live_single_cache_with_extra_tokens_is_still_reused(self) -> None:
+        manager = _make_manager(block_size=4)
+        manager.mark_loaded_request("req", 12)
+
+        result = manager.load_snapshot_for_request(
+            _request("req", (1, 2), 8),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.reused_live_cache
+        assert result.matched_tokens == 8
+        assert not result.live_prefix_incomplete
+
+    def test_released_slot_does_not_inherit_a_token_count(self) -> None:
+        manager = _make_manager(max_batch_size=1, block_size=4)
+        slot_id = manager.assign_slot("first")
+        manager.mark_slot_owner(slot_id, "first", 8)
+        manager.release_slot("first")
+
+        assert manager.live_slot_owner(slot_id) is None
+        assert manager.live_slot_tokens(slot_id) is None
+        assert manager.assign_slot("second") == slot_id
+
+    def test_single_cache_reuse_refused_when_token_count_diverges(self) -> None:
+        manager = _make_manager(block_size=4)
+        manager.mark_loaded_request("req", 4)
+        load_calls: list[object] = []
+
+        result = manager.load_snapshot_for_request(
+            _request("req", (1, 2), 8),
+            lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
+        )
+
+        assert not result.reused_live_cache
+        assert result.cache_miss
+        assert result.live_prefix_incomplete
+        assert result.live_cache_tokens == 4
+        assert result.action == "live-prefix-incomplete"
+        assert load_calls == []
+        assert manager.loaded_req_id is None
+
+    def test_untracked_live_owner_keeps_trusting_the_owner(self) -> None:
+        manager = _make_manager(block_size=4)
+        manager.mark_loaded_request("req")
+
+        result = manager.load_snapshot_for_request(
+            _request("req", (1, 2), 8),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.reused_live_cache
+        assert result.matched_tokens == 8
+        assert result.live_cache_tokens is None
+
+    def test_snapshot_load_records_matched_token_count(self) -> None:
+        manager = _make_manager(block_size=4)
+        _store_snapshot(manager, "req", (1, 2), 8)
+
+        result = manager.load_snapshot_for_request(
+            _request("req", (1, 2), 8),
+            lambda blobs, slot_id: True,
+        )
+
+        assert result.loaded
+        assert manager.loaded_req_id == "req"
+        assert manager.loaded_req_tokens == 8
+        assert not manager.live_request_prefix_incomplete(8)
+        assert manager.live_request_prefix_incomplete(9)
+
+    def test_dump_snapshot_if_needed_clamps_to_tracked_slot_tokens(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req", 4)
+        dump_calls: list[object] = []
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1, 2, 3), 12, cache_slot_id=slot_id),
+            lambda dump_slot_id: dump_calls.append(dump_slot_id) or ["short-blob"],
+        )
+
+        assert dumped
+        assert dump_calls == [slot_id]
+        assert manager.get_snapshot("req").num_tokens == 4
+
+    def test_dump_snapshot_if_needed_skips_an_empty_tracked_slot(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req", 0)
+        dump_calls: list[object] = []
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1, 2, 3), 12, cache_slot_id=slot_id),
+            lambda dump_slot_id: dump_calls.append(dump_slot_id) or ["blob"],
+        )
+
+        assert not dumped
+        assert dump_calls == []
+        assert manager.get_snapshot("req") is None
+
+    def test_dump_snapshot_if_needed_keeps_a_longer_tracked_prefix_label(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req", 20)
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1, 2, 3), 12, cache_slot_id=slot_id),
+            lambda dump_slot_id: ["blob"],
+        )
+
+        assert dumped
+        assert manager.get_snapshot("req").num_tokens == 12
+
+    def test_owned_live_cache_tokens_ignores_another_requests_cache(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "other", 4)
+        manager.mark_loaded_request("other", 4)
+
+        assert manager.owned_live_cache_tokens("req", slot_id) is None
+        assert manager.owned_live_cache_tokens("req", None) is None
+        assert manager.owned_live_cache_tokens("other", slot_id) == 4
+        assert manager.owned_live_cache_tokens("other", None) == 4

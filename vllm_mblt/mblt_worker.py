@@ -43,6 +43,25 @@ from vllm_mblt.runtime_cache import (
 logger = init_logger(__name__)
 
 
+_TRUE_ENV_VALUES = frozenset({"1", "true", "TRUE", "True"})
+
+
+def _resolve_enable_sampling_penalties(env_value: Optional[str]) -> bool:
+    """Decide whether frequency/presence/repetition penalties are applied.
+
+    vLLM applies these with a pure-torch fallback when the fused CUDA kernel is
+    unavailable, so the CPU-hosted MBLT sampler can honour them and the default
+    is on regardless of CUDA. The released MBLT packages ship
+    ``repetition_penalty`` in ``generation_config.json``; dropping it silently
+    would generate NPU output under different sampling than the GPU reference it
+    is compared against. Setting VLLM_MBLT_ENABLE_SAMPLING_PENALTIES to a
+    non-true value restores the previous ignore-and-warn behaviour.
+    """
+    if env_value is None:
+        return True
+    return env_value in _TRUE_ENV_VALUES
+
+
 _MULTIMODAL_HF_MODEL_TYPES = frozenset(
     {
         "mobilint-qwen2_vl",
@@ -349,6 +368,7 @@ class MbltWorker(WorkerBase):
         self.req_states: Dict[str, RequestState] = {}
         self._warned_batch_cache_snapshot_unsupported = False
         self._warned_last_logit_prompt_logprobs = False
+        self._live_cache_prefix_incomplete_count = 0
         self._vlm_image_positions_by_session: dict[str, tuple[int, int, Optional[tuple[bool, ...]]]] = {}
 
         self.max_batch_size = resolve_model_max_batch_size(self.vllm_config) or 1
@@ -371,11 +391,9 @@ class MbltWorker(WorkerBase):
         self.max_num_batched_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         # Disabled by default to avoid per-token stdout spam in production runs.
         self.print_debug = os.getenv("VLLM_MBLT_DEBUG", "0") in {"1", "true", "TRUE", "True"}
-        penalties_env = os.getenv("VLLM_MBLT_ENABLE_SAMPLING_PENALTIES")
-        if penalties_env is None:
-            self.enable_sampling_penalties = torch.cuda.is_available()
-        else:
-            self.enable_sampling_penalties = penalties_env in {"1", "true", "TRUE", "True"}
+        self.enable_sampling_penalties = _resolve_enable_sampling_penalties(
+            os.getenv("VLLM_MBLT_ENABLE_SAMPLING_PENALTIES")
+        )
         self._warned_penalties_disabled = False
 
     def _log_init_stage(self, stage: str, start_time: Optional[float] = None, **fields: object) -> None:
@@ -1620,6 +1638,34 @@ class MbltWorker(WorkerBase):
         )
         self._warned_last_logit_prompt_logprobs = True
 
+    def _warn_live_cache_prefix_incomplete(
+        self,
+        *,
+        req_id: str,
+        slot_id: Optional[int],
+        live_tokens: Optional[int],
+        target_tokens: int,
+    ) -> None:
+        """Report a live runtime cache that is missing part of the request prefix.
+
+        Reaching this means the accelerator cache no longer holds the prefix the
+        request is about to continue from, which is exactly the state that used
+        to be served silently as fluent-but-wrong output. The caller rebuilds
+        the prefix instead, but the divergence is a bug signal and must be
+        visible in the log rather than only in the generated text.
+        """
+        self._live_cache_prefix_incomplete_count = getattr(self, "_live_cache_prefix_incomplete_count", 0) + 1
+        logger.warning(
+            "MBLT runtime cache holds fewer tokens than the scheduler expects for req_id=%s "
+            "(cache_id=%s, live_tokens=%s, expected=%d). Rebuilding the prefix instead of "
+            "decoding against stale KV. occurrences=%d",
+            req_id,
+            slot_id,
+            live_tokens,
+            target_tokens,
+            self._live_cache_prefix_incomplete_count,
+        )
+
     @staticmethod
     def _can_reuse_output_buffers(
         cache_model: Any,
@@ -2645,6 +2691,11 @@ class MbltWorker(WorkerBase):
                 print(f"[cache] req={req_id} load-shared matched={result.matched_tokens}/{target_tokens}")
             elif result.action == "skip-cost":
                 print(f"[cache] req={req_id} skip-load-cost matched={result.matched_tokens}/{target_tokens}")
+            elif result.action == "live-prefix-incomplete":
+                print(
+                    f"[cache] req={req_id} live-prefix-incomplete "
+                    f"live={result.live_cache_tokens} expected={target_tokens} rebuild matched=0/{target_tokens}"
+                )
             else:
                 print(f"[cache] req={req_id} cache-miss fallback matched=0/{target_tokens}")
         return result.matched_tokens
@@ -2664,18 +2715,37 @@ class MbltWorker(WorkerBase):
             first_seq_block_hashes=request.first_seq_block_hashes,
         )
 
+        live_prefix_incomplete = False
+        live_cache_tokens: Optional[int] = None
         if self.runtime_cache.loaded_req_id == request.req_id:
-            return RuntimeCacheLoadResult(
-                matched_tokens=target_tokens,
-                reused_live_cache=True,
-                action="reuse-live",
-                snapshot_req_id=request.req_id,
+            if not self.runtime_cache.live_request_prefix_incomplete(target_tokens):
+                return RuntimeCacheLoadResult(
+                    matched_tokens=target_tokens,
+                    reused_live_cache=True,
+                    action="reuse-live",
+                    snapshot_req_id=request.req_id,
+                    live_cache_tokens=self.runtime_cache.loaded_req_tokens,
+                )
+            live_prefix_incomplete = True
+            live_cache_tokens = self.runtime_cache.loaded_req_tokens
+            self._warn_live_cache_prefix_incomplete(
+                req_id=request.req_id,
+                slot_id=None,
+                live_tokens=live_cache_tokens,
+                target_tokens=target_tokens,
             )
+            self.runtime_cache.clear_loaded_request(request.req_id)
 
         match = self.runtime_cache.choose_snapshot(request)
         if match.snapshot is None or match.matched_tokens <= 0:
             self.runtime_cache.clear_loaded_request()
-            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+            return RuntimeCacheLoadResult(
+                matched_tokens=0,
+                cache_miss=True,
+                action="live-prefix-incomplete" if live_prefix_incomplete else "cache-miss",
+                live_prefix_incomplete=live_prefix_incomplete,
+                live_cache_tokens=live_cache_tokens,
+            )
 
         if not self._ensure_prefix_cache_cost_model().should_load(
             matched_tokens=match.matched_tokens,
@@ -2710,7 +2780,7 @@ class MbltWorker(WorkerBase):
             )
 
         if self._timed_load_runtime_cache(match.snapshot.blobs, None):
-            self.runtime_cache.mark_loaded_request(request.req_id)
+            self.runtime_cache.mark_loaded_request(request.req_id, match.matched_tokens)
             return RuntimeCacheLoadResult(
                 matched_tokens=match.matched_tokens,
                 loaded=True,
@@ -2718,10 +2788,15 @@ class MbltWorker(WorkerBase):
                 is_own_snapshot=match.is_own_snapshot,
                 action="load-own" if match.is_own_snapshot else "load-shared",
                 snapshot_req_id=match.req_id,
+                live_prefix_incomplete=live_prefix_incomplete,
             )
 
         self.runtime_cache.clear_loaded_request()
-        return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+        return RuntimeCacheLoadResult(
+            matched_tokens=0,
+            cache_miss=True,
+            live_prefix_incomplete=live_prefix_incomplete,
+        )
 
     def _load_snapshot_for_batch_slot(
         self,
@@ -2767,6 +2842,11 @@ class MbltWorker(WorkerBase):
                     f"[cache] req={req_id} slot={slot_id} "
                     f"skip-load-cost matched={result.matched_tokens}/{target_tokens}"
                 )
+            elif result.action == "live-prefix-incomplete":
+                print(
+                    f"[cache] req={req_id} slot={slot_id} live-prefix-incomplete "
+                    f"live={result.live_cache_tokens} expected={target_tokens} rebuild matched=0/{target_tokens}"
+                )
             else:
                 print(f"[cache] req={req_id} slot={slot_id} cache-miss fallback matched=0/{target_tokens}")
         return result.matched_tokens
@@ -2789,13 +2869,26 @@ class MbltWorker(WorkerBase):
             first_seq_block_hashes=request.first_seq_block_hashes,
         )
 
+        live_prefix_incomplete = False
+        live_cache_tokens: Optional[int] = None
         if self.runtime_cache.live_slot_owner(slot_id) == request.req_id:
-            return RuntimeCacheLoadResult(
-                matched_tokens=target_tokens,
-                reused_live_cache=True,
-                action="reuse-live",
-                snapshot_req_id=request.req_id,
+            if not self.runtime_cache.live_slot_prefix_incomplete(slot_id, target_tokens):
+                return RuntimeCacheLoadResult(
+                    matched_tokens=target_tokens,
+                    reused_live_cache=True,
+                    action="reuse-live",
+                    snapshot_req_id=request.req_id,
+                    live_cache_tokens=self.runtime_cache.live_slot_tokens(slot_id),
+                )
+            live_prefix_incomplete = True
+            live_cache_tokens = self.runtime_cache.live_slot_tokens(slot_id)
+            self._warn_live_cache_prefix_incomplete(
+                req_id=request.req_id,
+                slot_id=slot_id,
+                live_tokens=live_cache_tokens,
+                target_tokens=target_tokens,
             )
+            self.runtime_cache.clear_slot_owner(slot_id)
 
         match = self.runtime_cache.choose_snapshot(request)
         if match.snapshot is not None and match.matched_tokens > 0:
@@ -2803,7 +2896,7 @@ class MbltWorker(WorkerBase):
                 matched_tokens=match.matched_tokens,
                 cache_id=slot_id,
             ):
-                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id, 0)
                 return RuntimeCacheLoadResult(
                     matched_tokens=0,
                     cache_miss=True,
@@ -2811,17 +2904,24 @@ class MbltWorker(WorkerBase):
                     is_own_snapshot=match.is_own_snapshot,
                     action="skip-cost",
                     snapshot_req_id=match.req_id,
+                    live_prefix_incomplete=live_prefix_incomplete,
                 )
 
             match = self.runtime_cache.verify_prompt_embed_match(request, match)
             if match.snapshot is None or match.matched_tokens <= 0:
-                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
-                return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id, 0)
+                return RuntimeCacheLoadResult(
+                    matched_tokens=0,
+                    cache_miss=True,
+                    action="live-prefix-incomplete" if live_prefix_incomplete else "cache-miss",
+                    live_prefix_incomplete=live_prefix_incomplete,
+                    live_cache_tokens=live_cache_tokens,
+                )
             if not self._ensure_prefix_cache_cost_model().should_load(
                 matched_tokens=match.matched_tokens,
                 cache_id=slot_id,
             ):
-                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id, 0)
                 return RuntimeCacheLoadResult(
                     matched_tokens=0,
                     cache_miss=True,
@@ -2829,10 +2929,11 @@ class MbltWorker(WorkerBase):
                     is_own_snapshot=match.is_own_snapshot,
                     action="skip-cost",
                     snapshot_req_id=match.req_id,
+                    live_prefix_incomplete=live_prefix_incomplete,
                 )
 
             if self._timed_load_runtime_cache(match.snapshot.blobs, slot_id):
-                self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
+                self.runtime_cache.mark_slot_owner(slot_id, request.req_id, match.matched_tokens)
                 return RuntimeCacheLoadResult(
                     matched_tokens=match.matched_tokens,
                     loaded=True,
@@ -2840,10 +2941,23 @@ class MbltWorker(WorkerBase):
                     is_own_snapshot=match.is_own_snapshot,
                     action="load-own" if match.is_own_snapshot else "load-shared",
                     snapshot_req_id=match.req_id,
+                    live_prefix_incomplete=live_prefix_incomplete,
                 )
 
-        self.runtime_cache.mark_slot_owner(slot_id, request.req_id)
-        return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
+        self.runtime_cache.mark_slot_owner(slot_id, request.req_id, 0)
+        return RuntimeCacheLoadResult(
+            matched_tokens=0,
+            cache_miss=True,
+            action="live-prefix-incomplete" if live_prefix_incomplete else "cache-miss",
+            live_prefix_incomplete=live_prefix_incomplete,
+            live_cache_tokens=live_cache_tokens,
+        )
+
+    def _owned_live_cache_tokens(self, req_id: str, slot_id: Optional[int]) -> Optional[int]:
+        return self.runtime_cache.owned_live_cache_tokens(
+            req_id,
+            slot_id if self._is_batch_model() else None,
+        )
 
     def _dump_snapshot(
         self,
@@ -2853,6 +2967,25 @@ class MbltWorker(WorkerBase):
         slot_id: Optional[int] = None,
         print_debug: bool = False,
     ) -> bool:
+        # A snapshot must never advertise more tokens than its blobs contain.
+        # The scheduler's num_computed_tokens is the caller's label of choice,
+        # but the live cache can legitimately hold a shorter prefix of this
+        # request (a cost-policy skip, a rebuilt prefix). Labeling the longer
+        # count would let a later load resume past KV that is not there, which
+        # is the same silent-wrong-output failure this tracking exists to stop.
+        live_tokens = self._owned_live_cache_tokens(req_id, slot_id)
+        if live_tokens is not None and live_tokens < max(0, int(next_num_tokens)):
+            if live_tokens <= 0:
+                return False
+            if not self.runtime_cache.should_dump_snapshot_after_step(req_id, live_tokens):
+                return False
+            if print_debug:
+                print(
+                    f"[cache] req={req_id} slot={slot_id} dump-clamped "
+                    f"tokens={live_tokens} requested={max(0, int(next_num_tokens))}"
+                )
+            next_num_tokens = live_tokens
+
         blobs = self._timed_dump_runtime_cache(slot_id)
         if blobs is None:
             if self._is_batch_model() and not self._warned_batch_cache_snapshot_unsupported:
@@ -2955,8 +3088,17 @@ class MbltWorker(WorkerBase):
                 finished_req_state.num_computed_tokens,
             )
             if self._is_batch_model():
+                # Only the request that still owns the live slot can be dumped:
+                # a request that was aborted before it ever ran leaves the slot
+                # holding somebody else's KV, and snapshotting that under this
+                # req_id would publish a prefix the tokens do not match.
+                owns_live_slot = (
+                    finished_slot_id is not None
+                    and self.runtime_cache.live_slot_owner(finished_slot_id) == req_id
+                )
                 if (
-                    should_dump
+                    owns_live_slot
+                    and should_dump
                     and self._dump_snapshot(
                         req_id=req_id,
                         req_state=finished_req_state,
@@ -3095,8 +3237,9 @@ class MbltWorker(WorkerBase):
         else:
             if penalties_requested and not getattr(self, "_warned_penalties_disabled", False):
                 logger.warning(
-                    "Sampling penalties are disabled for non-CUDA MBLT runtime. "
-                    "Ignoring frequency_penalty=%s, presence_penalty=%s, repetition_penalty=%s.",
+                    "Sampling penalties are disabled by VLLM_MBLT_ENABLE_SAMPLING_PENALTIES. "
+                    "Ignoring frequency_penalty=%s, presence_penalty=%s, repetition_penalty=%s. "
+                    "NPU output will not match a GPU reference run that applies them.",
                     requested_frequency_penalty,
                     requested_presence_penalty,
                     requested_repetition_penalty,
@@ -3479,7 +3622,7 @@ class MbltWorker(WorkerBase):
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
                 req_state.num_computed_tokens = next_cache_sizes[i]
-                self.runtime_cache.mark_slot_owner(cache_ids[i], req_id)
+                self.runtime_cache.mark_slot_owner(cache_ids[i], req_id, next_cache_sizes[i])
                 if self._should_sample_after_step(
                     req_state,
                     scheduled_end_positions[i],
@@ -3591,7 +3734,7 @@ class MbltWorker(WorkerBase):
                 # next_cache_size tokens, so later same-request decode can reuse it
                 # without forcing a block-boundary snapshot dump.
                 req_state.num_computed_tokens = next_cache_size
-                self.runtime_cache.mark_loaded_request(req_id)
+                self.runtime_cache.mark_loaded_request(req_id, next_cache_size)
                 if self._should_sample_after_step(
                     req_state,
                     scheduled_end,
