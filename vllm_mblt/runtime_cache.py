@@ -614,13 +614,39 @@ class MbltRuntimeCacheManager:
             return False
         return self.required_blocks(next_num_tokens) > self.required_blocks(snapshot.num_tokens)
 
+    def owned_live_cache_tokens(self, req_id: str, slot_id: int | None) -> int | None:
+        """Tokens the live cache is tracked to hold *for this request*.
+
+        Returns None when there is nothing to go on — the count is untracked,
+        or the live cache belongs to another request — so callers keep their
+        previous behaviour instead of acting on a number that is not about
+        ``req_id``.
+        """
+        if slot_id is not None:
+            if self.slot_live_req.get(slot_id) != req_id:
+                return None
+            return self.slot_live_tokens.get(slot_id)
+        if self.loaded_req_id != req_id:
+            return None
+        return self.loaded_req_tokens
+
     def dump_snapshot_if_needed(
         self,
         request: RuntimeCacheRequest,
         dump_runtime_cache: DumpRuntimeCache | None = None,
     ) -> bool:
-        if not self.should_dump_snapshot_after_step(request.req_id, request.num_computed_tokens):
+        num_tokens = max(0, int(request.num_computed_tokens))
+        if not self.should_dump_snapshot_after_step(request.req_id, num_tokens):
             return False
+        # Never label a snapshot with more tokens than its blobs hold: a later
+        # load would report the full match and resume past missing KV.
+        live_tokens = self.owned_live_cache_tokens(request.req_id, request.cache_slot_id)
+        if live_tokens is not None and live_tokens < num_tokens:
+            if live_tokens <= 0:
+                return False
+            if not self.should_dump_snapshot_after_step(request.req_id, live_tokens):
+                return False
+            num_tokens = live_tokens
         dump_runtime_cache = dump_runtime_cache or self._dump_runtime_cache_fn
         if dump_runtime_cache is None:
             raise RuntimeError("Runtime cache dump adapter is not configured.")
@@ -633,7 +659,7 @@ class MbltRuntimeCacheManager:
             block_ids=request.block_ids,
             first_seq_blocks=request.first_seq_blocks,
             first_seq_block_hashes=request.first_seq_block_hashes,
-            num_tokens=request.num_computed_tokens,
+            num_tokens=num_tokens,
             cache_token_ids=request.cache_token_ids,
             multimodal_cache_identity=request.multimodal_cache_identity,
             prompt_embed_cache_identity=request.prompt_embed_cache_identity,

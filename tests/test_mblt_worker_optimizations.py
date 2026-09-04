@@ -3333,3 +3333,85 @@ class TestMbltWorkerOptimizations:
         # Token 0 is in the prompt and token 1 was generated, so both are
         # penalised; the unpenalised token 2 must win instead of token 1.
         assert int(sampler_output.sampled_token_ids[0, 0].item()) == 2
+
+    def test_dump_before_switch_does_not_advertise_more_tokens_than_cached(self) -> None:
+        worker = self._make_worker()
+        dump_calls: list[object] = []
+        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["short-blob"]
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        # The scheduler view says 32 tokens, the live cache only holds 8.
+        req_state.num_computed_tokens = 32
+        worker.req_states = {"live": req_state}
+        worker.runtime_cache.mark_loaded_request("live", 8)
+
+        worker._dump_loaded_request_before_switch(next_req_id="other")
+
+        assert dump_calls == [None]
+        snapshot = worker.runtime_cache.get_snapshot("live")
+        assert snapshot is not None
+        assert snapshot.num_tokens == 8
+        assert snapshot.cache_token_ids == tuple(range(8))
+
+    def test_dump_before_switch_is_skipped_when_live_cache_is_empty(self) -> None:
+        worker = self._make_worker()
+        dump_calls: list[object] = []
+        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["blob"]
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        req_state.num_computed_tokens = 32
+        worker.req_states = {"live": req_state}
+        worker.runtime_cache.mark_loaded_request("live", 0)
+
+        worker._dump_loaded_request_before_switch(next_req_id="other")
+
+        assert dump_calls == []
+        assert worker.runtime_cache.get_snapshot("live") is None
+
+    def test_finalize_clamps_snapshot_to_the_tokens_the_slot_holds(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        dump_calls: list[object] = []
+        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["short-blob"]
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(64)))
+        req_state.block_ids = ([10],)
+        req_state.first_seq_blocks = (10,)
+        req_state.num_computed_tokens = 64
+        req_state.cache_slot_id = 0
+        worker.req_states = {"done": req_state}
+        worker.runtime_cache.req_to_slot = {"done": 0}
+        worker.runtime_cache.slot_to_req = {0: "done"}
+        worker.runtime_cache.free_slots = [1]
+        worker.runtime_cache.mark_slot_owner(0, "done", 16)
+
+        worker._finalize_finished_request("done")
+
+        assert dump_calls == [0]
+        snapshot = worker.runtime_cache.get_snapshot("done")
+        assert snapshot is not None
+        assert snapshot.num_tokens == 16
+
+    def test_clamped_snapshot_cannot_resume_past_missing_kv(self) -> None:
+        worker = self._make_worker()
+        dump_calls: list[object] = []
+        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["short-blob"]
+        worker._load_runtime_cache = lambda blobs, slot_id=None: True
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(256)))
+        req_state.block_ids = ([10, 11],)
+        req_state.first_seq_blocks = (10, 11)
+        req_state.num_computed_tokens = 256
+        worker.req_states = {"live": req_state}
+        worker.runtime_cache.mark_loaded_request("live", 128)
+
+        worker._dump_loaded_request_before_switch(next_req_id="other")
+        # Another request takes the single live cache, then "live" comes back.
+        worker.runtime_cache.mark_loaded_request("other", 8)
+
+        cache_size = worker._load_snapshot_if_needed("live", req_state)
+
+        # Without the clamp the snapshot would claim 256 tokens and decoding
+        # would resume at 256 over 128 tokens of real KV.
+        assert cache_size == 128

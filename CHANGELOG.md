@@ -18,6 +18,12 @@
 - A finished or aborted batch request is no longer snapshotted when it does not
   own its live cache slot, so an abort before the first step can no longer
   publish another request's KV as a prefix snapshot.
+- Prefix snapshots are never labeled with more tokens than the live cache holds.
+  Dump-before-switch and dump-on-finish used the scheduler's
+  `num_computed_tokens`, so a cache holding a shorter prefix produced a snapshot
+  advertising KV that was not in the blobs, and a later load resumed past the
+  missing entries. The dump is now clamped to the tracked count, or skipped when
+  that count is zero.
 - `npu_prefill_chunk_size` / `max_batch_size` dicts now resolve for
   `core_mode: "auto"` artifacts when the dict holds exactly one usable entry,
   instead of silently falling back to the `128` default. Note that accepting

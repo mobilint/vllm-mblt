@@ -2953,6 +2953,12 @@ class MbltWorker(WorkerBase):
             live_cache_tokens=live_cache_tokens,
         )
 
+    def _owned_live_cache_tokens(self, req_id: str, slot_id: Optional[int]) -> Optional[int]:
+        return self.runtime_cache.owned_live_cache_tokens(
+            req_id,
+            slot_id if self._is_batch_model() else None,
+        )
+
     def _dump_snapshot(
         self,
         req_id: str,
@@ -2961,6 +2967,25 @@ class MbltWorker(WorkerBase):
         slot_id: Optional[int] = None,
         print_debug: bool = False,
     ) -> bool:
+        # A snapshot must never advertise more tokens than its blobs contain.
+        # The scheduler's num_computed_tokens is the caller's label of choice,
+        # but the live cache can legitimately hold a shorter prefix of this
+        # request (a cost-policy skip, a rebuilt prefix). Labeling the longer
+        # count would let a later load resume past KV that is not there, which
+        # is the same silent-wrong-output failure this tracking exists to stop.
+        live_tokens = self._owned_live_cache_tokens(req_id, slot_id)
+        if live_tokens is not None and live_tokens < max(0, int(next_num_tokens)):
+            if live_tokens <= 0:
+                return False
+            if not self.runtime_cache.should_dump_snapshot_after_step(req_id, live_tokens):
+                return False
+            if print_debug:
+                print(
+                    f"[cache] req={req_id} slot={slot_id} dump-clamped "
+                    f"tokens={live_tokens} requested={max(0, int(next_num_tokens))}"
+                )
+            next_num_tokens = live_tokens
+
         blobs = self._timed_dump_runtime_cache(slot_id)
         if blobs is None:
             if self._is_batch_model() and not self._warned_batch_cache_snapshot_unsupported:

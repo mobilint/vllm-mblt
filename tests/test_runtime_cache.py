@@ -1072,3 +1072,57 @@ class TestMbltRuntimeCacheLiveTokenTracking:
         assert manager.loaded_req_tokens == 8
         assert not manager.live_request_prefix_incomplete(8)
         assert manager.live_request_prefix_incomplete(9)
+
+    def test_dump_snapshot_if_needed_clamps_to_tracked_slot_tokens(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req", 4)
+        dump_calls: list[object] = []
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1, 2, 3), 12, cache_slot_id=slot_id),
+            lambda dump_slot_id: dump_calls.append(dump_slot_id) or ["short-blob"],
+        )
+
+        assert dumped
+        assert dump_calls == [slot_id]
+        assert manager.get_snapshot("req").num_tokens == 4
+
+    def test_dump_snapshot_if_needed_skips_an_empty_tracked_slot(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req", 0)
+        dump_calls: list[object] = []
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1, 2, 3), 12, cache_slot_id=slot_id),
+            lambda dump_slot_id: dump_calls.append(dump_slot_id) or ["blob"],
+        )
+
+        assert not dumped
+        assert dump_calls == []
+        assert manager.get_snapshot("req") is None
+
+    def test_dump_snapshot_if_needed_keeps_a_longer_tracked_prefix_label(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "req", 20)
+
+        dumped = manager.dump_snapshot_if_needed(
+            _request("req", (1, 2, 3), 12, cache_slot_id=slot_id),
+            lambda dump_slot_id: ["blob"],
+        )
+
+        assert dumped
+        assert manager.get_snapshot("req").num_tokens == 12
+
+    def test_owned_live_cache_tokens_ignores_another_requests_cache(self) -> None:
+        manager = _make_manager(max_batch_size=2, block_size=4)
+        slot_id = manager.assign_slot("req")
+        manager.mark_slot_owner(slot_id, "other", 4)
+        manager.mark_loaded_request("other", 4)
+
+        assert manager.owned_live_cache_tokens("req", slot_id) is None
+        assert manager.owned_live_cache_tokens("req", None) is None
+        assert manager.owned_live_cache_tokens("other", slot_id) == 4
+        assert manager.owned_live_cache_tokens("other", None) == 4
