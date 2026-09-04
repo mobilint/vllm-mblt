@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1
+## 0.2.2
 
 ### Fixed
 
@@ -9,9 +9,18 @@
   plain Linux without an NVIDIA driver made vLLM allocate pinned tensors and
   `Tensor.pin_memory()` raised `Found no NVIDIA driver on your system`. The
   sampling-penalty path hit this first (`apply_all_penalties` ->
-  `make_tensor_with_pad`). MBLT runs on the NPU with CPU-side host tensors, so
-  there is nothing to pin, and `CpuPlatform` answers `False` for the same
-  reason.
+  `make_tensor_with_pad`), which is why the fixes below could not ship as
+  0.2.1. MBLT runs on the NPU with CPU-side host tensors, so there is nothing
+  to pin, and `CpuPlatform` answers `False` for the same reason.
+
+## 0.2.1
+
+Tagged on GitHub but never published to PyPI: the release pipeline's test gate
+caught the pinned memory failure above, so no 0.2.1 artifact was ever built.
+Install 0.2.2 to get the fixes below.
+
+### Fixed
+
 - Sampling penalties (`frequency_penalty`, `presence_penalty`,
   `repetition_penalty`) are now applied by default instead of only when CUDA is
   available. vLLM applies them through a pure-torch fallback when the fused
