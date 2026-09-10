@@ -249,6 +249,75 @@ Notes:
 - Reported latency and throughput are environment-dependent. Capture results from your target board for documentation
   or performance comparisons.
 
+## NPU Event Tracing
+
+The worker can record NPU activity as a Chrome Tracing log through qbruntime's
+event tracer, so you can see where time actually goes on the accelerator. It is
+wired into vLLM's standard worker profiler hook, which means the usual controls
+apply -- there is no MBLT-specific flag or endpoint.
+
+Set `VLLM_TORCH_PROFILER_DIR` to a directory before starting the server. This is
+the switch: without it the OpenAI server does not register the profile routes,
+and the worker reports that tracing is not enabled.
+
+```bash
+export VLLM_TORCH_PROFILER_DIR=/tmp/mblt_traces
+vllm serve mobilint/Llama-3.2-1B-Instruct --trust-remote-code
+```
+
+Then bracket the work you care about:
+
+```bash
+curl -X POST http://localhost:8000/start_profile
+# send the requests you want to trace
+curl -X POST http://localhost:8000/stop_profile
+```
+
+For an offline run, `LLM.start_profile()` / `LLM.stop_profile()` do the same, and
+`vllm bench serve --profile` brackets the benchmark for you.
+
+Each window writes `{hostname}_{pid}.mblt_npu_rank{rank}.{time_ns}.json` into
+that directory. Open it at <https://ui.perfetto.dev/>. The name follows the
+convention `torch.profiler.tensorboard_trace_handler` uses for its own traces,
+which vLLM and vllm-ascend both build on: the nanosecond timestamp is what
+keeps successive windows from clashing, the pid separates concurrent processes
+on a host, and the hostname separates containers that share a mounted trace
+directory but not a pid namespace. vLLM's front-end trace lands beside it as
+`{hostname}_{pid}.async_llm.{time_ns}.pt.trace.json.gz`. The events are the runtime's own device-level
+spans -- `infer`, `run npu`, `copy to npu`, `lock core`, `read device` and the
+like -- so a window shows what each inference step spent on the accelerator.
+
+vLLM writes its own front-end CPU trace (`*.async_llm.*.pt.trace.json.gz`) into
+the same directory, because `VLLM_TORCH_PROFILER_DIR` also enables the API
+server's `AsyncLLM` profiler. The two are complementary: that file covers
+CPU-side scheduling, the MBLT file covers NPU execution.
+
+Notes:
+
+- Trace a short window. qbruntime buffers the whole log in the process and
+  writes it only when tracing stops, so leaving a trace on for the life of a
+  server grows memory and produces a file too large to be useful. If the worker
+  shuts down while a trace is running it is stopped first so the window is not
+  lost.
+- Only one qbruntime trace can record per process. A start while one is
+  already recording is refused with a warning rather than cutting the first
+  window short. qbruntime has no way to report whether a trace is running or
+  who owns it, so this covers traces started through this plugin and, when its
+  module is already imported, through `mblt_model_zoo`'s benchmark helpers. A
+  trace started by any other client cannot be detected.
+- If a trace cannot be started, or its log cannot be written, `/start_profile`
+  and `/stop_profile` fail rather than reporting success for a trace that will
+  not be on disk. A repeated start or a stop with nothing running is not a
+  failure and only logs. During shutdown a trace that cannot be written is
+  logged and skipped so the rest of the teardown still runs.
+- A `/stop_profile` with no trace running answers `500`. That comes from vLLM's
+  front-end `AsyncLLM` profiler, which raises when stopped before it was
+  started; the worker-side trace is unaffected and only logs that there was
+  nothing to stop.
+- A torch profiler on the worker would show nothing useful here: the model runs
+  on the NPU through qbruntime rather than through torch ops, which is why this
+  hook records a qbruntime trace instead.
+
 ## Supported Model Families
 
 `vllm-mblt` registers Mobilint model wrappers for:
@@ -341,10 +410,12 @@ vllm_mblt/
 ├── __init__.py                 # vLLM plugin and model registration entry points
 ├── mblt_platform.py            # platform config overrides and runtime-aware defaults
 ├── mblt_worker.py              # custom worker, prefill/decode flow, KV snapshot logic
+├── tracing.py                  # qbruntime NPU event tracing behind vLLM's profiler hook
 └── models/                     # Mobilint model wrappers for LLM/VLM families
 
 tests/
 ├── test_kv_cache_swap_spec.py
 ├── test_mblt_platform_prefill.py
+├── test_mblt_tracing.py
 └── test_mblt_worker_optimizations.py
 ```
