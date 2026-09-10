@@ -73,6 +73,23 @@ class TestDetectTailOrder:
         assert order == ("rope", "deepstack")
 
     @pytest.mark.parametrize("default", [("rope", "deepstack"), ("deepstack", "rope")])
+    @pytest.mark.parametrize(
+        "tails, expected",
+        [
+            ([(1, -1, HIDDEN), (LAYERS, -1, -1)], ("rope", "deepstack")),
+            ([(LAYERS, -1, -1), (1, -1, HIDDEN)], ("deepstack", "rope")),
+        ],
+    )
+    def test_leading_axis_wins_when_the_last_axis_disagrees(self, tails, expected, default) -> None:
+        # rope declaring pe_size == hidden_size *and* deepstack declaring a
+        # dynamic hidden axis -- the two signatures the last axis cannot read,
+        # in one pair. The last axis then reads the rope input as deepstack, so
+        # consulting it first inverts the pair. The leading axis is decisive
+        # (LAYERS cannot be a rope batch dimension) and has to win. Both
+        # defaults are tried, so neither answer can be coming from the fallback.
+        assert MbltWorker._detect_qwen3_vl_tail_order(tails, HIDDEN, default) == expected
+
+    @pytest.mark.parametrize("default", [("rope", "deepstack"), ("deepstack", "rope")])
     def test_unreadable_on_both_axes_falls_back_to_default(self, default) -> None:
         # A single-layer deepstack sharing the rope input's declared size is
         # genuinely indistinguishable: neither axis separates the two. Guessing

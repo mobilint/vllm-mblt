@@ -1300,21 +1300,24 @@ class MbltWorker(WorkerBase):
     ) -> tuple[str, str]:
         """Classify the two trailing text-MXQ inputs as rope / deepstack.
 
-        Two independent discriminators, tried in that order:
+        Two discriminators, strongest first:
 
-        * the last axis -- deepstack's is the hidden size, rope's is pe_size;
         * the leading axis -- deepstack's is its layer count, which both callers
           require to be fixed and positive, while rope's must be 1 or dynamic.
-          So a leading axis greater than 1 can only be deepstack.
+          A leading axis greater than 1 therefore cannot be rope. This holds
+          unconditionally.
+        * the last axis -- deepstack's is the hidden size, rope's is pe_size.
+          Weaker, because rope satisfies it too whenever pe_size == hidden_size,
+          so it is consulted only when the leading axis is 1 or dynamic on both
+          tails and cannot separate them.
 
-        The leading axis settles the two signatures the last axis cannot read: a
-        deepstack input declaring a dynamic hidden axis, and an artifact whose
-        pe_size happens to equal the hidden size. Both used to fall back to the
-        positional guess, which then failed validation on the very artifacts
-        this classification exists to accept.
+        The order is the point. With the weak test first, a pair combining the
+        two signatures it cannot read -- rope declaring pe_size == hidden_size
+        and deepstack declaring a dynamic hidden axis -- gets actively inverted
+        and the reliable test never runs.
 
-        What neither can tell apart -- a single-layer deepstack whose hidden size
-        the rope input shares, say -- still falls back to `default`, so shipped
+        What neither can tell apart -- a single-layer deepstack whose declared
+        size the rope input shares, say -- falls back to `default`, so shipped
         artifacts keep their behaviour exactly.
         """
 
@@ -1326,20 +1329,19 @@ class MbltWorker(WorkerBase):
         if any(len(shape) < 1 for shape in tail_shapes):
             return default
 
+        holds_layers = tuple(int(shape[0]) > 1 for shape in tail_shapes)
+        if holds_layers == (True, False):
+            return ("deepstack", "rope")
+        if holds_layers == (False, True):
+            return ("rope", "deepstack")
+
+        # Both leading axes are 1 or dynamic, so fall through to the weaker test.
         matches_hidden = tuple(
             int(shape[-1]) > 0 and int(shape[-1]) == hidden_size for shape in tail_shapes
         )
         if matches_hidden == (True, False):
             return ("deepstack", "rope")
         if matches_hidden == (False, True):
-            return ("rope", "deepstack")
-
-        # The last axis was unreadable on both tails; the leading axis is
-        # independent of it and only deepstack may declare more than one layer.
-        holds_layers = tuple(int(shape[0]) > 1 for shape in tail_shapes)
-        if holds_layers == (True, False):
-            return ("deepstack", "rope")
-        if holds_layers == (False, True):
             return ("rope", "deepstack")
         return default
 
