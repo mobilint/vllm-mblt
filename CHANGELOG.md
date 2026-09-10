@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- `MbltWorker.profile()` records NPU activity as a qbruntime event trace, so
+  users can see where time goes on the accelerator. vLLM reaches every worker
+  through `collective_rpc("profile", ...)` and the v1 `WorkerBase` declares no
+  `profile`, so `/start_profile`, `/stop_profile`, `LLM.start_profile()` and
+  `vllm bench serve --profile` previously raised `AttributeError` on this
+  platform; implementing the hook is what makes all of them work. A torch
+  profiler would show nothing useful here because the model runs on the NPU
+  through qbruntime rather than through torch ops, so the hook drives
+  `qbruntime.start_tracing_events` / `stop_tracing_events` instead, the way
+  each out-of-tree platform points the same hook at its own device profiler.
+  `VLLM_TORCH_PROFILER_DIR` stays the switch and the output directory -- no
+  MBLT-specific flag or endpoint is added -- and each window writes
+  `mblt_trace_{rank}_{window}.json` for <https://ui.perfetto.dev/>. Because
+  qbruntime buffers the log and writes it only on stop, `shutdown()` stops a
+  running trace so a server torn down mid-window does not lose it, and a second
+  start while one is recording is refused with a warning rather than taking
+  over the first owner's window. Verified on an Aries board: a start/stop
+  window around one completion request produced a 1330-event trace, and a
+  `SIGTERM` mid-trace wrote the window before `Model disposed.`
+
 ## 0.2.3
 
 ### Fixed

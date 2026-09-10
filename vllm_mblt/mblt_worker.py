@@ -39,6 +39,7 @@ from vllm_mblt.runtime_cache import (
     first_seq_blocks,
     normalize_block_ids,
 )
+from vllm_mblt.tracing import TRACE_DIR_ENV_VAR, MbltTracer, resolve_trace_dir
 
 logger = init_logger(__name__)
 
@@ -396,6 +397,10 @@ class MbltWorker(WorkerBase):
         )
         self._warned_penalties_disabled = False
         self._warned_ambiguous_extra_input_order = False
+        # Built on the first profile() call, not here: resolving the trace
+        # directory eagerly would make every worker create it even for runs
+        # that never trace.
+        self._tracer: Optional[MbltTracer] = None
 
     def _log_init_stage(self, stage: str, start_time: Optional[float] = None, **fields: object) -> None:
         payload = {
@@ -3471,6 +3476,38 @@ class MbltWorker(WorkerBase):
         assert self.model is not None
         return self.model
 
+    def _get_tracer(self) -> MbltTracer:
+        if self._tracer is None:
+            trace_dir = resolve_trace_dir()
+            if trace_dir is None:
+                raise RuntimeError(
+                    f"NPU event tracing is not enabled. Set {TRACE_DIR_ENV_VAR} to a directory "
+                    "before starting the server to enable it."
+                )
+            self._tracer = MbltTracer(trace_dir, rank=self.rank)
+        return self._tracer
+
+    def profile(self, is_start: bool = True) -> None:
+        """Start or stop an NPU event trace.
+
+        vLLM's `Executor.profile()` reaches every worker through
+        `collective_rpc("profile", ...)`, so implementing this method is what
+        makes `/start_profile`, `/stop_profile`, `LLM.start_profile()` and
+        `vllm bench serve --profile` work on this platform. The v1
+        `WorkerBase` declares no `profile`, so those paths raise
+        `AttributeError` without it.
+
+        A torch profiler would see nothing useful here -- the model runs on the
+        NPU through qbruntime, not through torch ops -- so this hook records a
+        qbruntime event trace instead, the way each out-of-tree platform points
+        it at its own device profiler.
+        """
+        tracer = self._get_tracer()
+        if is_start:
+            tracer.start()
+        else:
+            tracer.stop()
+
     @torch.inference_mode()
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | None:
         if self.model is None:
@@ -3996,6 +4033,10 @@ class MbltWorker(WorkerBase):
         raise NotImplementedError
 
     def shutdown(self) -> None:
+        # qbruntime buffers the trace log and writes it only on stop, so a
+        # server torn down mid-trace would otherwise lose the whole window.
+        if self._tracer is not None and self._tracer.is_running:
+            self._tracer.stop()
         if self.model:
             dispose = getattr(self.model, "dispose", None)
             if callable(dispose):
