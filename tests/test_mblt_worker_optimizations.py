@@ -2543,7 +2543,11 @@ class TestMbltWorkerOptimizations:
         assert tuple(infer_inputs[1].shape) == (3, 5, 4)
         np.testing.assert_array_equal(infer_inputs[1], np.zeros((3, 5, 4), dtype=np.float32))
 
-    def test_build_infer_inputs_passes_deepstack_then_rope_for_nonbatch_qwen3_vl_three_input_model(self) -> None:
+    def test_build_infer_inputs_follows_declared_deepstack_then_rope_shapes(self) -> None:
+        # max_batch_size is set but inert: these shapes are unambiguous, so the
+        # declared order decides and the batch/non-batch default never applies.
+        # test_build_infer_inputs_falls_back_to_*_order_when_shapes_are_ambiguous
+        # below covers the default itself.
         worker = self._make_worker()
         worker.max_batch_size = 1
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
@@ -2564,7 +2568,8 @@ class TestMbltWorkerOptimizations:
         np.testing.assert_array_equal(infer_inputs[1], deepstack_embeds)
         np.testing.assert_array_equal(infer_inputs[2], rope_embeds)
 
-    def test_build_infer_inputs_passes_rope_then_deepstack_for_batch_qwen3_vl_three_input_model(self) -> None:
+    def test_build_infer_inputs_follows_declared_rope_then_deepstack_shapes(self) -> None:
+        # Mirror of the test above, and max_batch_size is inert here too.
         worker = self._make_worker()
         worker.max_batch_size = 16
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
@@ -2582,6 +2587,51 @@ class TestMbltWorkerOptimizations:
 
         assert isinstance(infer_inputs, list)
         assert [tuple(item.shape) for item in infer_inputs] == [(1, 5, 4), (1, 5, 6), (3, 5, 4)]
+        np.testing.assert_array_equal(infer_inputs[1], rope_embeds)
+        np.testing.assert_array_equal(infer_inputs[2], deepstack_embeds)
+
+    def _make_ambiguous_three_input_worker(self, max_batch_size: int):
+        """A 3-input Qwen3-VL worker whose two trailing shapes are identical.
+
+        Neither discriminator can read this signature -- one deepstack layer,
+        and a pe_size equal to the hidden size -- so `_is_batch_model()` decides
+        the order. That fallback is the only remaining path that can emit the
+        tensors in the wrong slots without raising, since both declared shapes
+        pass every validation check either way, so it needs pinning in both
+        directions: swapping the two branches of the `default` ternary in
+        `_qwen3_vl_text_extra_input_order` has to fail one of these two tests.
+        """
+
+        worker = self._make_worker()
+        worker.max_batch_size = max_batch_size
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.cache_model = SimpleNamespace(
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(
+                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 4), (1, -1, 4)]
+            ),
+        )
+        return worker
+
+    def test_build_infer_inputs_falls_back_to_nonbatch_order_when_shapes_are_ambiguous(self) -> None:
+        worker = self._make_ambiguous_three_input_worker(max_batch_size=1)
+        input_embeds = np.ones((5, 4), dtype=np.float32)
+        rope_embeds = np.full((1, 5, 4), 2.0, dtype=np.float32)
+        deepstack_embeds = np.full((1, 5, 4), 3.0, dtype=np.float32)
+
+        infer_inputs = worker._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
+
+        np.testing.assert_array_equal(infer_inputs[1], deepstack_embeds)
+        np.testing.assert_array_equal(infer_inputs[2], rope_embeds)
+
+    def test_build_infer_inputs_falls_back_to_batch_order_when_shapes_are_ambiguous(self) -> None:
+        worker = self._make_ambiguous_three_input_worker(max_batch_size=16)
+        input_embeds = np.ones((5, 4), dtype=np.float32)
+        rope_embeds = np.full((1, 5, 4), 2.0, dtype=np.float32)
+        deepstack_embeds = np.full((1, 5, 4), 3.0, dtype=np.float32)
+
+        infer_inputs = worker._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
+
         np.testing.assert_array_equal(infer_inputs[1], rope_embeds)
         np.testing.assert_array_equal(infer_inputs[2], deepstack_embeds)
 
