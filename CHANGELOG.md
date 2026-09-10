@@ -16,8 +16,13 @@
   layer) -- and the same answer drives both validation and the order the
   tensors are emitted in. Classifying one way while emitting the other would
   have put RoPE in the deepstack slot and returned wrong logits with no error.
-  A signature neither discriminator can read still falls back to the shipped
-  positional order, so shipped artifacts are unchanged.
+  A signature neither discriminator can read -- a single-layer deepstack whose
+  declared size the rope input shares -- still falls back to the positional
+  order for the model kind, so shipped artifacts are unchanged. That fallback
+  remains the one path that can emit the two tensors in the wrong slots without
+  raising, because the declared shapes are then identical and every validation
+  check passes either way; it now logs a warning once per worker naming the
+  shapes it could not tell apart.
 
 ## 0.2.2
 

@@ -144,6 +144,38 @@ class TestEmittedOrderMatchesDeclaration:
         np.testing.assert_allclose(out[expect_ds_at], deep)
 
 
+class TestAmbiguousSignatureIsReported:
+    """The fallback is the one path that can emit wrong slots without raising.
+
+    Nothing downstream can catch it -- the declared shapes are identical, so
+    every validation check passes either way -- which leaves the log as the only
+    way to find out. It has to fire, and it has to fire only once: this runs on
+    every decode step.
+    """
+
+    AMBIGUOUS = ((1, -1, HIDDEN), (1, -1, HIDDEN))
+
+    def test_warns_once_for_an_unreadable_signature(self, caplog) -> None:
+        w = _worker((INPUT_SHAPE, *self.AMBIGUOUS), is_batch=True)
+        w._warned_ambiguous_extra_input_order = False
+        with caplog.at_level("WARNING"):
+            for _ in range(3):
+                assert w._qwen3_vl_text_extra_input_order(
+                    [INPUT_SHAPE, *self.AMBIGUOUS], HIDDEN
+                ) == ("rope", "deepstack")
+        warnings = [r for r in caplog.records if "cannot be" in r.getMessage()]
+        assert len(warnings) == 1, f"expected one warning, got {len(warnings)}"
+        assert "(1, -1, 4096)" in warnings[0].getMessage()
+
+    @pytest.mark.parametrize("tails", [(ROPE_SHAPE, DEEPSTACK_SHAPE), (DEEPSTACK_SHAPE, ROPE_SHAPE)])
+    def test_stays_quiet_when_the_shapes_decide(self, tails, caplog) -> None:
+        w = _worker((INPUT_SHAPE, *tails), is_batch=True)
+        w._warned_ambiguous_extra_input_order = False
+        with caplog.at_level("WARNING"):
+            w._qwen3_vl_text_extra_input_order([INPUT_SHAPE, *tails], HIDDEN)
+        assert [r for r in caplog.records if "cannot be" in r.getMessage()] == []
+
+
 class TestPathsAgree:
     def test_both_builders_pick_the_same_order(self) -> None:
         # Compare full shapes, not just the last axis: text_input and deepstack

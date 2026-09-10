@@ -395,6 +395,7 @@ class MbltWorker(WorkerBase):
             os.getenv("VLLM_MBLT_ENABLE_SAMPLING_PENALTIES")
         )
         self._warned_penalties_disabled = False
+        self._warned_ambiguous_extra_input_order = False
 
     def _log_init_stage(self, stage: str, start_time: Optional[float] = None, **fields: object) -> None:
         payload = {
@@ -1293,11 +1294,10 @@ class MbltWorker(WorkerBase):
         return len(self._cache_model_input_shapes(self._get_cache_model())) >= 3
 
     @staticmethod
-    def _detect_qwen3_vl_tail_order(
+    def _classify_qwen3_vl_tail_order(
         tail_shapes: Sequence[Sequence[int]],
         hidden_size: int,
-        default: tuple[str, str],
-    ) -> tuple[str, str]:
+    ) -> Optional[tuple[str, str]]:
         """Classify the two trailing text-MXQ inputs as rope / deepstack.
 
         Two discriminators, strongest first:
@@ -1316,18 +1316,19 @@ class MbltWorker(WorkerBase):
         and deepstack declaring a dynamic hidden axis -- gets actively inverted
         and the reliable test never runs.
 
-        What neither can tell apart -- a single-layer deepstack whose declared
-        size the rope input shares, say -- falls back to `default`, so shipped
-        artifacts keep their behaviour exactly.
+        Returns None for what neither can tell apart -- a single-layer deepstack
+        whose declared size the rope input shares, say. Callers decide what to
+        do with an unreadable signature; None is deliberately not the positional
+        guess, so that choice is theirs to make and to report.
         """
 
         if len(tail_shapes) != 2 or hidden_size <= 0:
-            return default
+            return None
         # A rank-0 shape cannot be classified. Leave it to the rank checks that
         # follow in the callers, which say what is wrong with the signature --
         # indexing into it here would replace that with a bare IndexError.
         if any(len(shape) < 1 for shape in tail_shapes):
-            return default
+            return None
 
         holds_layers = tuple(int(shape[0]) > 1 for shape in tail_shapes)
         if holds_layers == (True, False):
@@ -1343,7 +1344,19 @@ class MbltWorker(WorkerBase):
             return ("deepstack", "rope")
         if matches_hidden == (False, True):
             return ("rope", "deepstack")
-        return default
+        return None
+
+    @classmethod
+    def _detect_qwen3_vl_tail_order(
+        cls,
+        tail_shapes: Sequence[Sequence[int]],
+        hidden_size: int,
+        default: tuple[str, str],
+    ) -> tuple[str, str]:
+        """`_classify_qwen3_vl_tail_order`, with `default` for an unreadable pair."""
+
+        classified = cls._classify_qwen3_vl_tail_order(tail_shapes, hidden_size)
+        return default if classified is None else classified
 
     def _qwen3_vl_text_extra_input_order(
         self,
@@ -1370,7 +1383,24 @@ class MbltWorker(WorkerBase):
         default = ("rope", "deepstack") if self._is_batch_model() else ("deepstack", "rope")
         if len(input_shapes) < 3:
             return default
-        return self._detect_qwen3_vl_tail_order(input_shapes[1:3], hidden_size, default)
+        classified = self._classify_qwen3_vl_tail_order(input_shapes[1:3], hidden_size)
+        if classified is not None:
+            return classified
+        # Unreadable, so the positional guess decides -- and this is the one path
+        # that can put the tensors in the wrong slots without raising: the two
+        # declared shapes are indistinguishable, so every validation check below
+        # passes either way. Say so once per worker; this runs every decode step.
+        if not getattr(self, "_warned_ambiguous_extra_input_order", False):
+            logger.warning(
+                "Qwen3-VL 3-input text MXQ declares rope and deepstack shapes that cannot be "
+                "told apart (%s, %s). Assuming %s, the order shipped for this model kind. If "
+                "this artifact wants the other order, the logits will be wrong with no error.",
+                tuple(input_shapes[1]),
+                tuple(input_shapes[2]),
+                default,
+            )
+            self._warned_ambiguous_extra_input_order = True
+        return default
 
     def _build_infer_inputs(
         self,
