@@ -25,10 +25,21 @@ INPUT_SHAPE = (1, -1, HIDDEN)
 
 
 def _worker(input_shapes, *, is_batch):
-    """A MbltWorker with just enough wired up to exercise the input builders."""
+    """A MbltWorker with just enough wired up to exercise the input builders.
+
+    Fakes the accelerator handle, the way the other builder tests do, rather
+    than shadowing `_cache_model_input_shapes`: that keeps the real reader in
+    the path, including the `except Exception: return []` that decides what the
+    builders see when a shape query fails.
+    """
+
     w = MbltWorker.__new__(MbltWorker)
-    w._cache_model_input_shapes = lambda _model: list(input_shapes)
-    w._get_cache_model = lambda: SimpleNamespace()
+    w.cache_model = SimpleNamespace(
+        get_num_model_variants=lambda: 1,
+        get_model_variant_handle=lambda _idx: SimpleNamespace(
+            get_model_input_shape=lambda: [tuple(shape) for shape in input_shapes]
+        ),
+    )
     w._is_batch_model = lambda: is_batch
     w._supports_deepstack_input = lambda: True
     return w
@@ -142,6 +153,33 @@ class TestEmittedOrderMatchesDeclaration:
         expect_ds_at = 2 if expect_rope_at == 1 else 1
         np.testing.assert_allclose(out[expect_rope_at], rope)
         np.testing.assert_allclose(out[expect_ds_at], deep)
+
+
+class TestShapeQueryFailure:
+    def test_a_failing_shape_query_degrades_to_the_text_input_alone(self) -> None:
+        # The real reader swallows every exception and returns []. Both builders
+        # have to take the len < 2 path then, rather than index a list they
+        # believe has three entries -- the hazard a3e29cc removed by threading
+        # the caller's shapes through instead of re-reading them.
+        def boom():
+            raise RuntimeError("accelerator handle is gone")
+
+        emb, deep, rope = _embeds()
+        for is_batch in (True, False):
+            w = _worker((INPUT_SHAPE, ROPE_SHAPE, DEEPSTACK_SHAPE), is_batch=is_batch)
+            w.cache_model = SimpleNamespace(get_num_model_variants=boom)
+
+            single = w._build_infer_inputs(emb, deep, rope)
+            assert isinstance(single, np.ndarray)
+            np.testing.assert_allclose(single, np.expand_dims(emb, 0))
+
+            # The batch builder rejects deepstack tensors for a model that
+            # declares no deepstack input, which is what [] now looks like...
+            with pytest.raises(RuntimeError, match="require a dual-input Qwen3-VL MXQ"):
+                w._build_batch_infer_inputs([emb], [deep], [rope])
+            # ...and emits the text input alone when none are supplied.
+            batch = w._build_batch_infer_inputs([emb], [None], [rope])
+            assert len(batch) == 1
 
 
 class TestAmbiguousSignatureIsReported:
