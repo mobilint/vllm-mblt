@@ -1373,11 +1373,11 @@ class MbltWorker(WorkerBase):
         against the shipped Batch16 order. So the declared shapes decide, and
         these defaults are consulted only for a signature they cannot read.
 
-        Both arguments are required, and `input_shapes` is the list the caller
-        already read: re-reading it here would go through
-        `_cache_model_input_shapes`, which swallows every exception and returns
-        `[]`, so a transient failure would silently hand back the positional
-        default while the caller still indexes a 3-entry list.
+        `input_shapes` is the list the caller already read, and is required:
+        re-reading it here would go through `_cache_model_input_shapes`, which
+        swallows every exception and returns `[]`, so a transient failure would
+        hand back the positional default while the caller still indexes a
+        3-entry list.
         """
 
         default = ("rope", "deepstack") if self._is_batch_model() else ("deepstack", "rope")
@@ -1402,6 +1402,29 @@ class MbltWorker(WorkerBase):
             self._warned_ambiguous_extra_input_order = True
         return default
 
+    def _qwen3_vl_text_extra_input_layout(
+        self,
+        input_shapes: Sequence[Sequence[int]],
+        hidden_size: int,
+    ) -> tuple[tuple[str, str], Optional[Sequence[int]], Sequence[int]]:
+        """Resolve (order, rope_shape, deepstack_shape) for a text MXQ signature.
+
+        Both builders need the same three answers from the same shapes, and the
+        order must be the one they later emit in: classifying one way and
+        emitting the other would put RoPE in the deepstack slot and produce
+        wrong logits with no error. Deriving all three here is what keeps them
+        from drifting apart.
+
+        A 2-input signature has no rope input, so rope_shape is None and the
+        order is unused.
+        """
+
+        if len(input_shapes) < 3:
+            return ("rope", "deepstack"), None, input_shapes[1]
+        order = self._qwen3_vl_text_extra_input_order(input_shapes, hidden_size)
+        shapes = dict(zip(order, input_shapes[1:3]))
+        return order, shapes["rope"], shapes["deepstack"]
+
     def _build_infer_inputs(
         self,
         input_embeds: np.ndarray,
@@ -1419,18 +1442,9 @@ class MbltWorker(WorkerBase):
             return batched_input
 
         uses_rope_input = len(input_shapes) >= 3
-        extra_input_order: tuple[str, str] = ("rope", "deepstack")
-        if uses_rope_input:
-            extra_input_order = self._qwen3_vl_text_extra_input_order(
-                input_shapes, int(input_embeds.shape[-1])
-            )
-            first_extra, second_extra = extra_input_order
-            extra_shapes = {first_extra: input_shapes[1], second_extra: input_shapes[2]}
-            rope_shape = extra_shapes["rope"]
-            deepstack_shape = extra_shapes["deepstack"]
-        else:
-            rope_shape = None
-            deepstack_shape = input_shapes[1]
+        extra_input_order, rope_shape, deepstack_shape = self._qwen3_vl_text_extra_input_layout(
+            input_shapes, int(input_embeds.shape[-1])
+        )
         if uses_rope_input:
             if rope_embeds is None:
                 raise RuntimeError("Qwen3-VL 3-input text MXQ requires RoPE embeddings.")
@@ -1552,22 +1566,9 @@ class MbltWorker(WorkerBase):
         hidden_size = int(concat_input.shape[-1])
         packed_tokens = int(concat_input.shape[0])
         uses_rope_input = len(input_shapes) >= 3
-        # The 3-input batch layout is [inputs, rope, deepstack] for the MXQs shipped
-        # so far, but the compiler does not guarantee that order: a rebuild can emit
-        # [inputs, deepstack, rope] instead. Let the declared shapes decide, and use
-        # the same answer for validation and for the order the tensors are emitted in
-        # -- classifying one way and emitting the other would put RoPE in the
-        # deepstack slot and produce wrong logits with no error.
-        extra_input_order: tuple[str, str] = ("rope", "deepstack")
-        if uses_rope_input:
-            extra_input_order = self._qwen3_vl_text_extra_input_order(input_shapes, hidden_size)
-            first_extra, second_extra = extra_input_order
-            extra_shapes = {first_extra: input_shapes[1], second_extra: input_shapes[2]}
-            rope_shape = extra_shapes["rope"]
-            deepstack_shape = extra_shapes["deepstack"]
-        else:
-            rope_shape = None
-            deepstack_shape = input_shapes[1]
+        extra_input_order, rope_shape, deepstack_shape = self._qwen3_vl_text_extra_input_layout(
+            input_shapes, hidden_size
+        )
         if uses_rope_input:
             if rope_embeds_batch is None:
                 raise RuntimeError("Qwen3-VL 3-input batch text MXQ requires batched RoPE embeddings.")
