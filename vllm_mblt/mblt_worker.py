@@ -1309,8 +1309,12 @@ class MbltWorker(WorkerBase):
 
         if len(tail_shapes) != 2 or hidden_size <= 0:
             return default
+        # A rank-0 shape cannot be classified. Leave it to the rank checks that
+        # follow in the callers, which say what is wrong with the signature --
+        # indexing shape[-1] here would replace that with a bare IndexError.
         matches_hidden = tuple(
-            int(shape[-1]) > 0 and int(shape[-1]) == hidden_size for shape in tail_shapes
+            len(shape) >= 1 and int(shape[-1]) > 0 and int(shape[-1]) == hidden_size
+            for shape in tail_shapes
         )
         if matches_hidden == (True, False):
             return ("deepstack", "rope")
@@ -1318,20 +1322,27 @@ class MbltWorker(WorkerBase):
             return ("rope", "deepstack")
         return default
 
-    def _qwen3_vl_text_extra_input_order(self, hidden_size: Optional[int] = None) -> tuple[str, str]:
+    def _qwen3_vl_text_extra_input_order(
+        self,
+        input_shapes: Sequence[Sequence[int]],
+        hidden_size: int,
+    ) -> tuple[str, str]:
         """Return the Qwen3-VL 3-input text MXQ extra-input order.
 
         mblt-model-zoo 2.3.0 ships different 3-input signatures for dynamic
         Qwen3-VL text artifacts: non-batch uses [inputs, deepstack, rope],
         while Batch16 uses [inputs, rope, deepstack]. The compiler does not
-        guarantee either, so when `hidden_size` is known the declared shapes
-        decide and the positional convention is only the fallback.
+        guarantee either, so the declared shapes decide and the positional
+        convention is only the fallback.
+
+        Both arguments are required, and `input_shapes` is the list the caller
+        already read: re-reading it here would go through
+        `_cache_model_input_shapes`, which swallows every exception and returns
+        `[]`, so a transient failure would silently hand back the positional
+        default while the caller still indexes a 3-entry list.
         """
 
         default = ("rope", "deepstack") if self._is_batch_model() else ("deepstack", "rope")
-        if hidden_size is None:
-            return default
-        input_shapes = self._cache_model_input_shapes(self._get_cache_model())
         if len(input_shapes) < 3:
             return default
         return self._detect_qwen3_vl_tail_order(input_shapes[1:3], hidden_size, default)
@@ -1355,7 +1366,9 @@ class MbltWorker(WorkerBase):
         uses_rope_input = len(input_shapes) >= 3
         extra_input_order: tuple[str, str] = ("rope", "deepstack")
         if uses_rope_input:
-            extra_input_order = self._qwen3_vl_text_extra_input_order(int(input_embeds.shape[-1]))
+            extra_input_order = self._qwen3_vl_text_extra_input_order(
+                input_shapes, int(input_embeds.shape[-1])
+            )
             first_extra, second_extra = extra_input_order
             extra_shapes = {first_extra: input_shapes[1], second_extra: input_shapes[2]}
             rope_shape = extra_shapes["rope"]
@@ -1492,7 +1505,7 @@ class MbltWorker(WorkerBase):
         # deepstack slot and produce wrong logits with no error.
         extra_input_order: tuple[str, str] = ("rope", "deepstack")
         if uses_rope_input:
-            extra_input_order = self._qwen3_vl_text_extra_input_order(hidden_size)
+            extra_input_order = self._qwen3_vl_text_extra_input_order(input_shapes, hidden_size)
             first_extra, second_extra = extra_input_order
             extra_shapes = {first_extra: input_shapes[1], second_extra: input_shapes[2]}
             rope_shape = extra_shapes["rope"]

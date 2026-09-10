@@ -78,42 +78,51 @@ class TestDetectTailOrder:
         assert order == ("rope", "deepstack")
 
 
+@pytest.mark.parametrize("is_batch", [True, False])
 @pytest.mark.parametrize(
     "tail_shapes, expect_rope_at",
     [((ROPE_SHAPE, DEEPSTACK_SHAPE), 1), ((DEEPSTACK_SHAPE, ROPE_SHAPE), 2)],
 )
 class TestEmittedOrderMatchesDeclaration:
-    """The detected order must drive the returned tensors, not just validation."""
+    """The detected order must drive the returned tensors, not just validation.
 
-    def test_batch_path(self, tail_shapes, expect_rope_at) -> None:
-        w = _worker((INPUT_SHAPE, *tail_shapes), is_batch=True)
+    Parametrized over `is_batch` as well: the two model kinds carry different
+    positional defaults, and detection has to win over both.
+    """
+
+    def test_batch_path(self, tail_shapes, expect_rope_at, is_batch) -> None:
+        w = _worker((INPUT_SHAPE, *tail_shapes), is_batch=is_batch)
         emb, deep, rope = _embeds()
         out = w._build_batch_infer_inputs([emb], [deep], [rope])
         assert len(out) == 3
         expect_ds_at = 2 if expect_rope_at == 1 else 1
-        assert out[expect_rope_at].shape[-1] == PE
-        assert out[expect_ds_at].shape[-1] == HIDDEN
         np.testing.assert_allclose(out[expect_rope_at], rope)
         np.testing.assert_allclose(out[expect_ds_at], deep)
 
-    def test_single_request_path(self, tail_shapes, expect_rope_at) -> None:
-        w = _worker((INPUT_SHAPE, *tail_shapes), is_batch=True)
+    def test_single_request_path(self, tail_shapes, expect_rope_at, is_batch) -> None:
+        w = _worker((INPUT_SHAPE, *tail_shapes), is_batch=is_batch)
         emb, deep, rope = _embeds()
         out = w._build_infer_inputs(emb, deep, rope)
         assert len(out) == 3
         expect_ds_at = 2 if expect_rope_at == 1 else 1
-        assert out[expect_rope_at].shape[-1] == PE
-        assert out[expect_ds_at].shape[-1] == HIDDEN
+        np.testing.assert_allclose(out[expect_rope_at], rope)
+        np.testing.assert_allclose(out[expect_ds_at], deep)
 
 
 class TestPathsAgree:
     def test_both_builders_pick_the_same_order(self) -> None:
+        # Compare full shapes, not just the last axis: text_input and deepstack
+        # both end in HIDDEN, so a builder that swapped slot 0 with the deepstack
+        # slot would pass a last-axis-only assertion.
         for tail in ((ROPE_SHAPE, DEEPSTACK_SHAPE), (DEEPSTACK_SHAPE, ROPE_SHAPE)):
             for is_batch in (True, False):
                 w = _worker((INPUT_SHAPE, *tail), is_batch=is_batch)
                 emb, deep, rope = _embeds()
                 batch_out = w._build_batch_infer_inputs([emb], [deep], [rope])
                 single_out = w._build_infer_inputs(emb, deep, rope)
-                assert [t.shape[-1] for t in batch_out] == [t.shape[-1] for t in single_out], (
+                assert [tuple(t.shape) for t in batch_out] == [tuple(t.shape) for t in single_out], (
                     f"batch and single-request paths disagree for tail={tail}, is_batch={is_batch}"
                 )
+                # slot 0 is always the text input, in both builders
+                np.testing.assert_allclose(batch_out[0], np.expand_dims(emb, 0))
+                np.testing.assert_allclose(single_out[0], np.expand_dims(emb, 0))
