@@ -129,11 +129,6 @@ class MbltTracer:
         """Whether qbruntime is currently recording into this tracer's file."""
         return self._running
 
-    @property
-    def path(self) -> Optional[str]:
-        """The file the current or most recent window writes to."""
-        return self._path
-
     def _get_backend(self) -> Any:
         if self._backend is None:
             self._backend = load_backend()
