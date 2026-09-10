@@ -1300,25 +1300,46 @@ class MbltWorker(WorkerBase):
     ) -> tuple[str, str]:
         """Classify the two trailing text-MXQ inputs as rope / deepstack.
 
-        Deepstack's last axis is the hidden size; rope's is pe_size. A negative
-        (dynamic) axis is unknown and never counts as a match, so an artifact we
-        cannot tell apart -- including one whose pe_size happens to equal the
-        hidden size -- falls back to `default` and keeps the previous behaviour
-        exactly.
+        Two independent discriminators, tried in that order:
+
+        * the last axis -- deepstack's is the hidden size, rope's is pe_size;
+        * the leading axis -- deepstack's is its layer count, which both callers
+          require to be fixed and positive, while rope's must be 1 or dynamic.
+          So a leading axis greater than 1 can only be deepstack.
+
+        The leading axis settles the two signatures the last axis cannot read: a
+        deepstack input declaring a dynamic hidden axis, and an artifact whose
+        pe_size happens to equal the hidden size. Both used to fall back to the
+        positional guess, which then failed validation on the very artifacts
+        this classification exists to accept.
+
+        What neither can tell apart -- a single-layer deepstack whose hidden size
+        the rope input shares, say -- still falls back to `default`, so shipped
+        artifacts keep their behaviour exactly.
         """
 
         if len(tail_shapes) != 2 or hidden_size <= 0:
             return default
         # A rank-0 shape cannot be classified. Leave it to the rank checks that
         # follow in the callers, which say what is wrong with the signature --
-        # indexing shape[-1] here would replace that with a bare IndexError.
+        # indexing into it here would replace that with a bare IndexError.
+        if any(len(shape) < 1 for shape in tail_shapes):
+            return default
+
         matches_hidden = tuple(
-            len(shape) >= 1 and int(shape[-1]) > 0 and int(shape[-1]) == hidden_size
-            for shape in tail_shapes
+            int(shape[-1]) > 0 and int(shape[-1]) == hidden_size for shape in tail_shapes
         )
         if matches_hidden == (True, False):
             return ("deepstack", "rope")
         if matches_hidden == (False, True):
+            return ("rope", "deepstack")
+
+        # The last axis was unreadable on both tails; the leading axis is
+        # independent of it and only deepstack may declare more than one layer.
+        holds_layers = tuple(int(shape[0]) > 1 for shape in tail_shapes)
+        if holds_layers == (True, False):
+            return ("deepstack", "rope")
+        if holds_layers == (False, True):
             return ("rope", "deepstack")
         return default
 
@@ -1329,11 +1350,13 @@ class MbltWorker(WorkerBase):
     ) -> tuple[str, str]:
         """Return the Qwen3-VL 3-input text MXQ extra-input order.
 
-        mblt-model-zoo 2.3.0 ships different 3-input signatures for dynamic
-        Qwen3-VL text artifacts: non-batch uses [inputs, deepstack, rope],
-        while Batch16 uses [inputs, rope, deepstack]. The compiler does not
-        guarantee either, so the declared shapes decide and the positional
-        convention is only the fallback.
+        The positional fallback records only what mblt-model-zoo 2.3.0 happened
+        to ship: non-batch [inputs, deepstack, rope], Batch16 [inputs, rope,
+        deepstack]. The compiler guarantees neither -- the reference Batch16
+        rebuild this classification was written against declares
+        [(1,-1,4096), (3,-1,4096), (1,-1,256)], i.e. deepstack before rope,
+        against the shipped Batch16 order. So the declared shapes decide, and
+        these defaults are consulted only for a signature they cannot read.
 
         Both arguments are required, and `input_shapes` is the list the caller
         already read: re-reading it here would go through

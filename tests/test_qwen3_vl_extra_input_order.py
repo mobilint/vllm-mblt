@@ -55,21 +55,33 @@ class TestDetectTailOrder:
         )
         assert order == ("deepstack", "rope")
 
-    def test_dynamic_last_axis_falls_back_to_default(self) -> None:
-        # A deepstack input with a dynamic hidden axis cannot be classified.
-        # Falling back keeps whatever the positional convention already did.
+    def test_dynamic_hidden_axis_resolved_by_leading_axis(self) -> None:
+        # The last axis is unreadable (dynamic hidden), so the leading axis
+        # decides: only deepstack may declare more than one layer. The default
+        # is the *wrong* answer here, so this fails if detection falls back.
         order = MbltWorker._detect_qwen3_vl_tail_order(
-            [(LAYERS, -1, -1), ROPE_SHAPE], HIDDEN, ("deepstack", "rope")
+            [(LAYERS, -1, -1), ROPE_SHAPE], HIDDEN, ("rope", "deepstack")
         )
         assert order == ("deepstack", "rope")
 
-    def test_pe_size_equal_to_hidden_falls_back_to_default(self) -> None:
-        # Ambiguous: both tails end in hidden_size. Guessing here would flip
-        # artifacts the positional convention already handled correctly.
+    def test_pe_size_equal_to_hidden_resolved_by_leading_axis(self) -> None:
+        # Both tails end in hidden_size, so the last axis cannot separate them.
+        # The leading axis still can, and again the default disagrees.
         order = MbltWorker._detect_qwen3_vl_tail_order(
-            [(1, -1, HIDDEN), DEEPSTACK_SHAPE], HIDDEN, ("rope", "deepstack")
+            [(1, -1, HIDDEN), DEEPSTACK_SHAPE], HIDDEN, ("deepstack", "rope")
         )
         assert order == ("rope", "deepstack")
+
+    @pytest.mark.parametrize("default", [("rope", "deepstack"), ("deepstack", "rope")])
+    def test_unreadable_on_both_axes_falls_back_to_default(self, default) -> None:
+        # A single-layer deepstack sharing the rope input's declared size is
+        # genuinely indistinguishable: neither axis separates the two. Guessing
+        # would flip artifacts the positional convention already handled, so the
+        # fallback has to win -- whichever way it points.
+        order = MbltWorker._detect_qwen3_vl_tail_order(
+            [(1, -1, HIDDEN), (1, -1, HIDDEN)], HIDDEN, default
+        )
+        assert order == default
 
     def test_two_input_layout_is_left_alone(self) -> None:
         order = MbltWorker._detect_qwen3_vl_tail_order(
@@ -81,7 +93,13 @@ class TestDetectTailOrder:
 @pytest.mark.parametrize("is_batch", [True, False])
 @pytest.mark.parametrize(
     "tail_shapes, expect_rope_at",
-    [((ROPE_SHAPE, DEEPSTACK_SHAPE), 1), ((DEEPSTACK_SHAPE, ROPE_SHAPE), 2)],
+    [
+        ((ROPE_SHAPE, DEEPSTACK_SHAPE), 1),
+        ((DEEPSTACK_SHAPE, ROPE_SHAPE), 2),
+        # Dynamic hidden axis: classified by the leading axis, and emitted
+        # end-to-end -- not just resolved by the detection helper in isolation.
+        (((LAYERS, -1, -1), ROPE_SHAPE), 2),
+    ],
 )
 class TestEmittedOrderMatchesDeclaration:
     """The detected order must drive the returned tensors, not just validation.

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The 3-input Qwen3-VL text MXQ no longer assumes a fixed order for its two
+  trailing inputs. `_build_infer_inputs` and `_build_batch_infer_inputs` read
+  `input_shapes[1]`/`[2]` positionally, which holds for the MXQs shipped so far
+  but is not something the compiler guarantees: a rebuild of the same model can
+  declare `[inputs, deepstack, rope]`, and serving one failed with
+  `RuntimeError: 3-input Qwen3-VL batch text MXQ rope batch dimension must be
+  1, got (3, -1, 4096).` The two inputs are now classified from their declared
+  shapes -- by the last axis (deepstack's is the hidden size) and, when that is
+  unreadable, by the leading axis (only deepstack may declare more than one
+  layer) -- and the same answer drives both validation and the order the
+  tensors are emitted in. Classifying one way while emitting the other would
+  have put RoPE in the deepstack slot and returned wrong logits with no error.
+  A signature neither discriminator can read still falls back to the shipped
+  positional order, so shipped artifacts are unchanged.
+
 ## 0.2.2
 
 ### Fixed
