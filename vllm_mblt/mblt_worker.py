@@ -4,7 +4,7 @@ import os
 import statistics
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -395,6 +395,7 @@ class MbltWorker(WorkerBase):
             os.getenv("VLLM_MBLT_ENABLE_SAMPLING_PENALTIES")
         )
         self._warned_penalties_disabled = False
+        self._warned_ambiguous_extra_input_order = False
 
     def _log_init_stage(self, stage: str, start_time: Optional[float] = None, **fields: object) -> None:
         payload = {
@@ -1292,17 +1293,137 @@ class MbltWorker(WorkerBase):
             return False
         return len(self._cache_model_input_shapes(self._get_cache_model())) >= 3
 
-    def _qwen3_vl_text_extra_input_order(self) -> tuple[str, str]:
-        """Return the Qwen3-VL 3-input text MXQ extra-input order.
+    @staticmethod
+    def _classify_qwen3_vl_tail_order(
+        tail_shapes: Sequence[Sequence[int]],
+        hidden_size: int,
+    ) -> Optional[tuple[str, str]]:
+        """Classify the two trailing text-MXQ inputs as rope / deepstack.
 
-        mblt-model-zoo 2.3.0 ships different 3-input signatures for dynamic
-        Qwen3-VL text artifacts: non-batch uses [inputs, deepstack, rope],
-        while Batch16 uses [inputs, rope, deepstack].
+        Two discriminators, strongest first:
+
+        * the leading axis -- deepstack's is its layer count, which both callers
+          require to be fixed and positive, while rope's must be 1 or dynamic.
+          A leading axis greater than 1 therefore cannot be rope. This holds
+          unconditionally.
+        * the last axis -- deepstack's is the hidden size, rope's is pe_size.
+          Weaker, because rope satisfies it too whenever pe_size == hidden_size,
+          so it is consulted only when the leading axis is 1 or dynamic on both
+          tails and cannot separate them.
+
+        The order is the point. With the weak test first, a pair combining the
+        two signatures it cannot read -- rope declaring pe_size == hidden_size
+        and deepstack declaring a dynamic hidden axis -- gets actively inverted
+        and the reliable test never runs.
+
+        Returns None for what neither can tell apart -- a single-layer deepstack
+        whose declared size the rope input shares, say. Callers decide what to
+        do with an unreadable signature; None is deliberately not the positional
+        guess, so that choice is theirs to make and to report.
         """
 
-        if self._is_batch_model():
+        if len(tail_shapes) != 2 or hidden_size <= 0:
+            return None
+        # A rank-0 shape cannot be classified. Leave it to the rank checks that
+        # follow in the callers, which say what is wrong with the signature --
+        # indexing into it here would replace that with a bare IndexError.
+        if any(len(shape) < 1 for shape in tail_shapes):
+            return None
+
+        holds_layers = tuple(int(shape[0]) > 1 for shape in tail_shapes)
+        if holds_layers == (True, False):
+            return ("deepstack", "rope")
+        if holds_layers == (False, True):
             return ("rope", "deepstack")
-        return ("deepstack", "rope")
+
+        # Both leading axes are 1 or dynamic, so fall through to the weaker test.
+        matches_hidden = tuple(
+            int(shape[-1]) > 0 and int(shape[-1]) == hidden_size for shape in tail_shapes
+        )
+        if matches_hidden == (True, False):
+            return ("deepstack", "rope")
+        if matches_hidden == (False, True):
+            return ("rope", "deepstack")
+        return None
+
+    @classmethod
+    def _detect_qwen3_vl_tail_order(
+        cls,
+        tail_shapes: Sequence[Sequence[int]],
+        hidden_size: int,
+        default: tuple[str, str],
+    ) -> tuple[str, str]:
+        """`_classify_qwen3_vl_tail_order`, with `default` for an unreadable pair."""
+
+        classified = cls._classify_qwen3_vl_tail_order(tail_shapes, hidden_size)
+        return default if classified is None else classified
+
+    def _qwen3_vl_text_extra_input_order(
+        self,
+        input_shapes: Sequence[Sequence[int]],
+        hidden_size: int,
+    ) -> tuple[str, str]:
+        """Return the Qwen3-VL 3-input text MXQ extra-input order.
+
+        The positional fallback records only what mblt-model-zoo 2.3.0 happened
+        to ship: non-batch [inputs, deepstack, rope], Batch16 [inputs, rope,
+        deepstack]. The compiler guarantees neither -- the reference Batch16
+        rebuild this classification was written against declares
+        [(1,-1,4096), (3,-1,4096), (1,-1,256)], i.e. deepstack before rope,
+        against the shipped Batch16 order. So the declared shapes decide, and
+        these defaults are consulted only for a signature they cannot read.
+
+        `input_shapes` is the list the caller already read, and is required:
+        re-reading it here would go through `_cache_model_input_shapes`, which
+        swallows every exception and returns `[]`, so a transient failure would
+        hand back the positional default while the caller still indexes a
+        3-entry list.
+        """
+
+        default = ("rope", "deepstack") if self._is_batch_model() else ("deepstack", "rope")
+        if len(input_shapes) < 3:
+            return default
+        classified = self._classify_qwen3_vl_tail_order(input_shapes[1:3], hidden_size)
+        if classified is not None:
+            return classified
+        # Unreadable, so the positional guess decides -- and this is the one path
+        # that can put the tensors in the wrong slots without raising: the two
+        # declared shapes are indistinguishable, so every validation check below
+        # passes either way. Say so once per worker; this runs every decode step.
+        if not getattr(self, "_warned_ambiguous_extra_input_order", False):
+            logger.warning(
+                "Qwen3-VL 3-input text MXQ declares rope and deepstack shapes that cannot be "
+                "told apart (%s, %s). Assuming %s, the order shipped for this model kind. If "
+                "this artifact wants the other order, the logits will be wrong with no error.",
+                tuple(input_shapes[1]),
+                tuple(input_shapes[2]),
+                default,
+            )
+            self._warned_ambiguous_extra_input_order = True
+        return default
+
+    def _qwen3_vl_text_extra_input_layout(
+        self,
+        input_shapes: Sequence[Sequence[int]],
+        hidden_size: int,
+    ) -> tuple[tuple[str, str], Optional[Sequence[int]], Sequence[int]]:
+        """Resolve (order, rope_shape, deepstack_shape) for a text MXQ signature.
+
+        Both builders need the same three answers from the same shapes, and the
+        order must be the one they later emit in: classifying one way and
+        emitting the other would put RoPE in the deepstack slot and produce
+        wrong logits with no error. Deriving all three here is what keeps them
+        from drifting apart.
+
+        A 2-input signature has no rope input, so rope_shape is None and the
+        order is unused.
+        """
+
+        if len(input_shapes) < 3:
+            return ("rope", "deepstack"), None, input_shapes[1]
+        order = self._qwen3_vl_text_extra_input_order(input_shapes, hidden_size)
+        shapes = dict(zip(order, input_shapes[1:3]))
+        return order, shapes["rope"], shapes["deepstack"]
 
     def _build_infer_inputs(
         self,
@@ -1321,14 +1442,9 @@ class MbltWorker(WorkerBase):
             return batched_input
 
         uses_rope_input = len(input_shapes) >= 3
-        if uses_rope_input:
-            first_extra, second_extra = self._qwen3_vl_text_extra_input_order()
-            extra_shapes = {first_extra: input_shapes[1], second_extra: input_shapes[2]}
-            rope_shape = extra_shapes["rope"]
-            deepstack_shape = extra_shapes["deepstack"]
-        else:
-            rope_shape = None
-            deepstack_shape = input_shapes[1]
+        extra_input_order, rope_shape, deepstack_shape = self._qwen3_vl_text_extra_input_layout(
+            input_shapes, int(input_embeds.shape[-1])
+        )
         if uses_rope_input:
             if rope_embeds is None:
                 raise RuntimeError("Qwen3-VL 3-input text MXQ requires RoPE embeddings.")
@@ -1401,7 +1517,7 @@ class MbltWorker(WorkerBase):
                 "rope": rope_embeds.astype(np.float32, copy=False),
                 "deepstack": deepstack_embeds.astype(np.float32, copy=False),
             }
-            return [batched_input, *(extras[name] for name in self._qwen3_vl_text_extra_input_order())]
+            return [batched_input, *(extras[name] for name in extra_input_order)]
         return [batched_input, deepstack_embeds.astype(np.float32, copy=False)]
 
     def _build_batch_infer_inputs(
@@ -1450,8 +1566,9 @@ class MbltWorker(WorkerBase):
         hidden_size = int(concat_input.shape[-1])
         packed_tokens = int(concat_input.shape[0])
         uses_rope_input = len(input_shapes) >= 3
-        rope_shape = input_shapes[1] if uses_rope_input else None
-        deepstack_shape = input_shapes[2] if uses_rope_input else input_shapes[1]
+        extra_input_order, rope_shape, deepstack_shape = self._qwen3_vl_text_extra_input_layout(
+            input_shapes, hidden_size
+        )
         if uses_rope_input:
             if rope_embeds_batch is None:
                 raise RuntimeError("Qwen3-VL 3-input batch text MXQ requires batched RoPE embeddings.")
@@ -1530,11 +1647,11 @@ class MbltWorker(WorkerBase):
                 )
             rope_chunks.append(rope_embeds.astype(np.float32, copy=False))
 
-        return [
-            text_input,
-            np.concatenate(rope_chunks, axis=1),
-            np.concatenate(deepstack_chunks, axis=1),
-        ]
+        extras = {
+            "rope": np.concatenate(rope_chunks, axis=1),
+            "deepstack": np.concatenate(deepstack_chunks, axis=1),
+        }
+        return [text_input, *(extras[name] for name in extra_input_order)]
 
     @staticmethod
     def _last_token_logits(logits: np.ndarray) -> np.ndarray:
