@@ -1450,8 +1450,27 @@ class MbltWorker(WorkerBase):
         hidden_size = int(concat_input.shape[-1])
         packed_tokens = int(concat_input.shape[0])
         uses_rope_input = len(input_shapes) >= 3
-        rope_shape = input_shapes[1] if uses_rope_input else None
-        deepstack_shape = input_shapes[2] if uses_rope_input else input_shapes[1]
+        # The 3-input batch layout is [inputs, rope, deepstack] for the MXQs shipped
+        # so far, but the compiler does not guarantee that order: a rebuild can emit
+        # [inputs, deepstack, rope] instead. Pick the two by shape signature rather
+        # than by position -- rope is the only tail input whose last axis is not the
+        # hidden size. Fall back to the positional choice whenever that is ambiguous,
+        # so shipped artifacts keep their current behaviour exactly.
+        if uses_rope_input:
+            tail = list(input_shapes[1:3])
+            rope_candidates = [s for s in tail if int(s[-1]) != hidden_size]
+            deepstack_candidates = [s for s in tail if int(s[-1]) == hidden_size]
+            rope_shape = (
+                rope_candidates[0] if len(rope_candidates) == 1 else input_shapes[1]
+            )
+            deepstack_shape = (
+                deepstack_candidates[0]
+                if len(deepstack_candidates) == 1
+                else input_shapes[2]
+            )
+        else:
+            rope_shape = None
+            deepstack_shape = input_shapes[1]
         if uses_rope_input:
             if rope_embeds_batch is None:
                 raise RuntimeError("Qwen3-VL 3-input batch text MXQ requires batched RoPE embeddings.")
