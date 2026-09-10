@@ -4,7 +4,7 @@ import os
 import statistics
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -1292,17 +1292,49 @@ class MbltWorker(WorkerBase):
             return False
         return len(self._cache_model_input_shapes(self._get_cache_model())) >= 3
 
-    def _qwen3_vl_text_extra_input_order(self) -> tuple[str, str]:
+    @staticmethod
+    def _detect_qwen3_vl_tail_order(
+        tail_shapes: Sequence[Sequence[int]],
+        hidden_size: int,
+        default: tuple[str, str],
+    ) -> tuple[str, str]:
+        """Classify the two trailing text-MXQ inputs as rope / deepstack.
+
+        Deepstack's last axis is the hidden size; rope's is pe_size. A negative
+        (dynamic) axis is unknown and never counts as a match, so an artifact we
+        cannot tell apart -- including one whose pe_size happens to equal the
+        hidden size -- falls back to `default` and keeps the previous behaviour
+        exactly.
+        """
+
+        if len(tail_shapes) != 2 or hidden_size <= 0:
+            return default
+        matches_hidden = tuple(
+            int(shape[-1]) > 0 and int(shape[-1]) == hidden_size for shape in tail_shapes
+        )
+        if matches_hidden == (True, False):
+            return ("deepstack", "rope")
+        if matches_hidden == (False, True):
+            return ("rope", "deepstack")
+        return default
+
+    def _qwen3_vl_text_extra_input_order(self, hidden_size: Optional[int] = None) -> tuple[str, str]:
         """Return the Qwen3-VL 3-input text MXQ extra-input order.
 
         mblt-model-zoo 2.3.0 ships different 3-input signatures for dynamic
         Qwen3-VL text artifacts: non-batch uses [inputs, deepstack, rope],
-        while Batch16 uses [inputs, rope, deepstack].
+        while Batch16 uses [inputs, rope, deepstack]. The compiler does not
+        guarantee either, so when `hidden_size` is known the declared shapes
+        decide and the positional convention is only the fallback.
         """
 
-        if self._is_batch_model():
-            return ("rope", "deepstack")
-        return ("deepstack", "rope")
+        default = ("rope", "deepstack") if self._is_batch_model() else ("deepstack", "rope")
+        if hidden_size is None:
+            return default
+        input_shapes = self._cache_model_input_shapes(self._get_cache_model())
+        if len(input_shapes) < 3:
+            return default
+        return self._detect_qwen3_vl_tail_order(input_shapes[1:3], hidden_size, default)
 
     def _build_infer_inputs(
         self,
@@ -1321,8 +1353,10 @@ class MbltWorker(WorkerBase):
             return batched_input
 
         uses_rope_input = len(input_shapes) >= 3
+        extra_input_order: tuple[str, str] = ("rope", "deepstack")
         if uses_rope_input:
-            first_extra, second_extra = self._qwen3_vl_text_extra_input_order()
+            extra_input_order = self._qwen3_vl_text_extra_input_order(int(input_embeds.shape[-1]))
+            first_extra, second_extra = extra_input_order
             extra_shapes = {first_extra: input_shapes[1], second_extra: input_shapes[2]}
             rope_shape = extra_shapes["rope"]
             deepstack_shape = extra_shapes["deepstack"]
@@ -1401,7 +1435,7 @@ class MbltWorker(WorkerBase):
                 "rope": rope_embeds.astype(np.float32, copy=False),
                 "deepstack": deepstack_embeds.astype(np.float32, copy=False),
             }
-            return [batched_input, *(extras[name] for name in self._qwen3_vl_text_extra_input_order())]
+            return [batched_input, *(extras[name] for name in extra_input_order)]
         return [batched_input, deepstack_embeds.astype(np.float32, copy=False)]
 
     def _build_batch_infer_inputs(
@@ -1452,22 +1486,17 @@ class MbltWorker(WorkerBase):
         uses_rope_input = len(input_shapes) >= 3
         # The 3-input batch layout is [inputs, rope, deepstack] for the MXQs shipped
         # so far, but the compiler does not guarantee that order: a rebuild can emit
-        # [inputs, deepstack, rope] instead. Pick the two by shape signature rather
-        # than by position -- rope is the only tail input whose last axis is not the
-        # hidden size. Fall back to the positional choice whenever that is ambiguous,
-        # so shipped artifacts keep their current behaviour exactly.
+        # [inputs, deepstack, rope] instead. Let the declared shapes decide, and use
+        # the same answer for validation and for the order the tensors are emitted in
+        # -- classifying one way and emitting the other would put RoPE in the
+        # deepstack slot and produce wrong logits with no error.
+        extra_input_order: tuple[str, str] = ("rope", "deepstack")
         if uses_rope_input:
-            tail = list(input_shapes[1:3])
-            rope_candidates = [s for s in tail if int(s[-1]) != hidden_size]
-            deepstack_candidates = [s for s in tail if int(s[-1]) == hidden_size]
-            rope_shape = (
-                rope_candidates[0] if len(rope_candidates) == 1 else input_shapes[1]
-            )
-            deepstack_shape = (
-                deepstack_candidates[0]
-                if len(deepstack_candidates) == 1
-                else input_shapes[2]
-            )
+            extra_input_order = self._qwen3_vl_text_extra_input_order(hidden_size)
+            first_extra, second_extra = extra_input_order
+            extra_shapes = {first_extra: input_shapes[1], second_extra: input_shapes[2]}
+            rope_shape = extra_shapes["rope"]
+            deepstack_shape = extra_shapes["deepstack"]
         else:
             rope_shape = None
             deepstack_shape = input_shapes[1]
@@ -1549,11 +1578,11 @@ class MbltWorker(WorkerBase):
                 )
             rope_chunks.append(rope_embeds.astype(np.float32, copy=False))
 
-        return [
-            text_input,
-            np.concatenate(rope_chunks, axis=1),
-            np.concatenate(deepstack_chunks, axis=1),
-        ]
+        extras = {
+            "rope": np.concatenate(rope_chunks, axis=1),
+            "deepstack": np.concatenate(deepstack_chunks, axis=1),
+        }
+        return [text_input, *(extras[name] for name in extra_input_order)]
 
     @staticmethod
     def _last_token_logits(logits: np.ndarray) -> np.ndarray:
