@@ -130,6 +130,42 @@ class TestMbltTracer:
         owner.stop()
         assert other.start() is not None
 
+    def test_start_skips_a_window_already_on_disk(self, tmp_path) -> None:
+        # A pid reused after a restart revisits the whole name series, so the
+        # first candidate can already hold an earlier experiment's trace.
+        stale = tmp_path / f"mblt_trace_0_{os.getpid()}_0.json"
+        stale.write_text("earlier trace")
+        tracer = MbltTracer(str(tmp_path), backend=FakeQbRuntime())
+
+        path = tracer.start()
+
+        assert os.path.basename(path) == f"mblt_trace_0_{os.getpid()}_1.json"
+        assert stale.read_text() == "earlier trace"
+
+    def test_a_second_tracer_in_one_process_does_not_reuse_the_first_path(self, tmp_path) -> None:
+        # Two sequential offline LLM instances build one tracer each; both
+        # start their window counter at zero with the same rank and pid.
+        first = MbltTracer(str(tmp_path), backend=FakeQbRuntime())
+        first_path = first.start()
+        first.stop()
+        # Only the backend writes the log, so stand in for it here.
+        open(first_path, "w").write("first window")
+
+        second = MbltTracer(str(tmp_path), backend=FakeQbRuntime())
+        second_path = second.start()
+
+        assert second_path != first_path
+        assert open(first_path).read() == "first window"
+
+    def test_start_raises_when_the_trace_dir_cannot_be_prepared(self, tmp_path) -> None:
+        blocker = tmp_path / "not_a_dir"
+        blocker.write_text("")
+        tracer = MbltTracer(str(blocker / "traces"), backend=FakeQbRuntime())
+
+        with pytest.raises(RuntimeError, match="Failed to prepare"):
+            tracer.start()
+        assert not tracer.is_running
+
     def test_a_refused_start_raises_without_claiming_the_trace(self, tmp_path) -> None:
         # Reporting success for a trace that will not exist is worse than
         # failing the profile request.

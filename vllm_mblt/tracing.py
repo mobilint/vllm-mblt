@@ -118,18 +118,38 @@ class MbltTracer:
         return self._backend
 
     def trace_path(self, window: Optional[int] = None) -> str:
-        """Return the file the given window (default: the next one) writes to.
+        """Return the file the given window (default: the current one) writes to.
 
-        The pid is part of the name because rank and window alone are not
-        unique across processes: a restarted server starts counting windows at
-        zero again, and two engines sharing one trace directory are both rank
-        0. Either would otherwise hand qbruntime a path that already holds an
-        earlier trace.
+        The pid is in the name so that engines running concurrently in separate
+        processes never pick the same candidate -- two of them are both rank 0
+        when they share a trace directory -- which is what lets
+        `_claim_next_window` settle uniqueness with a plain existence check.
         """
         if window is None:
             window = self._window
         name = f"{TRACE_FILENAME_PREFIX}_{self.rank}_{self.pid}_{window}.json"
         return os.path.join(self.trace_dir, name)
+
+    def _claim_next_window(self) -> str:
+        """Advance past windows already on disk and return the path to write.
+
+        Rank, pid and window do not make a name unique on their own: two
+        tracers built one after another in a process both start counting at
+        zero, and a pid reused after a restart revisits the whole series. Both
+        would hand qbruntime a path that already holds a trace.
+
+        Skipping the names that exist makes overwriting impossible rather than
+        unlikely, and needs no session id in the filename. It is exact rather
+        than racy because a window's file appears when it stops, callers hold
+        the lock, and a tracer cannot start while another one in this process
+        is recording -- so every earlier window of this pid is already on disk
+        by the time the next one is claimed. A window whose stop failed left no
+        file, but its log is gone either way, so reusing that name loses
+        nothing.
+        """
+        while os.path.exists(self.trace_path()):
+            self._window += 1
+        return self.trace_path()
 
     def start(self) -> Optional[str]:
         """Begin a trace window and return the destination path.
@@ -159,9 +179,13 @@ class MbltTracer:
                 )
                 return None
 
-            path = self.trace_path()
             try:
                 os.makedirs(self.trace_dir, exist_ok=True)
+                path = self._claim_next_window()
+            except Exception as e:
+                raise RuntimeError(f"Failed to prepare an MBLT NPU trace in {self.trace_dir}.") from e
+
+            try:
                 started = self._get_backend().start_tracing_events(path)
             except Exception as e:
                 raise RuntimeError(f"Failed to start an MBLT NPU trace at {path}.") from e

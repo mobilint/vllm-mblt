@@ -16,11 +16,12 @@
   each out-of-tree platform points the same hook at its own device profiler.
   `VLLM_TORCH_PROFILER_DIR` stays the switch and the output directory -- no
   MBLT-specific flag or endpoint is added -- and each window writes
-  `mblt_trace_{rank}_{pid}_{window}.json` for <https://ui.perfetto.dev/>. The
-  pid is in the name because rank and window alone are not unique across
-  processes: a restarted server counts windows from zero again, and two engines
-  sharing one trace directory are both rank 0, so either could otherwise
-  overwrite an earlier experiment's trace. Because qbruntime buffers the log
+  `mblt_trace_{rank}_{pid}_{window}.json` for <https://ui.perfetto.dev/>. An
+  existing trace is never overwritten: rank, pid and window are not unique on
+  their own -- a restarted server counts windows from zero again, a reused pid
+  revisits the whole series, and two engines sharing one trace directory are
+  both rank 0 -- so a start skips the names already on disk instead of trusting
+  the name to be free. Because qbruntime buffers the log
   and writes it only on stop, `shutdown()` stops a running trace so a server
   torn down mid-window does not lose it, and a second start while one is
   recording is refused with a warning rather than taking over the first owner's

@@ -277,9 +277,9 @@ For an offline run, `LLM.start_profile()` / `LLM.stop_profile()` do the same, an
 `vllm bench serve --profile` brackets the benchmark for you.
 
 Each window writes `mblt_trace_{rank}_{pid}_{window}.json` into that directory.
-Open it at <https://ui.perfetto.dev/>. The pid is in the name because rank and
-window alone are not unique across processes: a restarted server counts windows
-from zero again, and two engines sharing one trace directory are both rank 0. The events are the runtime's own device-level
+Open it at <https://ui.perfetto.dev/>. An existing trace is never overwritten:
+the window counter skips names already on disk, so a restarted server, a reused
+pid, and two engines sharing one trace directory all keep their own files. The events are the runtime's own device-level
 spans -- `infer`, `run npu`, `copy to npu`, `lock core`, `read device` and the
 like -- so a window shows what each inference step spent on the accelerator.
 
