@@ -1,4 +1,5 @@
 import os
+import socket
 import sys
 from types import SimpleNamespace
 
@@ -72,8 +73,29 @@ class TestResolveTraceDir:
             resolve_trace_dir()
 
 
+class TestTraceFilename:
+    """The name follows torch's own convention; see `tracing.trace_filename`."""
+
+    def test_name_carries_hostname_pid_profiler_rank_and_timestamp(self) -> None:
+        host_pid, name, timestamp, extension = tracing.trace_filename(rank=3).split(".")
+
+        assert host_pid == f"{socket.gethostname()}_{os.getpid()}"
+        assert name == f"{tracing.TRACE_NAME}_rank3"
+        assert timestamp.isdigit()
+        assert extension == "json"
+
+    def test_the_timestamp_separates_back_to_back_names(self) -> None:
+        # This is what makes a name unique without a counter or a probe, and
+        # it is why torch appends a nanosecond rather than a second.
+        first = tracing.trace_filename(rank=0)
+        second = tracing.trace_filename(rank=0)
+
+        assert first != second
+        assert int(second.split(".")[2]) > int(first.split(".")[2])
+
+
 class TestMbltTracer:
-    def test_start_creates_trace_dir_and_passes_rank_qualified_path(self, tmp_path) -> None:
+    def test_start_creates_trace_dir_and_passes_a_conventional_path(self, tmp_path) -> None:
         backend = FakeQbRuntime()
         trace_dir = tmp_path / "traces"
         tracer = MbltTracer(str(trace_dir), rank=2, backend=backend)
@@ -82,10 +104,14 @@ class TestMbltTracer:
 
         assert trace_dir.is_dir()
         assert backend.started_paths == [path]
-        assert os.path.basename(path) == f"mblt_trace_2_{os.getpid()}_0.json"
+        assert os.path.dirname(path) == str(trace_dir)
+        host, pid = os.path.basename(path).split(".")[0].rsplit("_", 1)
+        assert host == socket.gethostname()
+        assert pid == str(os.getpid())
+        assert os.path.basename(path).split(".")[1] == "mblt_npu_rank2"
         assert tracer.is_running
 
-    def test_stop_writes_and_advances_to_the_next_window(self, tmp_path) -> None:
+    def test_stop_writes_and_the_next_window_gets_its_own_file(self, tmp_path) -> None:
         backend = FakeQbRuntime()
         tracer = MbltTracer(str(tmp_path), backend=backend)
 
@@ -96,7 +122,6 @@ class TestMbltTracer:
 
         second = tracer.start()
         assert second != first
-        assert os.path.basename(second) == f"mblt_trace_0_{os.getpid()}_1.json"
         assert backend.started_paths == [first, second]
 
     def test_repeated_start_does_not_raise_or_restart_the_running_trace(self, tmp_path) -> None:
@@ -130,32 +155,17 @@ class TestMbltTracer:
         owner.stop()
         assert other.start() is not None
 
-    def test_start_skips_a_window_already_on_disk(self, tmp_path) -> None:
-        # A pid reused after a restart revisits the whole name series, so the
-        # first candidate can already hold an earlier experiment's trace.
-        stale = tmp_path / f"mblt_trace_0_{os.getpid()}_0.json"
-        stale.write_text("earlier trace")
-        tracer = MbltTracer(str(tmp_path), backend=FakeQbRuntime())
-
-        path = tracer.start()
-
-        assert os.path.basename(path) == f"mblt_trace_0_{os.getpid()}_1.json"
-        assert stale.read_text() == "earlier trace"
-
     def test_a_second_tracer_in_one_process_does_not_reuse_the_first_path(self, tmp_path) -> None:
-        # Two sequential offline LLM instances build one tracer each; both
-        # start their window counter at zero with the same rank and pid.
+        # Two sequential offline LLM instances build one tracer each, with the
+        # same rank, pid and hostname; only the timestamp separates them.
         first = MbltTracer(str(tmp_path), backend=FakeQbRuntime())
         first_path = first.start()
         first.stop()
-        # Only the backend writes the log, so stand in for it here.
-        open(first_path, "w").write("first window")
 
         second = MbltTracer(str(tmp_path), backend=FakeQbRuntime())
         second_path = second.start()
 
         assert second_path != first_path
-        assert open(first_path).read() == "first window"
 
     def test_start_raises_when_the_trace_dir_cannot_be_prepared(self, tmp_path) -> None:
         blocker = tmp_path / "not_a_dir"
@@ -264,8 +274,10 @@ class TestMbltWorkerProfileHook:
         worker.profile(is_start=True)
         assert worker._tracer is not None
         assert worker._tracer.is_running
-        expected = os.path.join(os.path.abspath(str(tmp_path)), f"mblt_trace_3_{os.getpid()}_0.json")
-        assert backend.started_paths == [expected]
+        assert len(backend.started_paths) == 1
+        started = backend.started_paths[0]
+        assert os.path.dirname(started) == os.path.abspath(str(tmp_path))
+        assert f".{tracing.TRACE_NAME}_rank3." in os.path.basename(started)
 
         worker.profile(is_start=False)
         assert not worker._tracer.is_running

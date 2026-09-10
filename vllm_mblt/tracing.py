@@ -21,8 +21,10 @@ Two properties of the qbruntime tracer shape the code here:
 """
 
 import os
+import socket
 import sys
 import threading
+import time
 from typing import Any, Optional
 
 from vllm import envs
@@ -36,7 +38,9 @@ logger = init_logger(__name__)
 # registers the profile routes when this is set.
 TRACE_DIR_ENV_VAR = "VLLM_TORCH_PROFILER_DIR"
 
-TRACE_FILENAME_PREFIX = "mblt_trace"
+# Names the profiler a trace came from, the way vLLM's own front-end traces
+# carry `async_llm`, so both are recognizable in one directory listing.
+TRACE_NAME = "mblt_npu"
 
 # Process-global record of the tracer that owns the running qbruntime trace.
 _ACTIVE_TRACER: Optional["MbltTracer"] = None
@@ -44,9 +48,7 @@ _ACTIVE_TRACER_LOCK = threading.Lock()
 
 # `mblt_model_zoo`'s benchmark helpers trace through the same process-global
 # qbruntime facility and record their ownership in this module attribute.
-_EXTERNAL_TRACE_OWNERS = (
-    ("mblt_model_zoo.hf_transformers.utils.benchmark_utils", "_ACTIVE_QBRUNTIME_TRACE_HANDLE"),
-)
+_EXTERNAL_TRACE_OWNERS = (("mblt_model_zoo.hf_transformers.utils.benchmark_utils", "_ACTIVE_QBRUNTIME_TRACE_HANDLE"),)
 
 
 def _external_trace_owner() -> Optional[str]:
@@ -81,10 +83,26 @@ def resolve_trace_dir() -> Optional[str]:
         # straight through for its own traces. qbruntime writes through a plain
         # file path and cannot reach one, and treating it as a local path would
         # silently create a directory named after the URI.
-        raise RuntimeError(
-            f"NPU event tracing needs a local directory, but {TRACE_DIR_ENV_VAR} is {trace_dir!r}."
-        )
+        raise RuntimeError(f"NPU event tracing needs a local directory, but {TRACE_DIR_ENV_VAR} is {trace_dir!r}.")
     return trace_dir
+
+
+def trace_filename(rank: int) -> str:
+    """Name a trace file the way torch names its own.
+
+    `torch.profiler.tensorboard_trace_handler` builds
+    `{hostname}_{pid}.{worker_name}.{time_ns}.pt.trace.json`, noting that the
+    nanosecond is there "to avoid naming clash when exporting the trace"; vLLM
+    and vllm-ascend both hand it a rank-derived worker name and let it append
+    the timestamp. This follows that convention instead of inventing one.
+
+    Every component earns its place. The timestamp separates windows of one
+    tracer, tracers built one after another in a process, and a pid reused
+    after a restart. The pid separates concurrent processes on one host. The
+    hostname separates processes that share a mounted trace directory but not
+    a pid namespace, where two containers can hold the same pid.
+    """
+    return f"{socket.gethostname()}_{os.getpid()}.{TRACE_NAME}_rank{rank}.{time.time_ns()}.json"
 
 
 def load_backend() -> Any:
@@ -102,9 +120,8 @@ class MbltTracer:
     def __init__(self, trace_dir: str, *, rank: int = 0, backend: Any = None) -> None:
         self.trace_dir = trace_dir
         self.rank = rank
-        self.pid = os.getpid()
         self._backend = backend
-        self._window = 0
+        self._path: Optional[str] = None
         self._running = False
 
     @property
@@ -112,44 +129,15 @@ class MbltTracer:
         """Whether qbruntime is currently recording into this tracer's file."""
         return self._running
 
+    @property
+    def path(self) -> Optional[str]:
+        """The file the current or most recent window writes to."""
+        return self._path
+
     def _get_backend(self) -> Any:
         if self._backend is None:
             self._backend = load_backend()
         return self._backend
-
-    def trace_path(self, window: Optional[int] = None) -> str:
-        """Return the file the given window (default: the current one) writes to.
-
-        The pid is in the name so that engines running concurrently in separate
-        processes never pick the same candidate -- two of them are both rank 0
-        when they share a trace directory -- which is what lets
-        `_claim_next_window` settle uniqueness with a plain existence check.
-        """
-        if window is None:
-            window = self._window
-        name = f"{TRACE_FILENAME_PREFIX}_{self.rank}_{self.pid}_{window}.json"
-        return os.path.join(self.trace_dir, name)
-
-    def _claim_next_window(self) -> str:
-        """Advance past windows already on disk and return the path to write.
-
-        Rank, pid and window do not make a name unique on their own: two
-        tracers built one after another in a process both start counting at
-        zero, and a pid reused after a restart revisits the whole series. Both
-        would hand qbruntime a path that already holds a trace.
-
-        Skipping the names that exist makes overwriting impossible rather than
-        unlikely, and needs no session id in the filename. It is exact rather
-        than racy because a window's file appears when it stops, callers hold
-        the lock, and a tracer cannot start while another one in this process
-        is recording -- so every earlier window of this pid is already on disk
-        by the time the next one is claimed. A window whose stop failed left no
-        file, but its log is gone either way, so reusing that name loses
-        nothing.
-        """
-        while os.path.exists(self.trace_path()):
-            self._window += 1
-        return self.trace_path()
 
     def start(self) -> Optional[str]:
         """Begin a trace window and return the destination path.
@@ -164,7 +152,7 @@ class MbltTracer:
 
         with _ACTIVE_TRACER_LOCK:
             if self._running:
-                logger.warning("MBLT NPU trace is already recording into %s; ignoring start.", self.trace_path())
+                logger.warning("MBLT NPU trace is already recording into %s; ignoring start.", self._path)
                 return None
             # Probed before the test so the owner is known either way; it is
             # a dict lookup, not an import.
@@ -181,10 +169,10 @@ class MbltTracer:
 
             try:
                 os.makedirs(self.trace_dir, exist_ok=True)
-                path = self._claim_next_window()
             except Exception as e:
-                raise RuntimeError(f"Failed to prepare an MBLT NPU trace in {self.trace_dir}.") from e
+                raise RuntimeError(f"Failed to prepare the MBLT NPU trace directory {self.trace_dir}.") from e
 
+            path = os.path.join(self.trace_dir, trace_filename(self.rank))
             try:
                 started = self._get_backend().start_tracing_events(path)
             except Exception as e:
@@ -193,6 +181,7 @@ class MbltTracer:
             if started is False:
                 raise RuntimeError(f"qbruntime refused to start an MBLT NPU trace at {path}.")
 
+            self._path = path
             self._running = True
             _ACTIVE_TRACER = self
             logger.info("Started MBLT NPU trace; the log is written to %s on stop.", path)
@@ -213,7 +202,7 @@ class MbltTracer:
                 logger.warning("MBLT NPU trace was not started, nothing to stop.")
                 return None
 
-            path = self.trace_path()
+            path = self._path
             try:
                 self._get_backend().stop_tracing_events()
             except Exception as e:
@@ -224,7 +213,6 @@ class MbltTracer:
                 self._running = False
                 if _ACTIVE_TRACER is self:
                     _ACTIVE_TRACER = None
-                self._window += 1
 
             logger.info("Stopped MBLT NPU trace; wrote %s. View it at https://ui.perfetto.dev/.", path)
             return path

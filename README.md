@@ -276,10 +276,14 @@ curl -X POST http://localhost:8000/stop_profile
 For an offline run, `LLM.start_profile()` / `LLM.stop_profile()` do the same, and
 `vllm bench serve --profile` brackets the benchmark for you.
 
-Each window writes `mblt_trace_{rank}_{pid}_{window}.json` into that directory.
-Open it at <https://ui.perfetto.dev/>. An existing trace is never overwritten:
-the window counter skips names already on disk, so a restarted server, a reused
-pid, and two engines sharing one trace directory all keep their own files. The events are the runtime's own device-level
+Each window writes `{hostname}_{pid}.mblt_npu_rank{rank}.{time_ns}.json` into
+that directory. Open it at <https://ui.perfetto.dev/>. The name follows the
+convention `torch.profiler.tensorboard_trace_handler` uses for its own traces,
+which vLLM and vllm-ascend both build on: the nanosecond timestamp is what
+keeps successive windows from clashing, the pid separates concurrent processes
+on a host, and the hostname separates containers that share a mounted trace
+directory but not a pid namespace. vLLM's front-end trace lands beside it as
+`{hostname}_{pid}.async_llm.{time_ns}.pt.trace.json.gz`. The events are the runtime's own device-level
 spans -- `infer`, `run npu`, `copy to npu`, `lock core`, `read device` and the
 like -- so a window shows what each inference step spent on the accelerator.
 
