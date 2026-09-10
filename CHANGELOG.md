@@ -16,13 +16,20 @@
   each out-of-tree platform points the same hook at its own device profiler.
   `VLLM_TORCH_PROFILER_DIR` stays the switch and the output directory -- no
   MBLT-specific flag or endpoint is added -- and each window writes
-  `mblt_trace_{rank}_{window}.json` for <https://ui.perfetto.dev/>. Because
-  qbruntime buffers the log and writes it only on stop, `shutdown()` stops a
-  running trace so a server torn down mid-window does not lose it, and a second
-  start while one is recording is refused with a warning rather than taking
-  over the first owner's window. Verified on an Aries board: a start/stop
-  window around one completion request produced a 1330-event trace, and a
-  `SIGTERM` mid-trace wrote the window before `Model disposed.`
+  `mblt_trace_{rank}_{pid}_{window}.json` for <https://ui.perfetto.dev/>. The
+  pid is in the name because rank and window alone are not unique across
+  processes: a restarted server counts windows from zero again, and two engines
+  sharing one trace directory are both rank 0, so either could otherwise
+  overwrite an earlier experiment's trace. Because qbruntime buffers the log
+  and writes it only on stop, `shutdown()` stops a running trace so a server
+  torn down mid-window does not lose it, and a second start while one is
+  recording is refused with a warning rather than taking over the first owner's
+  window. A trace that cannot be started, or whose log cannot be written, fails
+  the profile request instead of reporting success for a trace that will not be
+  on disk; a repeated start or a stop with nothing running only logs. Verified
+  on an Aries board: a start/stop window around one completion request produced
+  a 1330-event trace, and a `SIGTERM` mid-trace wrote the window before
+  `Model disposed.`
 
 ## 0.2.3
 

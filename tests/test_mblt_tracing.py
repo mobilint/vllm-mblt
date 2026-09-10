@@ -1,4 +1,5 @@
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -48,15 +49,27 @@ class TestResolveTraceDir:
         monkeypatch.delenv(TRACE_DIR_ENV_VAR, raising=False)
         assert resolve_trace_dir() is None
 
-    def test_resolve_trace_dir_treats_blank_env_var_as_unset(self, monkeypatch) -> None:
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, "   ")
-        assert resolve_trace_dir() is None
-
     def test_resolve_trace_dir_returns_absolute_path(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, f"  {tmp_path}  ")
+        monkeypatch.setenv(TRACE_DIR_ENV_VAR, str(tmp_path))
         resolved = resolve_trace_dir()
         assert resolved == os.path.abspath(str(tmp_path))
         assert os.path.isabs(resolved)
+
+    def test_resolve_trace_dir_makes_a_relative_path_absolute(self, monkeypatch) -> None:
+        # vLLM resolves the variable itself; reading its value rather than the
+        # raw environment keeps the NPU trace beside the front-end CPU trace.
+        monkeypatch.setenv(TRACE_DIR_ENV_VAR, "relative/traces")
+        resolved = resolve_trace_dir()
+        assert os.path.isabs(resolved)
+        assert resolved.endswith(os.path.join("relative", "traces"))
+
+    def test_resolve_trace_dir_rejects_a_remote_destination(self, monkeypatch) -> None:
+        # vLLM passes gs:// through for its own traces, but qbruntime writes
+        # through a plain file path and would otherwise create a local
+        # directory named after the URI.
+        monkeypatch.setenv(TRACE_DIR_ENV_VAR, "gs://bucket/traces")
+        with pytest.raises(RuntimeError, match="local directory"):
+            resolve_trace_dir()
 
 
 class TestMbltTracer:
@@ -69,7 +82,7 @@ class TestMbltTracer:
 
         assert trace_dir.is_dir()
         assert backend.started_paths == [path]
-        assert os.path.basename(path) == "mblt_trace_2_0.json"
+        assert os.path.basename(path) == f"mblt_trace_2_{os.getpid()}_0.json"
         assert tracer.is_running
 
     def test_stop_writes_and_advances_to_the_next_window(self, tmp_path) -> None:
@@ -83,10 +96,10 @@ class TestMbltTracer:
 
         second = tracer.start()
         assert second != first
-        assert os.path.basename(second) == "mblt_trace_0_1.json"
+        assert os.path.basename(second) == f"mblt_trace_0_{os.getpid()}_1.json"
         assert backend.started_paths == [first, second]
 
-    def test_repeated_start_does_not_restart_the_running_trace(self, tmp_path) -> None:
+    def test_repeated_start_does_not_raise_or_restart_the_running_trace(self, tmp_path) -> None:
         backend = FakeQbRuntime()
         tracer = MbltTracer(str(tmp_path), backend=backend)
 
@@ -117,33 +130,70 @@ class TestMbltTracer:
         owner.stop()
         assert other.start() is not None
 
-    def test_start_reports_failure_without_claiming_the_trace(self, tmp_path) -> None:
+    def test_a_refused_start_raises_without_claiming_the_trace(self, tmp_path) -> None:
+        # Reporting success for a trace that will not exist is worse than
+        # failing the profile request.
         backend = FakeQbRuntime(start_result=False)
         tracer = MbltTracer(str(tmp_path), backend=backend)
 
-        assert tracer.start() is None
+        with pytest.raises(RuntimeError, match="refused"):
+            tracer.start()
         assert not tracer.is_running
         assert tracing._ACTIVE_TRACER is None
 
-    def test_start_failure_leaves_the_next_start_usable(self, tmp_path) -> None:
+    def test_start_failure_raises_and_leaves_the_next_start_usable(self, tmp_path) -> None:
         backend = FakeQbRuntime(start_error=RuntimeError("no device"))
         tracer = MbltTracer(str(tmp_path), backend=backend)
 
-        assert tracer.start() is None
+        with pytest.raises(RuntimeError, match="Failed to start"):
+            tracer.start()
         assert not tracer.is_running
 
         tracer._backend = FakeQbRuntime()
         assert tracer.start() is not None
 
-    def test_stop_failure_releases_the_trace_instead_of_blocking_later_windows(self, tmp_path) -> None:
+    def test_stop_failure_raises_but_releases_the_trace_for_later_windows(self, tmp_path) -> None:
         backend = FakeQbRuntime(stop_error=RuntimeError("write failed"))
         tracer = MbltTracer(str(tmp_path), backend=backend)
 
         tracer.start()
-        assert tracer.stop() is None
+        with pytest.raises(RuntimeError, match="Failed to write"):
+            tracer.stop()
         assert not tracer.is_running
         assert tracing._ACTIVE_TRACER is None
         assert tracer.start() is not None
+
+    def test_start_defers_to_a_trace_owned_by_an_external_client(self, monkeypatch, tmp_path) -> None:
+        # mblt_model_zoo's benchmark helpers drive the same process-global
+        # qbruntime tracer and record their ownership in a module attribute.
+        module_name, attr_name = tracing._EXTERNAL_TRACE_OWNERS[0]
+        monkeypatch.setitem(sys.modules, module_name, SimpleNamespace(**{attr_name: object()}))
+        backend = FakeQbRuntime()
+        tracer = MbltTracer(str(tmp_path), backend=backend)
+
+        assert tracer.start() is None
+        assert not tracer.is_running
+        assert backend.started_paths == []
+
+    def test_start_proceeds_when_the_external_client_holds_no_trace(self, monkeypatch, tmp_path) -> None:
+        module_name, attr_name = tracing._EXTERNAL_TRACE_OWNERS[0]
+        monkeypatch.setitem(sys.modules, module_name, SimpleNamespace(**{attr_name: None}))
+        tracer = MbltTracer(str(tmp_path), backend=FakeQbRuntime())
+
+        assert tracer.start() is not None
+
+    def test_external_owner_probe_never_imports_the_module(self, monkeypatch) -> None:
+        # Inspecting sys.modules only: a module that was never imported cannot
+        # have started a trace, and importing it here would pull in the
+        # benchmark helpers' heavy dependencies.
+        module_name = tracing._EXTERNAL_TRACE_OWNERS[0][0]
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+        def fail_on_import(name, *args, **kwargs):
+            raise AssertionError(f"unexpected import of {name}")
+
+        monkeypatch.setattr("builtins.__import__", fail_on_import)
+        assert tracing._external_trace_owner() is None
 
     def test_backend_is_imported_lazily(self, tmp_path, monkeypatch) -> None:
         backend = FakeQbRuntime()
@@ -178,7 +228,8 @@ class TestMbltWorkerProfileHook:
         worker.profile(is_start=True)
         assert worker._tracer is not None
         assert worker._tracer.is_running
-        assert backend.started_paths == [os.path.join(os.path.abspath(str(tmp_path)), "mblt_trace_3_0.json")]
+        expected = os.path.join(os.path.abspath(str(tmp_path)), f"mblt_trace_3_{os.getpid()}_0.json")
+        assert backend.started_paths == [expected]
 
         worker.profile(is_start=False)
         assert not worker._tracer.is_running

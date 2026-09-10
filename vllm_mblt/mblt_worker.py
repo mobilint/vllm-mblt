@@ -3501,6 +3501,11 @@ class MbltWorker(WorkerBase):
         NPU through qbruntime, not through torch ops -- so this hook records a
         qbruntime event trace instead, the way each out-of-tree platform points
         it at its own device profiler.
+
+        Failures propagate: if the trace cannot be started, or its log cannot
+        be written, the caller hears about it rather than being told the
+        profile succeeded and finding no trace on disk. A repeated start or a
+        stop with nothing running is not a failure and only logs.
         """
         tracer = self._get_tracer()
         if is_start:
@@ -4035,8 +4040,13 @@ class MbltWorker(WorkerBase):
     def shutdown(self) -> None:
         # qbruntime buffers the trace log and writes it only on stop, so a
         # server torn down mid-trace would otherwise lose the whole window.
+        # A trace that cannot be written must not take the rest of the
+        # teardown -- the model still has to be disposed -- down with it.
         if self._tracer is not None and self._tracer.is_running:
-            self._tracer.stop()
+            try:
+                self._tracer.stop()
+            except Exception as e:
+                logger.warning("Could not write the in-flight MBLT NPU trace during shutdown: %s", e)
         if self.model:
             dispose = getattr(self.model, "dispose", None)
             if callable(dispose):

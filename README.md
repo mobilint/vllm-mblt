@@ -276,8 +276,10 @@ curl -X POST http://localhost:8000/stop_profile
 For an offline run, `LLM.start_profile()` / `LLM.stop_profile()` do the same, and
 `vllm bench serve --profile` brackets the benchmark for you.
 
-Each window writes `mblt_trace_{rank}_{window}.json` into that directory. Open it
-at <https://ui.perfetto.dev/>. The events are the runtime's own device-level
+Each window writes `mblt_trace_{rank}_{pid}_{window}.json` into that directory.
+Open it at <https://ui.perfetto.dev/>. The pid is in the name because rank and
+window alone are not unique across processes: a restarted server counts windows
+from zero again, and two engines sharing one trace directory are both rank 0. The events are the runtime's own device-level
 spans -- `infer`, `run npu`, `copy to npu`, `lock core`, `read device` and the
 like -- so a window shows what each inference step spent on the accelerator.
 
@@ -293,10 +295,17 @@ Notes:
   server grows memory and produces a file too large to be useful. If the worker
   shuts down while a trace is running it is stopped first so the window is not
   lost.
-- Only one qbruntime trace can record per process. Starting a second one is
-  refused with a warning rather than cutting the first one's window short --
-  relevant if the same process also traces through `mblt_model_zoo`'s benchmark
-  helpers.
+- Only one qbruntime trace can record per process. A start while one is
+  already recording is refused with a warning rather than cutting the first
+  window short. qbruntime has no way to report whether a trace is running or
+  who owns it, so this covers traces started through this plugin and, when its
+  module is already imported, through `mblt_model_zoo`'s benchmark helpers. A
+  trace started by any other client cannot be detected.
+- If a trace cannot be started, or its log cannot be written, `/start_profile`
+  and `/stop_profile` fail rather than reporting success for a trace that will
+  not be on disk. A repeated start or a stop with nothing running is not a
+  failure and only logs. During shutdown a trace that cannot be written is
+  logged and skipped so the rest of the teardown still runs.
 - A `/stop_profile` with no trace running answers `500`. That comes from vLLM's
   front-end `AsyncLLM` profiler, which raises when stopped before it was
   started; the worker-side trace is unaffected and only logs that there was
