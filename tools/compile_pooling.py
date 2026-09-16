@@ -16,6 +16,8 @@ from qbcompiler import CalibrationConfig, mxq_compile
 from safetensors.torch import save_file
 from transformers import AutoModel, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
+from vllm_mblt.pooling_artifacts import sha256
+
 MODELS = {
     "intfloat/e5-small": ("bert", "mean", "MobilintEmbeddingModel"),
     "BAAI/bge-reranker-v2-m3": ("xlm-roberta", "scalar", "MobilintForSequenceClassification"),
@@ -52,7 +54,7 @@ def main():
     if args.samples < 1 or args.max_length < 2:
         raise ValueError("samples and max-length must be positive")
     recipe_hashes = {
-        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+        p.name: sha256(p)
         for p in (Path(__file__), Path(__file__).with_name("nemotron_encoder.py"))
     }
     revision = HfApi().model_info(args.model, revision=args.revision).sha
@@ -128,10 +130,13 @@ def main():
                 QWEN_RERANK_INSTRUCTION,
                 QWEN_RERANK_PREFIX,
                 QWEN_RERANK_SUFFIX,
+                QWEN_RERANK_SUFFIX_IDS,
             )
 
             prefix = tok.encode(QWEN_RERANK_PREFIX, add_special_tokens=False)
             suffix = tok.encode(QWEN_RERANK_SUFFIX, add_special_tokens=False)
+            if tuple(suffix) != QWEN_RERANK_SUFFIX_IDS:
+                raise ValueError("Unsupported Qwen reranker tokenizer suffix IDs")
             room = args.max_length - len(prefix) - len(suffix)
             if room <= 0:
                 raise ValueError("max-length does not fit the reranker prompt")
@@ -257,7 +262,7 @@ def main():
         calibration_lengths=lengths,
         versions={p: importlib.metadata.version(p) for p in ("qbcompiler", "torch", "transformers")},
     )
-    manifest["sha256"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in out.iterdir() if p.is_file()}
+    manifest["sha256"] = {p.name: sha256(p) for p in out.iterdir() if p.is_file()}
     (out / "pooling.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Completed pooling package: {out}", flush=True)
 

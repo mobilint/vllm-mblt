@@ -17,8 +17,18 @@ class MbltPoolingWorker(WorkerBase):
         if unknown:
             raise ValueError(f"Unsupported pooling runtime options: {sorted(unknown)}")
         self.model = PoolingRuntime(self.model_config.model, revision=self.model_config.revision, **extra)
-        if self.model_config.max_model_len > self.model.max_length:
-            raise ValueError("max_model_len exceeds the compiled pooling artifact's sequence limit")
+        try:
+            config = self.model_config.hf_config
+            if config.mblt_pooling != self.model.kind or config.hidden_size != self.model.hidden_size:
+                raise ValueError("vLLM pooling task/dimensions do not match the compiled package")
+            if self.model_config.is_matryoshka and not self.model.manifest.get("matryoshka", False):
+                raise ValueError("vLLM advertises dimension reduction unsupported by the compiled package")
+            if self.model_config.max_model_len > self.model.max_length:
+                raise ValueError("max_model_len exceeds the compiled pooling artifact's sequence limit")
+        except Exception:
+            self.model.close()
+            self.model = None
+            raise
 
     def get_supported_tasks(self):
         kind = self.model_config.hf_config.mblt_pooling

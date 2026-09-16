@@ -13,6 +13,13 @@ worker and scheduling behavior.
 | `Qwen/Qwen3-Reranker-0.6B` | One relevance score | Softmax over the final `no`/`yes` logits |
 | `BAAI/bge-reranker-v2-m3` | One relevance score | Sigmoid of the sequence-classification logit |
 
+The review-time numerical check of the current Qwen3-Embedding prototype MXQ
+reached a minimum cosine of **0.9794**, below this guide's default **0.98** gate.
+An earlier run passed narrowly (minimum 0.9802); that is insufficient to qualify
+this build for distribution. Its compilation path is available, but that MXQ
+needs accuracy work and fresh validation before it can be packaged as validated.
+Do not lower the gate solely to make a report pass.
+
 The server takes a **compiled package path**, not the original FP32/BF16 Hub
 checkpoint. A source checkpoint alone does not contain an MXQ.
 
@@ -128,7 +135,9 @@ Set the API key in the shell before starting the server. For another model,
 change the artifact directory and served model name. Runtime placement is
 `--model-loader-extra-config '{"dev_no":0,"core":0}'`; cores 0–7 map to the two
 Aries clusters. The worker does not support tensor/pipeline parallelism, LoRA,
-multimodal inputs, or caller-supplied input embeddings.
+multimodal inputs, or caller-supplied input embeddings. Pooling-type overrides
+must match the compiled package; long-input chunked processing, logit bias, and
+token-selection overrides are rejected at startup rather than silently ignored.
 
 Embedding input strings follow the source model's conventions. E5 uses `query: `
 and `passage: `. Qwen retrieval queries use `Instruct: <task>\nQuery: <query>`;
@@ -156,6 +165,10 @@ score-template hook. BGE uses the tokenizer's query/document pair encoding.
 protects `/v1/*` only: the `/rerank`, `/v2/rerank`, and `/score` aliases require
 authentication at a reverse proxy before exposing the server to a network.
 The example uses the authenticated `/v1/rerank` alias and loopback binding.
+For Qwen reranking, requests whose `truncate_prompt_tokens` setting removes the
+required assistant suffix return HTTP 400. Shorten the query/document before
+submission so that the formatted pair fits the compiled limit; a truncated
+scoring prompt would otherwise produce an invalid relevance score.
 Scores default to [0, 1]; when activation is disabled,
 Qwen returns `yes_logit - no_logit` and BGE returns its raw scalar logit.
 
@@ -178,16 +191,21 @@ Nemotron's reference model requires a separate Transformers >=5.5 environment.
 Serving uses only the exported table and MXQ, and remains compatible with the
 Transformers 4.x dependency required by vLLM 0.11.2.
 
-To check the HTTP server, including concurrent batches, API-key enforcement,
-and rejection of inputs above the compiled limit:
+For a package-bound HTTP validation report, let the tool launch a temporary
+loopback server from the package being validated. It generates an ephemeral API
+key, checks concurrent batches, authentication and input limits, and stops the
+server afterward. Run this on the NPU host with this plugin installed; stop any
+other process using the selected NPU core first:
 
 ```bash
 python tools/validate_pooling_api.py artifacts/e5-small \
-  --url http://127.0.0.1:8000 --output artifacts/e5-small/api-validation.json
+  --launch-server --core 0 --output artifacts/e5-small/api-validation.json
 ```
 
-This command reads `VLLM_API_KEY` from the environment and assumes that the served
-model name matches `source_model` in the package manifest.
+To check an independently running server instead, pass `--url` in place of
+`--launch-server` and set `VLLM_API_KEY`. That mode cannot prove which MXQ bytes
+the server loaded, so its report is diagnostic only and is rejected by the
+packager. It expects the served model name to match `source_model` in the manifest.
 
 The smoke check includes different sequence lengths and unrelated relevance
 pairs. Its default thresholds are embedding cosine >=0.98 and absolute score
@@ -209,7 +227,11 @@ python tools/package_pooling.py artifacts/e5-small \
   --output artifacts/releases/e5-small.tar.gz
 ```
 
-The packager verifies the compiler manifest's checksums, requires matching
-successful numerical and API validation reports, and excludes build
-intermediates. It writes an archive and a `.sha256` sidecar. Extract the complete
+Both validators verify the manifest's file checksums before and after validation
+and record its SHA256 digest and source revision. The packager requires matching
+successful reports for those exact artifacts, a managed-server API report, and
+the numerical reference used in the test. A changed MXQ, embedding table,
+configuration, tokenizer, or manifest requires fresh validation. Older reports
+without these identities must be regenerated; the MXQ itself need not be rebuilt.
+The packager excludes build intermediates. It writes an archive and a `.sha256` sidecar. Extract the complete
 archive on the NPU host and point `vllm serve` at the extracted directory.

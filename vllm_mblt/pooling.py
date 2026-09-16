@@ -8,12 +8,7 @@ import torch
 from safetensors.torch import load_file
 from torch import nn
 
-
-def artifact_file(root: Path, name: str) -> Path:
-    path = (root / name).resolve()
-    if not path.is_relative_to(root.resolve()) or not path.is_file():
-        raise ValueError(f"Missing or out-of-package pooling artifact: {name}")
-    return path
+from vllm_mblt.pooling_artifacts import artifact_file
 
 
 def pool_output(output, kind, params, *, hidden_size, matryoshka=False):
@@ -52,19 +47,25 @@ class PoolingRuntime(nn.Module):
         import qbruntime
 
         root = Path(model_path)
+        cache_blobs = None
         if not root.is_dir():
             from huggingface_hub import snapshot_download
 
             root = Path(snapshot_download(model_path, revision=revision))
-        self.manifest = json.loads(artifact_file(root, "pooling.json").read_text())
+            cache_blobs = root.parent.parent / "blobs"
+
+        def resolve(name):
+            return artifact_file(root, name, cache_blobs=cache_blobs)
+
+        self.manifest = json.loads(resolve("pooling.json").read_text())
         manifest = self.manifest
         if manifest.get("format_version") != 1:
             raise ValueError("Unsupported pooling artifact format")
         self.kind = manifest["pooling"]
         self.max_length = manifest["max_length"]
         self.hidden_size = manifest["hidden_size"]
-        source = json.loads(artifact_file(root, "source_config.json").read_text())
-        state = load_file(str(artifact_file(root, manifest["embeddings"])))
+        source = json.loads(resolve("source_config.json").read_text())
+        state = load_file(str(resolve(manifest["embeddings"])))
         if manifest["input_kind"] in ("bert", "xlm-roberta"):
             if manifest["input_kind"] == "bert":
                 from transformers import BertConfig
@@ -88,7 +89,7 @@ class PoolingRuntime(nn.Module):
         )
         mc.set_single_core_mode(None, [core_id])
         self.acc = qbruntime.Accelerator(dev_no)
-        self.mxq = qbruntime.Model(str(artifact_file(root, manifest["mxq"])), mc)
+        self.mxq = qbruntime.Model(str(resolve(manifest["mxq"])), mc)
         self.mxq.launch(self.acc)
 
     @torch.inference_mode()

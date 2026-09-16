@@ -340,6 +340,19 @@ class MbltPlatform(Platform):
             if getattr(parallel_config, "world_size", 1) != 1:
                 raise ValueError("Mobilint pooling currently requires tensor/pipeline parallel size 1")
             hf_config = vllm_config.model_config.hf_config
+            expected_pooling = {"mean": "MEAN", "last": "LAST", "scalar": "CLS", "yes_no": "LAST"}
+            if hf_config.mblt_pooling not in expected_pooling:
+                raise ValueError("Unknown compiled Mobilint pooling task")
+            pooler = getattr(vllm_config.model_config, "pooler_config", None)
+            if pooler is not None:
+                if pooler.pooling_type not in (None, expected_pooling[hf_config.mblt_pooling]):
+                    raise ValueError("pooling_type must match the compiled Mobilint package")
+                if pooler.enable_chunked_processing or pooler.max_embed_len not in (
+                    None, vllm_config.model_config.max_model_len
+                ):
+                    raise ValueError("Mobilint pooling does not support long-input chunked processing")
+                if any(getattr(pooler, key) is not None for key in ("logit_bias", "step_tag_id", "returned_token_ids")):
+                    raise ValueError("Mobilint pooling does not support logit_bias or token-selection overrides")
             if getattr(hf_config, "is_matryoshka", False) and getattr(hf_config, "matryoshka_dimensions", None) is None:
                 # vLLM 0.11.2 otherwise validates only dimensions > 0. Reject
                 # oversized requests before they can raise inside the engine.

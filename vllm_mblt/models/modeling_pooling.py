@@ -13,6 +13,8 @@ QWEN_RERANK_PREFIX = (
     '"no".<|im_end|>\n<|im_start|>user\n'
 )
 QWEN_RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+# Token IDs of the supported Qwen3-Reranker tokenizer; compilation verifies them.
+QWEN_RERANK_SUFFIX_IDS = (151645, 198, 151644, 77091, 198, 151667, 271, 151668, 271)
 
 
 class MobilintEmbeddingModel(nn.Module):
@@ -54,5 +56,9 @@ class MobilintQwen3ForSequenceClassification(MobilintForSequenceClassification):
 
     @classmethod
     def post_process_tokens(cls, prompt) -> None:
-        # The suffix is already part of the template. Never append EOS after it.
-        pass
+        ids = prompt["prompt_token_ids"]
+        if tuple(ids[-len(QWEN_RERANK_SUFFIX_IDS) :]) != QWEN_RERANK_SUFFIX_IDS:
+            raise ValueError(
+                "Qwen reranker truncation removed the scoring suffix. Shorten the query/document "
+                "before submission instead of truncating the formatted prompt."
+            )

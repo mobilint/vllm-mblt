@@ -2,18 +2,11 @@
 """Archive a validated pooling package, excluding calibration and build intermediates."""
 
 import argparse
-import hashlib
 import json
 import tarfile
 from pathlib import Path
 
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+from vllm_mblt.pooling_artifacts import artifact_file, package_identity, require_matching_report, sha256
 
 
 def main():
@@ -23,22 +16,24 @@ def main():
     args = parser.parse_args()
     root = args.package.resolve()
     manifest = json.loads((root / "pooling.json").read_text())
+    identity = package_identity(root)
     names = set(manifest["sha256"]) | {"pooling.json", "reference.json", "validation.json", "api-validation.json"}
     for name in names:
-        path = (root / name).resolve()
-        if path.parent != root or not path.is_file():
-            raise ValueError(f"Missing or invalid package member: {name}")
-        expected = manifest["sha256"].get(name)
-        if expected and sha256(path) != expected:
-            raise ValueError(f"Artifact checksum mismatch: {name}")
+        artifact_file(root, name)
     for name in ("validation.json", "api-validation.json"):
         report = json.loads((root / name).read_text())
-        if report.get("passed") is not True or report.get("source_model") != manifest["source_model"]:
-            raise ValueError(f"A successful matching validation report is required: {name}")
+        require_matching_report(report, identity, name)
+        if name == "api-validation.json" and report.get("artifact_binding") != "managed-server":
+            raise ValueError("API report must be produced with --launch-server")
+        if name == "validation.json":
+            if report.get("reference_sha256") != sha256(root / "reference.json"):
+                raise ValueError("Reference does not match the numerical validation report")
+            if not report.get("cases") or not all(row.get("passed") is True for row in report["cases"]):
+                raise ValueError("Numerical report must contain passing validation cases")
     if args.output.exists():
         raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(args.output, "w:gz", compresslevel=1) as archive:
+    with tarfile.open(args.output, "w:gz", compresslevel=1, dereference=True) as archive:
         for name in sorted(names):
             archive.add(root / name, arcname=f"{root.name}/{name}", recursive=False)
     checksum = sha256(args.output)

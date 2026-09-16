@@ -9,6 +9,7 @@ from vllm.model_executor.models.interfaces_base import is_pooling_model
 from vllm_mblt.mblt_platform import MbltPlatform
 from vllm_mblt.models.modeling_pooling import (
     QWEN_RERANK_SUFFIX,
+    QWEN_RERANK_SUFFIX_IDS,
     MobilintEmbeddingModel,
     MobilintForSequenceClassification,
     MobilintLastTokenEmbeddingModel,
@@ -72,6 +73,10 @@ def test_rerank_template_keeps_query_document_and_suffix():
     prompt = MobilintQwen3ForSequenceClassification.get_score_template("a query", "a document")
     assert "<Query>: a query\n<Document>: a document" in prompt
     assert prompt.endswith(QWEN_RERANK_SUFFIX)
+    valid = {"prompt_token_ids": [42, 43, *QWEN_RERANK_SUFFIX_IDS]}
+    MobilintQwen3ForSequenceClassification.post_process_tokens(valid)
+    with pytest.raises(ValueError, match="scoring suffix"):
+        MobilintQwen3ForSequenceClassification.post_process_tokens({"prompt_token_ids": [42, 43]})
 
 
 def test_artifact_cannot_escape_package(tmp_path):
@@ -105,6 +110,17 @@ def test_pooling_scheduler_disables_partial_prompts_and_prefix_cache():
     assert 256 in cfg.model_config.hf_config.matryoshka_dimensions
     assert 0 not in cfg.model_config.hf_config.matryoshka_dimensions
     assert 1025 not in cfg.model_config.hf_config.matryoshka_dimensions
+    from vllm.config import PoolerConfig
+
+    for overrides in (
+        {"pooling_type": "LAST"},
+        {"logit_bias": 1.0},
+        {"enable_chunked_processing": True},
+        {"max_embed_len": 1024},
+    ):
+        cfg.model_config.pooler_config = PoolerConfig(**overrides)
+        with pytest.raises(ValueError):
+            MbltPlatform.check_and_update_config(cfg)
 
 
 def test_worker_variable_length_batch_keeps_request_order():
