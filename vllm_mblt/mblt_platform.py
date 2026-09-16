@@ -334,6 +334,22 @@ class MbltPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config: ParallelConfig = vllm_config.parallel_config  # type: ignore
+        if getattr(vllm_config.model_config, "runner_type", None) == "pooling":
+            if not getattr(vllm_config.model_config.hf_config, "mblt_pooling", None):
+                raise ValueError("Mobilint pooling requires a compiled artifact package; see docs/pooling.md")
+            if getattr(parallel_config, "world_size", 1) != 1:
+                raise ValueError("Mobilint pooling currently requires tensor/pipeline parallel size 1")
+            parallel_config.worker_cls = "vllm_mblt.pooling_worker.MbltPoolingWorker"
+            if getattr(vllm_config.cache_config, "block_size", None) is None:
+                vllm_config.cache_config.block_size = 128
+            vllm_config.cache_config.enable_prefix_caching = False
+            scheduler = vllm_config.scheduler_config
+            scheduler.enable_chunked_prefill = False
+            scheduler.chunked_prefill_enabled = False
+            scheduler.max_num_batched_tokens = max(
+                scheduler.max_num_batched_tokens, vllm_config.model_config.max_model_len
+            )
+            return
         parallel_config.worker_cls = "vllm_mblt.mblt_worker.MbltWorker"
 
         cache_config: CacheConfig = vllm_config.cache_config

@@ -113,6 +113,14 @@ Current Mobilint Qwen2/3-VL notes:
 
 ## Runtime Tuning
 
+### Embedding and Reranking Models
+
+Pooling models use compiled MXQ packages and a dedicated worker. See
+[the pooling guide](docs/pooling.md) for compilation, package contents,
+embedding/rerank API examples, and numerical validation for E5-small,
+Qwen3-Embedding/Reranker-0.6B, Nemotron-3-Embed-1B, and BGE-reranker-v2-m3.
+
+
 ### Runtime Layout Overrides
 
 By default, `vllm-mblt` follows the runtime layout encoded in the Mobilint model artifact/config. Use
