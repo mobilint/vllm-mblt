@@ -339,6 +339,11 @@ class MbltPlatform(Platform):
                 raise ValueError("Mobilint pooling requires a compiled artifact package; see docs/pooling.md")
             if getattr(parallel_config, "world_size", 1) != 1:
                 raise ValueError("Mobilint pooling currently requires tensor/pipeline parallel size 1")
+            hf_config = vllm_config.model_config.hf_config
+            if getattr(hf_config, "is_matryoshka", False) and getattr(hf_config, "matryoshka_dimensions", None) is None:
+                # vLLM 0.11.2 otherwise validates only dimensions > 0. Reject
+                # oversized requests before they can raise inside the engine.
+                hf_config.matryoshka_dimensions = list(range(1, hf_config.hidden_size + 1))
             parallel_config.worker_cls = "vllm_mblt.pooling_worker.MbltPoolingWorker"
             if getattr(vllm_config.cache_config, "block_size", None) is None:
                 vllm_config.cache_config.block_size = 128

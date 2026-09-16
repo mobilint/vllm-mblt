@@ -55,6 +55,14 @@ def main():
         long_payload["documents"] = ["word " * (manifest["max_length"] * 2)]
     too_long = requests.post(args.url + endpoint, json=long_payload, headers=headers, timeout=30).status_code
     assert too_long == 400
+    if embed and manifest.get("matryoshka"):
+        for dimensions in (0, manifest["hidden_size"] + 1):
+            invalid = dict(payload, dimensions=dimensions)
+            response = requests.post(args.url + endpoint, json=invalid, headers=headers, timeout=30)
+            assert response.status_code == 400
+            # A 400 alone is insufficient: an engine-side failure can also
+            # surface as a 400 before the API process shuts down.
+            run(None)
     report = dict(
         source_model=manifest["source_model"],
         endpoint=endpoint,

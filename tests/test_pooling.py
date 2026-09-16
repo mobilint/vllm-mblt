@@ -99,6 +99,12 @@ def test_pooling_scheduler_disables_partial_prompts_and_prefix_cache():
     assert cfg.cache_config.block_size == 128
     assert not cfg.scheduler_config.enable_chunked_prefill
     assert cfg.scheduler_config.max_num_batched_tokens == 512
+    cfg.model_config.hf_config.is_matryoshka = True
+    cfg.model_config.hf_config.hidden_size = 1024
+    MbltPlatform.check_and_update_config(cfg)
+    assert 256 in cfg.model_config.hf_config.matryoshka_dimensions
+    assert 0 not in cfg.model_config.hf_config.matryoshka_dimensions
+    assert 1025 not in cfg.model_config.hf_config.matryoshka_dimensions
 
 
 def test_worker_variable_length_batch_keeps_request_order():
