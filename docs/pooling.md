@@ -16,6 +16,42 @@ worker and scheduling behavior.
 The server takes a **compiled package path**, not the original FP32/BF16 Hub
 checkpoint. A source checkpoint alone does not contain an MXQ.
 
+## Before you start
+
+Serving requires a Mobilint Aries NPU with its driver and runtime installed.
+Compilation requires a separate CUDA GPU environment with the Mobilint compiler
+SDK; it does not require an NPU on the compiler host. The builds described here
+were validated on Aries with one NPU core and a maximum of 512 input tokens.
+Other hardware targets and longer sequence lengths require separate validation.
+
+Clone this repository and follow the [installation instructions](../README.md#installation)
+on the NPU host. Use a source revision containing this pooling implementation;
+installing an older PyPI release does not add these model classes.
+
+Choose one of these paths:
+
+- **Use a compiled package:** obtain a compatible complete pooling package and
+  its checksum from your model provider. Verify the checksum, extract the
+  archive, and continue with the serving examples below. Compilation is not
+  required on the serving host.
+- **Build your own package:** obtain a compatible Mobilint compiler SDK and
+  follow the compilation and validation steps below. The tested compiler version
+  is a development build; this repository does not provide its installer or
+  guarantee that it is available through a public package index.
+
+This repository does not include the five models' MXQ packages or publish a
+public download URL for them. For NPU setup, SDK access, or availability of
+compatible compiled packages, contact
+[tech-support@mobilint.com](mailto:tech-support@mobilint.com).
+The original Hugging Face checkpoints linked below are source weights, not
+ready-to-serve Mobilint packages. You do not need access to an internal server
+or a company network to follow these instructions once you have the required SDK
+or compiled package.
+
+All commands below run from the repository root. Paths such as `artifacts/e5-small`
+are directories you create locally. If compiling on another machine, transfer
+the entire resulting package to that path on the NPU host.
+
 ## Compile
 
 The tested Aries builds use `qbcompiler==1.3.1.dev1`, PyTorch
@@ -73,7 +109,9 @@ MXQs and weights are separate deliverables, not source files committed to Git.
 
 The tested runtime uses vLLM `0.11.2`, PyTorch `2.9.0`, Transformers `4.57.1`,
 `mobilint-qb-runtime==1.4.0`, and `mblt-model-zoo==2.6.0`. Install this plugin
-with `pip install -e .` in that environment, then run:
+with `pip install -e .` in that environment. Set `VLLM_API_KEY` to an API key
+you choose, for example `export VLLM_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"`.
+Keep the same environment variable in the client shell, then run:
 
 ```bash
 vllm serve ./artifacts/e5-small --runner pooling \
@@ -127,10 +165,14 @@ Generate references on the compiler/GPU host, then compare on the NPU host:
 
 ```bash
 PYTHONPATH=. python tools/pooling_reference.py artifacts/e5-small \
-  --device cuda --output e5-reference.json
+  --device cuda --output artifacts/e5-small/reference.json
 PYTHONPATH=. python tools/validate_pooling.py artifacts/e5-small \
-  --reference e5-reference.json --output e5-validation.json
+  --reference artifacts/e5-small/reference.json \
+  --output artifacts/e5-small/validation.json
 ```
+
+When generating references on a separate GPU host, copy `reference.json` into
+the corresponding package on the NPU host before running validation.
 
 Nemotron's reference model requires a separate Transformers >=5.5 environment.
 Serving uses only the exported table and MXQ, and remains compatible with the
@@ -141,7 +183,7 @@ and rejection of inputs above the compiled limit:
 
 ```bash
 python tools/validate_pooling_api.py artifacts/e5-small \
-  --url http://127.0.0.1:8000 --output e5-api-validation.json
+  --url http://127.0.0.1:8000 --output artifacts/e5-small/api-validation.json
 ```
 
 This command reads `VLLM_API_KEY` from the environment and assumes that the served
