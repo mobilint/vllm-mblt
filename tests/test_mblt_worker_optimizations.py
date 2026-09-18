@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -2796,6 +2797,85 @@ class TestMbltWorkerOptimizations:
             (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
             for param in captured["params"]
         ] == [(2, 5, 1), (1, 7, 2)]
+
+    def test_infer_logits_batch_dispatches_cache_rows_across_backend_models(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 2
+        barrier = threading.Barrier(2)
+        calls: list[tuple[int, list[tuple[int, int, int]]]] = []
+
+        def make_model(marker: int):
+            def infer(_inputs, **kwargs):
+                params = kwargs["params"]
+                calls.append(
+                    (
+                        marker,
+                        [
+                            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
+                            for param in params
+                        ],
+                    )
+                )
+                barrier.wait(timeout=2)
+                return [np.full((len(params), 4), float(marker), dtype=np.float32)]
+
+            return SimpleNamespace(
+                infer=infer,
+                get_num_model_variants=lambda: 0,
+            )
+
+        model0 = make_model(10)
+        model1 = make_model(20)
+        worker.cache_model = model0
+        worker.cache_backend = SimpleNamespace(mxq_models=[model0, model1], k_per_model=1)
+
+        logits = worker._infer_logits_batch(
+            [np.ones((1, 4), dtype=np.float32), np.ones((2, 4), dtype=np.float32)],
+            cache_sizes=[3, 5],
+            cache_ids=[1, 0],
+        )
+
+        np.testing.assert_array_equal(logits[0], np.full(4, 20.0, dtype=np.float32))
+        np.testing.assert_array_equal(logits[1], np.full(4, 10.0, dtype=np.float32))
+        assert sorted(calls) == [(10, [(2, 5, 0)]), (20, [(1, 3, 0)])]
+
+    def test_runtime_cache_io_routes_global_slot_to_backend_model(self) -> None:
+        worker = self._make_worker()
+        calls: list[tuple[str, int, object]] = []
+
+        def make_model(marker: str):
+            return SimpleNamespace(
+                dump_cache_memory=lambda cache_id: calls.append((f"dump-{marker}", cache_id, None))
+                or [marker],
+                load_cache_memory=lambda blobs, cache_id: calls.append((f"load-{marker}", cache_id, blobs)),
+            )
+
+        model0 = make_model("zero")
+        model1 = make_model("one")
+        worker.cache_model = model0
+        worker.cache_backend = SimpleNamespace(mxq_models=[model0, model1], k_per_model=2)
+
+        assert worker._dump_runtime_cache(slot_id=3) == ["one"]
+        assert worker._load_runtime_cache(["snapshot"], slot_id=2)
+        assert calls == [
+            ("dump-one", 1, None),
+            ("load-one", 0, ["snapshot"]),
+        ]
+
+    @pytest.mark.parametrize("multimodal", [False, True])
+    def test_resolve_cache_backend_finds_text_backend(self, multimodal: bool) -> None:
+        worker = self._make_worker()
+        cache_model = object()
+        backend = SimpleNamespace(mxq_models=[cache_model], k_per_model=1)
+        text_model = SimpleNamespace(npu_backend=backend)
+        worker.cache_model = cache_model
+        worker.model = (
+            SimpleNamespace(model=SimpleNamespace(language_model=text_model))
+            if multimodal
+            else text_model
+        )
+
+        assert worker._resolve_cache_backend() is backend
 
     def test_infer_logits_batch_passes_qwen3_vl_rope_then_deepstack_inputs(self) -> None:
         worker = self._make_worker()
