@@ -2285,6 +2285,21 @@ class TestMbltWorkerOptimizations:
             np.asarray([[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]], dtype=np.float32),
         )
 
+    def test_build_rope_embeddings_uses_model_zoo_27_runtime_helper(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        expected = np.full((1, 2, 6), 7.0, dtype=np.float32)
+        worker.model = SimpleNamespace(
+            get_language_model=lambda: SimpleNamespace(
+                _mobilint_rotary_emb=lambda _x, _position_ids: expected,
+                rotary_emb=None,
+            )
+        )
+
+        rope = worker._build_rope_embeddings_from_position_ids(torch.zeros((3, 1, 2), dtype=torch.long))
+
+        np.testing.assert_array_equal(rope, expected)
+
     def test_build_rope_input_embeds_uses_prompt_rows_and_mrope_delta_for_decode(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")

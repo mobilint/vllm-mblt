@@ -1170,15 +1170,18 @@ class MbltWorker(WorkerBase):
         if language_model is None:
             language_model = getattr(getattr(self.model, "model", None), "language_model", None)
 
-        rotary_emb = getattr(language_model, "rotary_emb", None)
-        return rotary_emb if callable(rotary_emb) else None
+        for attribute in ("_mobilint_rotary_emb", "rotary_emb"):
+            rotary_emb = getattr(language_model, attribute, None)
+            if callable(rotary_emb):
+                return rotary_emb
+        return None
 
     def _build_rope_embeddings_from_position_ids(self, position_ids: torch.Tensor) -> np.ndarray:
         rotary_emb = self._get_qwen3_vl_rotary_embedding()
         if rotary_emb is None:
             raise RuntimeError(
-                "Qwen3-VL 3-input text MXQ requires a callable language_model.rotary_emb "
-                "to build RoPE input tensors."
+                "Qwen3-VL dynamic text MXQ requires a callable language_model._mobilint_rotary_emb "
+                "(Model Zoo 2.7+) to build RoPE input tensors."
             )
         rotary_context = torch.empty((), device=position_ids.device, dtype=torch.float32)
         return np.asarray(rotary_emb(rotary_context, position_ids), dtype=np.float32)
@@ -1296,7 +1299,7 @@ class MbltWorker(WorkerBase):
     def _text_mxq_uses_rope_input(self) -> bool:
         if not self._supports_deepstack_input():
             return False
-        return len(self._cache_model_input_shapes(self._get_cache_model())) >= 3
+        return len(self._cache_model_input_shapes(self._get_cache_model())) in (3, 5)
 
     @staticmethod
     def _classify_qwen3_vl_tail_order(
@@ -1411,8 +1414,8 @@ class MbltWorker(WorkerBase):
         self,
         input_shapes: Sequence[Sequence[int]],
         hidden_size: int,
-    ) -> tuple[tuple[str, str], Optional[Sequence[int]], Sequence[int]]:
-        """Resolve (order, rope_shape, deepstack_shape) for a text MXQ signature.
+    ) -> tuple[tuple[str, ...], Optional[Sequence[int]], list[Sequence[int]]]:
+        """Resolve roles and shapes for bundled or per-layer DeepStack inputs.
 
         Both builders need the same three answers from the same shapes, and the
         order must be the one they later emit in: classifying one way and
@@ -1420,15 +1423,34 @@ class MbltWorker(WorkerBase):
         wrong logits with no error. Deriving all three here is what keeps them
         from drifting apart.
 
-        A 2-input signature has no rope input, so rope_shape is None and the
-        order is unused.
+        Model Zoo 2.7 adds the split layouts ``[input, ds0, ds1, ds2]`` and
+        ``[input, ds0, ds1, ds2, rope]``. Their positional contract is fixed;
+        only the legacy bundled 3-input layout needs shape-based ordering.
         """
 
-        if len(input_shapes) < 3:
-            return ("rope", "deepstack"), None, input_shapes[1]
-        order = self._qwen3_vl_text_extra_input_order(input_shapes, hidden_size)
-        shapes = dict(zip(order, input_shapes[1:3]))
-        return order, shapes["rope"], shapes["deepstack"]
+        if len(input_shapes) == 2:
+            return ("deepstack",), None, [input_shapes[1]]
+        if len(input_shapes) == 3:
+            order = self._qwen3_vl_text_extra_input_order(input_shapes, hidden_size)
+            shapes = dict(zip(order, input_shapes[1:3]))
+            return order, shapes["rope"], [shapes["deepstack"]]
+        if len(input_shapes) in (4, 5):
+            if len(input_shapes) == 4 and self._is_batch_model():
+                raise RuntimeError(
+                    "Batched split-static Qwen3-VL text MXQs are unsupported; "
+                    "use a 5-input split-dynamic artifact with external RoPE."
+                )
+            deepstack_count = len(input_shapes) - 1 - int(len(input_shapes) == 5)
+            roles = tuple(f"deepstack_{index}" for index in range(deepstack_count))
+            rope_shape = None
+            if len(input_shapes) == 5:
+                roles += ("rope",)
+                rope_shape = input_shapes[-1]
+            return roles, rope_shape, list(input_shapes[1 : 1 + deepstack_count])
+        raise RuntimeError(
+            "Unsupported Qwen3-VL text MXQ signature: expected 2/3-input bundled "
+            f"or 4/5-input split DeepStack layout, got {len(input_shapes)} inputs."
+        )
 
     def _build_infer_inputs(
         self,
@@ -1446,64 +1468,66 @@ class MbltWorker(WorkerBase):
                 raise RuntimeError("Deepstack embeddings are only supported for Qwen3-VL models.")
             return batched_input
 
-        uses_rope_input = len(input_shapes) >= 3
-        extra_input_order, rope_shape, deepstack_shape = self._qwen3_vl_text_extra_input_layout(
+        extra_input_order, rope_shape, deepstack_shapes = self._qwen3_vl_text_extra_input_layout(
             input_shapes, int(input_embeds.shape[-1])
         )
+        uses_rope_input = rope_shape is not None
         if uses_rope_input:
             if rope_embeds is None:
-                raise RuntimeError("Qwen3-VL 3-input text MXQ requires RoPE embeddings.")
+                raise RuntimeError("Qwen3-VL dynamic text MXQ requires RoPE embeddings.")
             if len(rope_shape) != 3:
                 raise RuntimeError(
-                    "3-input Qwen3-VL text MXQ rope input must have rank 3 "
+                    "Qwen3-VL text MXQ rope input must have rank 3 "
                     f"(1, sequence, pe_size), but got shape={rope_shape}."
                 )
             expected_rope_batch, expected_rope_seq, expected_rope_size = rope_shape
             if expected_rope_batch not in (-1, 1):
-                raise RuntimeError(f"3-input Qwen3-VL text MXQ rope batch dimension must be 1, got {rope_shape}.")
+                raise RuntimeError(f"Qwen3-VL text MXQ rope batch dimension must be 1, got {rope_shape}.")
             if expected_rope_seq > 0 and expected_rope_seq != input_embeds.shape[0]:
                 raise RuntimeError(
-                    "3-input Qwen3-VL text MXQ rope sequence dimension mismatch: "
+                    "Qwen3-VL text MXQ rope sequence dimension mismatch: "
                     f"expected={expected_rope_seq}, input_seq_len={input_embeds.shape[0]}, shape={rope_shape}."
                 )
             if expected_rope_size > 0 and expected_rope_size != rope_embeds.shape[-1]:
                 raise RuntimeError(
-                    "3-input Qwen3-VL text MXQ rope hidden dimension mismatch: "
+                    "Qwen3-VL text MXQ rope hidden dimension mismatch: "
                     f"expected={expected_rope_size}, rope_size={rope_embeds.shape[-1]}, shape={rope_shape}."
                 )
             expected_rope_shape = (1, int(input_embeds.shape[0]), int(rope_embeds.shape[-1]))
             if tuple(rope_embeds.shape) != expected_rope_shape:
                 raise RuntimeError(
-                    "RoPE embedding shape mismatch for 3-input Qwen3-VL text MXQ: "
+                    "RoPE embedding shape mismatch for Qwen3-VL text MXQ: "
                     f"expected={expected_rope_shape}, got={tuple(rope_embeds.shape)}."
                 )
-        if len(deepstack_shape) != 3:
-            raise RuntimeError(
-                "Dual-input model deepstack input must have rank 3 "
-                f"(layers, sequence, hidden), but got shape={deepstack_shape}."
-            )
-
-        expected_layers, expected_seq_len, expected_hidden = deepstack_shape
-        if expected_layers <= 0:
-            raise RuntimeError(
-                "Dual-input model deepstack layer dimension must be fixed and positive, "
-                f"but got shape={deepstack_shape}."
-            )
-
         input_seq_len = int(input_embeds.shape[0])
         input_hidden = int(input_embeds.shape[-1])
-        if expected_seq_len > 0 and expected_seq_len != input_seq_len:
-            raise RuntimeError(
-                "Dual-input model deepstack sequence dimension mismatch: "
-                f"expected={expected_seq_len}, input_seq_len={input_seq_len}, "
-                f"shape={deepstack_shape}."
-            )
-        if expected_hidden > 0 and expected_hidden != input_hidden:
-            raise RuntimeError(
-                "Dual-input model deepstack hidden dimension mismatch: "
-                f"expected={expected_hidden}, input_hidden={input_hidden}, "
-                f"shape={deepstack_shape}."
-            )
+        split_deepstack = len(deepstack_shapes) > 1
+        for deepstack_shape in deepstack_shapes:
+            if len(deepstack_shape) != 3:
+                raise RuntimeError(
+                    "Qwen3-VL DeepStack input must have rank 3 "
+                    f"(layers, sequence, hidden), but got shape={deepstack_shape}."
+                )
+            expected_shape_layers, expected_seq_len, expected_hidden = deepstack_shape
+            if split_deepstack and expected_shape_layers not in (-1, 1):
+                raise RuntimeError(
+                    "Split Qwen3-VL DeepStack inputs must each contain one layer, "
+                    f"but got shape={deepstack_shape}."
+                )
+            if expected_seq_len > 0 and expected_seq_len != input_seq_len:
+                raise RuntimeError(
+                    "Qwen3-VL DeepStack sequence dimension mismatch: "
+                    f"expected={expected_seq_len}, input_seq_len={input_seq_len}, shape={deepstack_shape}."
+                )
+            if expected_hidden > 0 and expected_hidden != input_hidden:
+                raise RuntimeError(
+                    "Qwen3-VL DeepStack hidden dimension mismatch: "
+                    f"expected={expected_hidden}, input_hidden={input_hidden}, shape={deepstack_shape}."
+                )
+
+        expected_layers = len(deepstack_shapes) if split_deepstack else int(deepstack_shapes[0][0])
+        if expected_layers <= 0:
+            raise RuntimeError("Qwen3-VL bundled DeepStack layer dimension must be fixed and positive.")
 
         if deepstack_embeds is None:
             deepstack_embeds = np.zeros(
@@ -1517,13 +1541,14 @@ class MbltWorker(WorkerBase):
                     "Deepstack embedding shape mismatch for dual-input model: "
                     f"expected={expected_shape}, got={tuple(deepstack_embeds.shape)}."
                 )
+        deepstack_array = deepstack_embeds.astype(np.float32, copy=False)
+        extras = {"deepstack": deepstack_array}
+        extras.update(
+            {f"deepstack_{index}": deepstack_array[index : index + 1] for index in range(expected_layers)}
+        )
         if uses_rope_input:
-            extras = {
-                "rope": rope_embeds.astype(np.float32, copy=False),
-                "deepstack": deepstack_embeds.astype(np.float32, copy=False),
-            }
-            return [batched_input, *(extras[name] for name in extra_input_order)]
-        return [batched_input, deepstack_embeds.astype(np.float32, copy=False)]
+            extras["rope"] = rope_embeds.astype(np.float32, copy=False)
+        return [batched_input, *(extras[name] for name in extra_input_order)]
 
     def _build_batch_infer_inputs(
         self,
@@ -1570,48 +1595,53 @@ class MbltWorker(WorkerBase):
 
         hidden_size = int(concat_input.shape[-1])
         packed_tokens = int(concat_input.shape[0])
-        uses_rope_input = len(input_shapes) >= 3
-        extra_input_order, rope_shape, deepstack_shape = self._qwen3_vl_text_extra_input_layout(
+        extra_input_order, rope_shape, deepstack_shapes = self._qwen3_vl_text_extra_input_layout(
             input_shapes, hidden_size
         )
+        uses_rope_input = rope_shape is not None
         if uses_rope_input:
             if rope_embeds_batch is None:
-                raise RuntimeError("Qwen3-VL 3-input batch text MXQ requires batched RoPE embeddings.")
+                raise RuntimeError("Qwen3-VL dynamic batch text MXQ requires batched RoPE embeddings.")
             if len(rope_shape) != 3:
                 raise RuntimeError(
-                    "3-input Qwen3-VL batch text MXQ rope input must have rank 3 "
+                    "Qwen3-VL batch text MXQ rope input must have rank 3 "
                     f"(1, packed_tokens, pe_size), but got shape={rope_shape}."
                 )
             expected_rope_batch, expected_rope_seq, expected_rope_size = rope_shape
             if expected_rope_batch not in (-1, 1):
-                raise RuntimeError(f"3-input Qwen3-VL batch text MXQ rope batch dimension must be 1, got {rope_shape}.")
+                raise RuntimeError(f"Qwen3-VL batch text MXQ rope batch dimension must be 1, got {rope_shape}.")
             if expected_rope_seq > 0 and expected_rope_seq != packed_tokens:
                 raise RuntimeError(
-                    "3-input Qwen3-VL batch text MXQ rope packed-token dimension mismatch: "
+                    "Qwen3-VL batch text MXQ rope packed-token dimension mismatch: "
                     f"expected={expected_rope_seq}, packed_tokens={packed_tokens}, shape={rope_shape}."
                 )
-        if len(deepstack_shape) != 3:
-            raise RuntimeError(
-                "Dual-input batch model deepstack input must have rank 3 "
-                f"(layers, packed_tokens, hidden), but got shape={deepstack_shape}."
-            )
-        expected_layers, expected_seq_len, expected_hidden = deepstack_shape
-        if expected_layers <= 0:
-            raise RuntimeError(
-                "Dual-input batch model deepstack layer dimension must be fixed and positive, "
-                f"but got shape={deepstack_shape}."
-            )
+        split_deepstack = len(deepstack_shapes) > 1
+        for deepstack_shape in deepstack_shapes:
+            if len(deepstack_shape) != 3:
+                raise RuntimeError(
+                    "Qwen3-VL batch DeepStack input must have rank 3 "
+                    f"(layers, packed_tokens, hidden), but got shape={deepstack_shape}."
+                )
+            expected_shape_layers, expected_seq_len, expected_hidden = deepstack_shape
+            if split_deepstack and expected_shape_layers not in (-1, 1):
+                raise RuntimeError(
+                    "Split Qwen3-VL batch DeepStack inputs must each contain one layer, "
+                    f"but got shape={deepstack_shape}."
+                )
+            if expected_seq_len > 0 and expected_seq_len != packed_tokens:
+                raise RuntimeError(
+                    "Qwen3-VL batch DeepStack packed-token dimension mismatch: "
+                    f"expected={expected_seq_len}, packed_tokens={packed_tokens}, shape={deepstack_shape}."
+                )
+            if expected_hidden > 0 and expected_hidden != hidden_size:
+                raise RuntimeError(
+                    "Qwen3-VL batch DeepStack hidden dimension mismatch: "
+                    f"expected={expected_hidden}, hidden_size={hidden_size}, shape={deepstack_shape}."
+                )
 
-        if expected_seq_len > 0 and expected_seq_len != packed_tokens:
-            raise RuntimeError(
-                "Dual-input batch model deepstack packed-token dimension mismatch: "
-                f"expected={expected_seq_len}, packed_tokens={packed_tokens}, shape={deepstack_shape}."
-            )
-        if expected_hidden > 0 and expected_hidden != hidden_size:
-            raise RuntimeError(
-                "Dual-input batch model deepstack hidden dimension mismatch: "
-                f"expected={expected_hidden}, hidden_size={hidden_size}, shape={deepstack_shape}."
-            )
+        expected_layers = len(deepstack_shapes) if split_deepstack else int(deepstack_shapes[0][0])
+        if expected_layers <= 0:
+            raise RuntimeError("Qwen3-VL bundled batch DeepStack layer dimension must be fixed and positive.")
 
         deepstack_chunks: list[np.ndarray] = []
         for i, input_embeds in enumerate(input_embeds_batch):
@@ -1629,8 +1659,13 @@ class MbltWorker(WorkerBase):
                 deepstack_embeds = deepstack_embeds.astype(np.float32, copy=False)
             deepstack_chunks.append(deepstack_embeds)
 
+        deepstack_concat = np.concatenate(deepstack_chunks, axis=1)
+        extras = {"deepstack": deepstack_concat}
+        extras.update(
+            {f"deepstack_{index}": deepstack_concat[index : index + 1] for index in range(expected_layers)}
+        )
         if not uses_rope_input:
-            return [text_input, np.concatenate(deepstack_chunks, axis=1)]
+            return [text_input, *(extras[name] for name in extra_input_order)]
 
         rope_chunks: list[np.ndarray] = []
         assert rope_embeds_batch is not None
@@ -1638,24 +1673,21 @@ class MbltWorker(WorkerBase):
             seq_len = int(input_embeds.shape[0])
             rope_embeds = rope_embeds_batch[i]
             if rope_embeds is None:
-                raise RuntimeError("Qwen3-VL 3-input batch text MXQ is missing RoPE embeddings for a request.")
+                raise RuntimeError("Qwen3-VL dynamic batch text MXQ is missing RoPE embeddings for a request.")
             expected_rope_shape = (1, seq_len, int(rope_embeds.shape[-1]))
             if tuple(rope_embeds.shape) != expected_rope_shape:
                 raise RuntimeError(
-                    "Batched RoPE embedding shape mismatch for 3-input Qwen3-VL text MXQ: "
+                    "Batched RoPE embedding shape mismatch for Qwen3-VL text MXQ: "
                     f"expected={expected_rope_shape}, got={tuple(rope_embeds.shape)}."
                 )
             if expected_rope_size > 0 and expected_rope_size != rope_embeds.shape[-1]:
                 raise RuntimeError(
-                    "3-input Qwen3-VL batch text MXQ rope hidden dimension mismatch: "
+                    "Qwen3-VL batch text MXQ rope hidden dimension mismatch: "
                     f"expected={expected_rope_size}, rope_size={rope_embeds.shape[-1]}, shape={rope_shape}."
                 )
             rope_chunks.append(rope_embeds.astype(np.float32, copy=False))
 
-        extras = {
-            "rope": np.concatenate(rope_chunks, axis=1),
-            "deepstack": np.concatenate(deepstack_chunks, axis=1),
-        }
+        extras["rope"] = np.concatenate(rope_chunks, axis=1)
         return [text_input, *(extras[name] for name in extra_input_order)]
 
     @staticmethod
