@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+
+- Multi-card software batching now uses Model Zoo's multi-slot NPU backend
+  when `dev_no` is a list. The worker maps each global vLLM cache row to its
+  owning MXQ model and local cache ID, dispatches independent model-slot
+  batches concurrently, and restores outputs to scheduler order.
+- KV-cache dump/load and prefix-cache snapshots follow the same multi-slot
+  mapping, keeping request state bound to the correct model instance and local
+  cache ID across cards.
+
+### Changed
+
+- Model loading now validates that the aggregate backend capacity (`N * K`)
+  covers the scheduler's resolved `max_batch_size` and reports multi-slot
+  topology in initialization logs.
+
 ## 0.4.0
 
 ### Added

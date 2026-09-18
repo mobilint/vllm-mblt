@@ -3,6 +3,7 @@ import math
 import os
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Sequence
 
@@ -364,6 +365,7 @@ class MbltWorker(WorkerBase):
         self.model: Optional[MobilintGenerationMixin] = None
         self.input_embeddings: Optional[nn.Module] = None
         self.cache_model: Optional[Any] = None
+        self.cache_backend: Optional[Any] = None
         self._infer_output_buffers: Optional[list[np.ndarray]] = None
 
         self.req_states: Dict[str, RequestState] = {}
@@ -516,6 +518,53 @@ class MbltWorker(WorkerBase):
                 raise RuntimeError("Model is not initialized.")
             self.cache_model = self.model.get_cache_mxq_model()
         return self.cache_model
+
+    def _resolve_cache_backend(self) -> Optional[Any]:
+        """Return the model-zoo backend that owns the text MXQ model slots."""
+        if self.model is None:
+            return None
+
+        candidates = [self.model]
+        inner_model = getattr(self.model, "model", None)
+        if inner_model is not None:
+            candidates.append(inner_model)
+            language_model = getattr(inner_model, "language_model", None)
+            if language_model is not None:
+                candidates.append(language_model)
+        language_model = getattr(self.model, "language_model", None)
+        if language_model is not None:
+            candidates.append(language_model)
+
+        cache_model = self._get_cache_model()
+        for candidate in candidates:
+            backend = getattr(candidate, "npu_backend", None)
+            models = getattr(backend, "mxq_models", None)
+            if backend is not None and models and any(model is cache_model for model in models):
+                return backend
+        return None
+
+    def _get_cache_models(self) -> list[Any]:
+        backend = getattr(self, "cache_backend", None)
+        models = getattr(backend, "mxq_models", None)
+        if models:
+            return list(models)
+        return [self._get_cache_model()]
+
+    def _cache_slot(self, cache_id: int) -> tuple[Any, int, int]:
+        """Map a worker-global cache row to ``(model, model_idx, local_id)``."""
+        backend = getattr(self, "cache_backend", None)
+        backend_models = getattr(backend, "mxq_models", None)
+        if not backend_models:
+            return self._get_cache_model(), 0, int(cache_id)
+        models = list(backend_models)
+        k_per_model = max(1, int(getattr(backend, "k_per_model", 1) or 1))
+        model_idx, local_cache_id = divmod(int(cache_id), k_per_model)
+        if model_idx >= len(models):
+            raise RuntimeError(
+                "Mobilint cache slot exceeds the loaded multi-card capacity: "
+                f"cache_id={cache_id}, models={len(models)}, k_per_model={k_per_model}."
+            )
+        return models[model_idx], model_idx, local_cache_id
 
     def _supports_deepstack_input(self) -> bool:
         hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
@@ -689,17 +738,17 @@ class MbltWorker(WorkerBase):
         self.runtime_cache.release_slot(req_id)
 
     def _dump_runtime_cache(self, slot_id: Optional[int] = None) -> Optional[list[Any]]:
-        cache_model = self._get_cache_model()
         if slot_id is None:
-            return cache_model.dump_cache_memory()
-        return cache_model.dump_cache_memory(cache_id=slot_id)
+            return self._get_cache_model().dump_cache_memory()
+        cache_model, _, local_slot_id = self._cache_slot(slot_id)
+        return cache_model.dump_cache_memory(cache_id=local_slot_id)
 
     def _load_runtime_cache(self, blobs: list[Any], slot_id: Optional[int] = None) -> bool:
-        cache_model = self._get_cache_model()
         if slot_id is None:
-            cache_model.load_cache_memory(blobs)
+            self._get_cache_model().load_cache_memory(blobs)
         else:
-            cache_model.load_cache_memory(blobs, cache_id=slot_id)
+            cache_model, _, local_slot_id = self._cache_slot(slot_id)
+            cache_model.load_cache_memory(blobs, cache_id=local_slot_id)
         return True
 
     def _timed_load_runtime_cache(self, blobs: list[Any], slot_id: Optional[int] = None) -> bool:
@@ -1925,73 +1974,40 @@ class MbltWorker(WorkerBase):
         deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
         rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
     ) -> list[np.ndarray]:
-        if not input_embeds_batch:
-            return []
-
-        cache_model = self._get_cache_model()
-        batch_size = len(input_embeds_batch)
-        params = self._make_batch_params(
-            sequence_lengths=[int(input_embeds.shape[0]) for input_embeds in input_embeds_batch],
-            cache_sizes=cache_sizes,
-            cache_ids=cache_ids,
-        )
-
-        infer_inputs = self._build_batch_infer_inputs(
-            input_embeds_batch,
-            deepstack_embeds_batch,
-            rope_embeds_batch=rope_embeds_batch,
-        )
-        infer_output = cache_model.infer(infer_inputs, params=params)
-
-        logits = infer_output[0] if isinstance(infer_output, (list, tuple)) else infer_output
-        logits_np = np.asarray(logits)
-        if logits_np.ndim == 3:
-            offset = 0
-            last_token_logits: list[np.ndarray] = []
-            for input_embeds in input_embeds_batch:
-                seq_len = int(input_embeds.shape[0])
-                if seq_len <= 0:
-                    raise RuntimeError("Batched infer received an empty input embedding slice.")
-                last_token_logits.append(logits_np[0, offset + seq_len - 1, :])
-                offset += seq_len
-            if offset != logits_np.shape[1]:
-                raise RuntimeError(
-                    "Batched infer returned logits with unexpected sequence length: "
-                    f"shape={logits_np.shape}, expected_tokens={offset}"
-                )
-            return last_token_logits
-        if logits_np.size % batch_size != 0:
-            raise RuntimeError(
-                f"Batched infer returned logits with unexpected shape: shape={logits_np.shape}, batch_size={batch_size}"
+        return [
+            output.last_token_logits
+            for output in self._infer_logits_batch_with_sequence(
+                input_embeds_batch,
+                cache_sizes,
+                cache_ids,
+                deepstack_embeds_batch,
+                rope_embeds_batch,
             )
-        logits_np = logits_np.reshape(batch_size, -1)
-        return [logits_np[i] for i in range(batch_size)]
+        ]
 
-    def _infer_logits_batch_with_sequence(
+    def _infer_logits_batch_group(
         self,
+        cache_model: Any,
         input_embeds_batch: list[np.ndarray],
         cache_sizes: list[int],
-        cache_ids: list[int],
-        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
-        rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
+        local_cache_ids: list[int],
+        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]],
+        rope_embeds_batch: Optional[list[Optional[np.ndarray]]],
     ) -> list[InferenceLogits]:
-        if not input_embeds_batch:
-            return []
-
-        cache_model = self._get_cache_model()
+        """Run one Model slot and parse its logits without changing row order."""
         batch_size = len(input_embeds_batch)
         params = self._make_batch_params(
             sequence_lengths=[int(input_embeds.shape[0]) for input_embeds in input_embeds_batch],
             cache_sizes=cache_sizes,
-            cache_ids=cache_ids,
+            cache_ids=local_cache_ids,
         )
-
         infer_inputs = self._build_batch_infer_inputs(
             input_embeds_batch,
             deepstack_embeds_batch,
             rope_embeds_batch=rope_embeds_batch,
         )
         infer_output = cache_model.infer(infer_inputs, params=params)
+
         logits = infer_output[0] if isinstance(infer_output, (list, tuple)) else infer_output
         logits_np = np.asarray(logits)
         if logits_np.ndim == 3:
@@ -2015,13 +2031,65 @@ class MbltWorker(WorkerBase):
                     f"shape={logits_np.shape}, expected_tokens={offset}"
                 )
             return outputs
-
         if logits_np.size % batch_size != 0:
             raise RuntimeError(
                 f"Batched infer returned logits with unexpected shape: shape={logits_np.shape}, batch_size={batch_size}"
             )
         logits_np = logits_np.reshape(batch_size, -1)
         return [InferenceLogits(last_token_logits=logits_np[i], full_sequence_logits=None) for i in range(batch_size)]
+
+    def _infer_logits_batch_with_sequence(
+        self,
+        input_embeds_batch: list[np.ndarray],
+        cache_sizes: list[int],
+        cache_ids: list[int],
+        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
+        rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
+    ) -> list[InferenceLogits]:
+        if not input_embeds_batch:
+            return []
+        if not (len(input_embeds_batch) == len(cache_sizes) == len(cache_ids)):
+            raise RuntimeError("Batched infer inputs, cache sizes, and cache IDs must have identical lengths.")
+
+        groups: dict[int, list[tuple[int, int]]] = {}
+        models: dict[int, Any] = {}
+        for row_index, cache_id in enumerate(cache_ids):
+            cache_model, model_idx, local_cache_id = self._cache_slot(cache_id)
+            models[model_idx] = cache_model
+            groups.setdefault(model_idx, []).append((row_index, local_cache_id))
+
+        outputs: list[Optional[InferenceLogits]] = [None] * len(input_embeds_batch)
+
+        def _slice_optional(
+            values: Optional[list[Optional[np.ndarray]]], indices: list[int]
+        ) -> Optional[list[Optional[np.ndarray]]]:
+            return None if values is None else [values[index] for index in indices]
+
+        def _run_group(model_idx: int) -> None:
+            entries = groups[model_idx]
+            indices = [entry[0] for entry in entries]
+            group_outputs = self._infer_logits_batch_group(
+                models[model_idx],
+                [input_embeds_batch[index] for index in indices],
+                [cache_sizes[index] for index in indices],
+                [entry[1] for entry in entries],
+                _slice_optional(deepstack_embeds_batch, indices),
+                _slice_optional(rope_embeds_batch, indices),
+            )
+            for index, output in zip(indices, group_outputs):
+                outputs[index] = output
+
+        if len(groups) == 1:
+            _run_group(next(iter(groups)))
+        else:
+            with ThreadPoolExecutor(max_workers=len(groups), thread_name_prefix="mblt-npu") as executor:
+                futures = [executor.submit(_run_group, model_idx) for model_idx in sorted(groups)]
+                for future in futures:
+                    future.result()
+
+        if any(output is None for output in outputs):
+            raise RuntimeError("Multi-card batched infer did not produce every requested output row.")
+        return [output for output in outputs if output is not None]
 
     def _infer_normal_logits_batch_chunked(
         self,
@@ -3355,10 +3423,22 @@ class MbltWorker(WorkerBase):
         start = time.perf_counter()
         self._log_init_stage("load_model:before_get_cache_mxq_model")
         self.cache_model = self.model.get_cache_mxq_model()
+        self.cache_backend = self._resolve_cache_backend()
+        cache_models = self._get_cache_models()
+        backend_capacity = len(cache_models) * max(
+            1, int(getattr(self.cache_backend, "k_per_model", self.max_batch_size) or 1)
+        )
+        if backend_capacity < self.max_batch_size:
+            raise RuntimeError(
+                "Mobilint backend capacity is smaller than the vLLM scheduler capacity: "
+                f"backend_capacity={backend_capacity}, max_batch_size={self.max_batch_size}."
+            )
         self._log_init_stage(
             "load_model:after_get_cache_mxq_model",
             start,
             cache_model_type=type(self.cache_model).__name__,
+            cache_model_slots=len(cache_models),
+            cache_slots_per_model=getattr(self.cache_backend, "k_per_model", self.max_batch_size),
         )
         self._reset_cache_slots()
         self._infer_output_buffers = None
@@ -4084,6 +4164,7 @@ class MbltWorker(WorkerBase):
             if callable(dispose):
                 dispose()
         self.cache_model = None
+        self.cache_backend = None
         self.input_embeddings = None
         self._infer_output_buffers = None
         self.runtime_cache.reset()

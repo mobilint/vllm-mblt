@@ -208,6 +208,27 @@ vllm serve mobilint/Llama-3.2-1B-Instruct-Batch32 --trust-remote-code
 For batch-compiled MXQs such as `mobilint/Llama-3.2-1B-Instruct-Batch32`, the plugin also caps the effective
 chunked prefill limit to `128`, even when the model config advertises a larger `npu_prefill_chunk_size`.
 
+### Multi-Card Software Batching
+
+`dev_no` may be a list when the installed `mblt-model-zoo` / `mblt-npu-python` backend supports multi-slot
+inference. The backend creates enough MXQ model slots for the requested aggregate `max_batch_size`, distributes
+the slots round-robin across the selected cards, and `vllm-mblt` dispatches each scheduled batch to the owning
+model slots concurrently.
+
+```bash
+vllm serve mobilint/Llama-3.2-1B-Instruct \
+  --trust-remote-code \
+  --model-loader-extra-config '{"dev_no": [0, 1], "max_batch_size": 2}'
+```
+
+If one MXQ model instance has compiled batch capacity `K`, the backend loads
+`ceil(max_batch_size / K)` model instances. `max_batch_size` is therefore the aggregate serving capacity across
+all loaded instances, not a per-card value. KV-cache rows, including prefix-cache snapshots, remain bound to the
+model instance and local cache ID that own them.
+
+For explicit core or cluster placement across multiple cards, use canonical device-qualified target strings such
+as `"0:0:0"` / `"1:0:0"` for `target_cores` or `"0:0"` / `"1:0"` for `target_clusters`.
+
 ## Benchmarking
 
 This repository includes `sonnet.txt`, which can be used with vLLM benchmark commands.
