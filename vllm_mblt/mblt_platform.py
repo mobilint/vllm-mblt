@@ -334,6 +334,40 @@ class MbltPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config: ParallelConfig = vllm_config.parallel_config  # type: ignore
+        if getattr(vllm_config.model_config, "runner_type", None) == "pooling":
+            if not getattr(vllm_config.model_config.hf_config, "mblt_pooling", None):
+                raise ValueError("Mobilint pooling requires a compiled artifact package; see docs/pooling.md")
+            if getattr(parallel_config, "world_size", 1) != 1:
+                raise ValueError("Mobilint pooling currently requires tensor/pipeline parallel size 1")
+            hf_config = vllm_config.model_config.hf_config
+            expected_pooling = {"mean": "MEAN", "last": "LAST", "scalar": "CLS", "yes_no": "LAST"}
+            if hf_config.mblt_pooling not in expected_pooling:
+                raise ValueError("Unknown compiled Mobilint pooling task")
+            pooler = getattr(vllm_config.model_config, "pooler_config", None)
+            if pooler is not None:
+                if pooler.pooling_type not in (None, expected_pooling[hf_config.mblt_pooling]):
+                    raise ValueError("pooling_type must match the compiled Mobilint package")
+                if pooler.enable_chunked_processing or pooler.max_embed_len not in (
+                    None, vllm_config.model_config.max_model_len
+                ):
+                    raise ValueError("Mobilint pooling does not support long-input chunked processing")
+                if any(getattr(pooler, key) is not None for key in ("logit_bias", "step_tag_id", "returned_token_ids")):
+                    raise ValueError("Mobilint pooling does not support logit_bias or token-selection overrides")
+            if getattr(hf_config, "is_matryoshka", False) and getattr(hf_config, "matryoshka_dimensions", None) is None:
+                # vLLM 0.11.2 otherwise validates only dimensions > 0. Reject
+                # oversized requests before they can raise inside the engine.
+                hf_config.matryoshka_dimensions = list(range(1, hf_config.hidden_size + 1))
+            parallel_config.worker_cls = "vllm_mblt.pooling_worker.MbltPoolingWorker"
+            if getattr(vllm_config.cache_config, "block_size", None) is None:
+                vllm_config.cache_config.block_size = 128
+            vllm_config.cache_config.enable_prefix_caching = False
+            scheduler = vllm_config.scheduler_config
+            scheduler.enable_chunked_prefill = False
+            scheduler.chunked_prefill_enabled = False
+            scheduler.max_num_batched_tokens = max(
+                scheduler.max_num_batched_tokens, vllm_config.model_config.max_model_len
+            )
+            return
         parallel_config.worker_cls = "vllm_mblt.mblt_worker.MbltWorker"
 
         cache_config: CacheConfig = vllm_config.cache_config
