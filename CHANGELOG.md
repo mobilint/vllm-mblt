@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0
+## 0.4.0
 
 ### Added
 
@@ -14,6 +14,21 @@
   `_mobilint_rotary_emb` runtime helper, while retaining the legacy
   `rotary_emb` fallback. Without this lookup, dynamic Batch16 artifacts loaded
   successfully but the first request fatally stopped the engine.
+
+### Changed
+
+- Raised the minimum `mblt-model-zoo[transformers]` version from 2.3.0 to
+  2.7.0. This establishes the Model Zoo contract needed for Qwen3-VL Batch16
+  split-dynamic text MXQs and removes the former processor-side 2048-token
+  dynamic-vision cap.
+- Qwen3-VL processor integration now has regression coverage ensuring image and
+  video resolution overrides reach Model Zoo unchanged and the removed
+  2048-token cap is not reintroduced at the vllm-mblt boundary.
+
+## 0.3.0
+
+### Added
+
 - `MbltWorker.profile()` records NPU activity as a qbruntime event trace, so
   users can see where time goes on the accelerator. vLLM reaches every worker
   through `collective_rpc("profile", ...)` and the v1 `WorkerBase` declares no
@@ -42,16 +57,6 @@
   on an Aries board: a start/stop window around one completion request produced
   a 1330-event trace, and a `SIGTERM` mid-trace wrote the window before
   `Model disposed.`
-
-### Changed
-
-- Raised the minimum `mblt-model-zoo[transformers]` version from 2.3.0 to
-  2.7.0. This establishes the Model Zoo contract needed for Qwen3-VL Batch16
-  split-dynamic text MXQs and removes the former processor-side 2048-token
-  dynamic-vision cap.
-- Qwen3-VL processor integration now has regression coverage ensuring image and
-  video resolution overrides reach Model Zoo unchanged and the removed
-  2048-token cap is not reintroduced at the vllm-mblt boundary.
 
 ## 0.2.3
 
