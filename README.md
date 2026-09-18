@@ -393,6 +393,8 @@ Qwen3-VL dynamic-vision Batch16 artifacts forward packed text embeddings plus
 the matching packed RoPE and DeepStack tensors. Both the bundled 3-input text
 layout and the per-layer split 5-input layout are supported; batched split-static
 artifacts remain unsupported.
+Qwen3-VL dynamic image and video processor resolution overrides are passed through
+to the selected artifact; vllm-mblt does not impose the former 2048 vision-token cap.
 Unsupported multimodal model types fail before runtime inference with a clear
 error.
 

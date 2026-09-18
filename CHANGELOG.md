@@ -49,6 +49,9 @@
   2.7.0. This establishes the Model Zoo contract needed for Qwen3-VL Batch16
   split-dynamic text MXQs and removes the former processor-side 2048-token
   dynamic-vision cap.
+- Qwen3-VL processor integration now has regression coverage ensuring image and
+  video resolution overrides reach Model Zoo unchanged and the removed
+  2048-token cap is not reintroduced at the vllm-mblt boundary.
 
 ## 0.2.3
 
