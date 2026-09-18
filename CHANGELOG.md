@@ -10,6 +10,10 @@
   worker validates every declared layer shape, emits one tensor per DeepStack
   layer, appends external RoPE for the dynamic layout, and rejects unsupported
   batched split-static artifacts before runtime inference.
+- External RoPE generation now reads Model Zoo 2.7's preserved
+  `_mobilint_rotary_emb` runtime helper, while retaining the legacy
+  `rotary_emb` fallback. Without this lookup, dynamic Batch16 artifacts loaded
+  successfully but the first request fatally stopped the engine.
 - `MbltWorker.profile()` records NPU activity as a qbruntime event trace, so
   users can see where time goes on the accelerator. vLLM reaches every worker
   through `collective_rpc("profile", ...)` and the v1 `WorkerBase` declares no

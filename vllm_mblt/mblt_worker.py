@@ -1170,15 +1170,18 @@ class MbltWorker(WorkerBase):
         if language_model is None:
             language_model = getattr(getattr(self.model, "model", None), "language_model", None)
 
-        rotary_emb = getattr(language_model, "rotary_emb", None)
-        return rotary_emb if callable(rotary_emb) else None
+        for attribute in ("_mobilint_rotary_emb", "rotary_emb"):
+            rotary_emb = getattr(language_model, attribute, None)
+            if callable(rotary_emb):
+                return rotary_emb
+        return None
 
     def _build_rope_embeddings_from_position_ids(self, position_ids: torch.Tensor) -> np.ndarray:
         rotary_emb = self._get_qwen3_vl_rotary_embedding()
         if rotary_emb is None:
             raise RuntimeError(
-                "Qwen3-VL 3-input text MXQ requires a callable language_model.rotary_emb "
-                "to build RoPE input tensors."
+                "Qwen3-VL dynamic text MXQ requires a callable language_model._mobilint_rotary_emb "
+                "(Model Zoo 2.7+) to build RoPE input tensors."
             )
         rotary_context = torch.empty((), device=position_ids.device, dtype=torch.float32)
         return np.asarray(rotary_emb(rotary_context, position_ids), dtype=np.float32)
