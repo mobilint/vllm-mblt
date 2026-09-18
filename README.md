@@ -37,7 +37,7 @@ can be served through familiar vLLM commands and OpenAI-compatible APIs.
 
 - Python 3.10+
 - `vllm==0.11.2`
-- `mblt-model-zoo[transformers] >= 2.1.0`
+- `mblt-model-zoo[transformers] >= 2.7.0`
 - A Mobilint NPU environment. If you are not yet a Mobilint customer, please contact
   [tech-support@mobilint.com](mailto:tech-support@mobilint.com).
 
@@ -388,10 +388,11 @@ layer: image requests still rebuild vision features through the model's
 multimodal feature hooks before the LM prefill/decode step.
 
 Batch-compiled VLM text backends (`max_batch_size > 1`) are supported for
-Mobilint Qwen2-VL and Qwen3-VL model types. With `mblt-model-zoo>=2.3.0`,
-Qwen3-VL dynamic-vision Batch16 artifacts such as
-`mobilint/Qwen3-VL-8B-Instruct-Batch16` forward packed text embeddings plus
-the matching packed RoPE and deepstack tensors to the 3-input text MXQ.
+Mobilint Qwen2-VL and Qwen3-VL model types. With `mblt-model-zoo>=2.7.0`,
+Qwen3-VL dynamic-vision Batch16 artifacts forward packed text embeddings plus
+the matching packed RoPE and DeepStack tensors. Both the bundled 3-input text
+layout and the per-layer split 5-input layout are supported; batched split-static
+artifacts remain unsupported.
 Unsupported multimodal model types fail before runtime inference with a clear
 error.
 

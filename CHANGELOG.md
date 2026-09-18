@@ -33,6 +33,13 @@
   a 1330-event trace, and a `SIGTERM` mid-trace wrote the window before
   `Model disposed.`
 
+### Changed
+
+- Raised the minimum `mblt-model-zoo[transformers]` version from 2.3.0 to
+  2.7.0. This establishes the Model Zoo contract needed for Qwen3-VL Batch16
+  split-dynamic text MXQs and removes the former processor-side 2048-token
+  dynamic-vision cap.
+
 ## 0.2.3
 
 ### Fixed
