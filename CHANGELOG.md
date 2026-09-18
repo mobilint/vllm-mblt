@@ -4,6 +4,12 @@
 
 ### Added
 
+- Qwen3-VL text dispatch now supports Model Zoo 2.7's per-layer split
+  DeepStack layouts: 4-input static artifacts for non-batch execution and
+  5-input dynamic artifacts for both non-batch and Batch16 execution. The
+  worker validates every declared layer shape, emits one tensor per DeepStack
+  layer, appends external RoPE for the dynamic layout, and rejects unsupported
+  batched split-static artifacts before runtime inference.
 - `MbltWorker.profile()` records NPU activity as a qbruntime event trace, so
   users can see where time goes on the accelerator. vLLM reaches every worker
   through `collective_rpc("profile", ...)` and the v1 `WorkerBase` declares no

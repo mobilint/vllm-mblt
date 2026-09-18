@@ -21,6 +21,7 @@ TOKENS = 7
 
 ROPE_SHAPE = (1, -1, PE)
 DEEPSTACK_SHAPE = (LAYERS, -1, HIDDEN)
+SPLIT_DEEPSTACK_SHAPE = (1, -1, HIDDEN)
 INPUT_SHAPE = (1, -1, HIDDEN)
 
 
@@ -231,3 +232,62 @@ class TestPathsAgree:
                 # slot 0 is always the text input, in both builders
                 np.testing.assert_allclose(batch_out[0], np.expand_dims(emb, 0))
                 np.testing.assert_allclose(single_out[0], np.expand_dims(emb, 0))
+
+
+@pytest.mark.parametrize("is_batch", [True, False])
+class TestSplitDeepStackLayouts:
+    def test_dynamic_layout_emits_each_layer_then_rope(self, is_batch) -> None:
+        shapes = (INPUT_SHAPE, *([SPLIT_DEEPSTACK_SHAPE] * LAYERS), ROPE_SHAPE)
+        worker = _worker(shapes, is_batch=is_batch)
+        emb, deepstack, rope = _embeds()
+
+        single = worker._build_infer_inputs(emb, deepstack, rope)
+        batch = worker._build_batch_infer_inputs([emb], [deepstack], [rope])
+
+        for outputs in (single, batch):
+            assert len(outputs) == 5
+            np.testing.assert_allclose(outputs[0], np.expand_dims(emb, 0))
+            for layer_index in range(LAYERS):
+                np.testing.assert_allclose(outputs[1 + layer_index], deepstack[layer_index : layer_index + 1])
+            np.testing.assert_allclose(outputs[-1], rope)
+
+    def test_static_layout_emits_each_layer_without_rope(self, is_batch) -> None:
+        shapes = (INPUT_SHAPE, *([SPLIT_DEEPSTACK_SHAPE] * LAYERS))
+        worker = _worker(shapes, is_batch=is_batch)
+        emb, deepstack, _ = _embeds()
+
+        if is_batch:
+            with pytest.raises(RuntimeError, match="Batched split-static"):
+                worker._build_infer_inputs(emb, deepstack)
+            with pytest.raises(RuntimeError, match="Batched split-static"):
+                worker._build_batch_infer_inputs([emb], [deepstack])
+            return
+
+        single = worker._build_infer_inputs(emb, deepstack)
+        batch = worker._build_batch_infer_inputs([emb], [deepstack])
+
+        for outputs in (single, batch):
+            assert len(outputs) == 4
+            for layer_index in range(LAYERS):
+                np.testing.assert_allclose(outputs[1 + layer_index], deepstack[layer_index : layer_index + 1])
+
+    def test_missing_dynamic_rope_is_rejected(self, is_batch) -> None:
+        shapes = (INPUT_SHAPE, *([SPLIT_DEEPSTACK_SHAPE] * LAYERS), ROPE_SHAPE)
+        worker = _worker(shapes, is_batch=is_batch)
+        emb, deepstack, _ = _embeds()
+
+        with pytest.raises(RuntimeError, match="requires RoPE"):
+            worker._build_infer_inputs(emb, deepstack)
+        with pytest.raises(RuntimeError, match="requires batched RoPE"):
+            worker._build_batch_infer_inputs([emb], [deepstack])
+
+    def test_rope_detection_distinguishes_split_static_and_dynamic(self, is_batch) -> None:
+        static_worker = _worker(
+            (INPUT_SHAPE, *([SPLIT_DEEPSTACK_SHAPE] * LAYERS)), is_batch=is_batch
+        )
+        dynamic_worker = _worker(
+            (INPUT_SHAPE, *([SPLIT_DEEPSTACK_SHAPE] * LAYERS), ROPE_SHAPE), is_batch=is_batch
+        )
+
+        assert static_worker._text_mxq_uses_rope_input() is False
+        assert dynamic_worker._text_mxq_uses_rope_input() is True
