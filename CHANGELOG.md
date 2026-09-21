@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0
+
 ### Added
 
 - Qwen3-VL dynamic-vision artifacts now accept multi-image and video requests through the vLLM serving path.
