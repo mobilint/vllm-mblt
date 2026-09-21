@@ -51,6 +51,7 @@ def _make_safe_processor() -> MobilintQwen3VLSafeProcessor:
         size={"longest_edge": 16_777_216, "shortest_edge": 65_536},
         max_pixels=16_777_216,
         min_pixels=65_536,
+        total_pixels=16_777_216,
     )
     return processor
 
@@ -67,6 +68,7 @@ def test_dynamic_processor_caps_defaults_at_4096_vision_tokens() -> None:
     assert processor.image_processor.max_pixels == image_limit
     assert processor.video_processor.size["longest_edge"] == video_limit
     assert processor.video_processor.max_pixels == video_limit
+    assert processor.video_processor.total_pixels == video_limit
 
 
 def test_dynamic_processor_caps_call_overrides_at_4096_vision_tokens() -> None:
@@ -79,6 +81,7 @@ def test_dynamic_processor_caps_call_overrides_at_4096_vision_tokens() -> None:
         "max_pixels": 16_777_216,
         "videos_kwargs": {
             "min_pixels": 16_777_216,
+            "total_pixels": 16_777_216,
             "size": {"longest_edge": 16_777_216},
         },
     }
@@ -90,6 +93,7 @@ def test_dynamic_processor_caps_call_overrides_at_4096_vision_tokens() -> None:
     assert image_kwargs["images_kwargs"]["size"]["longest_edge"] == 4096 * 16**2
     assert video_kwargs["max_pixels"] == 4096 * 16**2 * 2
     assert video_kwargs["videos_kwargs"]["min_pixels"] == 4096 * 16**2 * 2
+    assert video_kwargs["videos_kwargs"]["total_pixels"] == 4096 * 16**2 * 2
     assert video_kwargs["videos_kwargs"]["size"]["longest_edge"] == 4096 * 16**2 * 2
 
 

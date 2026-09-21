@@ -2305,6 +2305,39 @@ class TestMbltWorkerOptimizations:
         torch.testing.assert_close(deepstack[0, 3:5], torch.full((2, 4), 13.0))
         torch.testing.assert_close(deepstack[0, 6:8], torch.full((2, 4), 12.0))
 
+    @pytest.mark.parametrize(
+        ("modality", "grid_key", "pixel_key", "grid"),
+        [
+            ("image", "image_grid_thw", "pixel_values", [1, 65, 64]),
+            ("video", "video_grid_thw", "pixel_values_videos", [17, 16, 16]),
+        ],
+    )
+    def test_build_prompt_embeds_rejects_oversized_dynamic_vision_grid(
+        self,
+        modality: str,
+        grid_key: str,
+        pixel_key: str,
+        grid: list[int],
+    ) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
+            get_image_features=lambda **_kwargs: pytest.fail("oversized image reached the NPU hook"),
+            get_video_features=lambda **_kwargs: pytest.fail("oversized video reached the NPU hook"),
+        )
+        feature = self._make_mm_feature(
+            modality,
+            data={grid_key: torch.tensor(grid), pixel_key: torch.zeros(1, 2)},
+        )
+
+        with pytest.raises(RuntimeError, match="exceeding the NPU encoder limit of 4096"):
+            worker._build_prompt_embeds(
+                prompt_token_ids=None,
+                prompt_embeds=torch.zeros(4, 4),
+                mm_features=[feature],
+            )
+
     def test_build_prompt_rope_embeds_passes_mixed_dynamic_features_to_model_zoo(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
@@ -2410,6 +2443,7 @@ class TestMbltWorkerOptimizations:
         assert delta == 3
         assert captured["image_grid_thw"] is None
         assert captured["video_grid_thw"].tolist() == [[16, 12, 20]]
+        assert "second_per_grid_ts" not in captured
 
     def test_build_rope_embeddings_passes_context_tensor_to_rotary_embedding(self) -> None:
         worker = self._make_worker()

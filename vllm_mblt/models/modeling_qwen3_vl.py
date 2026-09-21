@@ -15,57 +15,84 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from vllm_mblt.models.modeling_vl_utils import MobilintVLCachedProcessorMixin
+from vllm_mblt.models.modeling_vl_utils import (
+    QWEN3_VL_MAX_VISION_TOKENS,
+    MobilintVLCachedProcessorMixin,
+)
 
 
 class MobilintQwen3VLSafeProcessor(MobilintQwen3VLProcessor):
     """Keep dynamic vision inputs within the NPU encoder's sequence limit."""
 
-    max_vision_tokens = 4096
+    max_vision_tokens = QWEN3_VL_MAX_VISION_TOKENS
+    _PIXEL_BUDGET_FIELDS = ("max_pixels", "min_pixels", "total_pixels")
 
-    @staticmethod
-    def _cap_stored_pixels(processor: object, limit: int) -> None:
-        for attribute in ("max_pixels", "min_pixels"):
-            value = getattr(processor, attribute, None)
+    @classmethod
+    def _cap_pixel_budgets(cls, target: object, limit: int) -> None:
+        """Cap every known pixel-budget field on a processor or kwargs dict."""
+        for field in cls._PIXEL_BUDGET_FIELDS:
+            value = target.get(field) if isinstance(target, dict) else getattr(target, field, None)
             if value is not None and value > limit:
-                setattr(processor, attribute, limit)
+                if isinstance(target, dict):
+                    target[field] = limit
+                else:
+                    setattr(target, field, limit)
+
+    def _vision_pixel_limit(self, processor: object, *, video: bool) -> int:
+        temporal_factor = int(getattr(processor, "temporal_patch_size", 1)) if video else 1
+        return self.max_vision_tokens * int(processor.patch_size) ** 2 * temporal_factor
+
+    def _clamp_processor_defaults(self, processor: object, *, kind: str, video: bool) -> None:
+        limit = self._vision_pixel_limit(processor, video=video)
+        scope = {"size": processor.size}
+        self._cap_size_edges(scope, limit, kind)
+        processor.size = scope["size"]
+        self._cap_pixel_budgets(processor, limit)
+
+    def _clamp_call_budgets(
+        self,
+        kwargs: dict,
+        *,
+        processor: object,
+        nested_key: str,
+        kind: str,
+        video: bool,
+    ) -> int:
+        limit = self._vision_pixel_limit(processor, video=video)
+        for scope in self._call_kwargs_scopes(kwargs, nested_key):
+            self._reject_do_resize_false(scope, kind)
+            self._cap_pixel_budgets(scope, limit)
+            self._cap_size_edges(scope, limit, kind)
+        return limit
 
     def _clamp_dynamic_image_size(self) -> None:
-        image_processor = self.image_processor
-        limit = self.max_vision_tokens * int(image_processor.patch_size) ** 2
-        scope = {"size": image_processor.size}
-        self._cap_size_edges(scope, limit, "image")
-        image_processor.size = scope["size"]
-        self._cap_stored_pixels(image_processor, limit)
+        self._clamp_processor_defaults(self.image_processor, kind="image", video=False)
 
     def _clamp_dynamic_image_call_kwargs(self, kwargs: dict) -> None:
-        image_processor = self.image_processor
-        limit = self.max_vision_tokens * int(image_processor.patch_size) ** 2
-        for scope in self._call_kwargs_scopes(kwargs, "images_kwargs"):
-            self._reject_do_resize_false(scope, "image")
-            self._cap_pixel_kwargs(scope, limit, "image")
-            self._cap_size_edges(scope, limit, "image")
+        limit = self._clamp_call_budgets(
+            kwargs,
+            processor=self.image_processor,
+            nested_key="images_kwargs",
+            kind="image",
+            video=False,
+        )
         self._mirror_pixel_caps_to_image_size(kwargs, limit)
 
     def _clamp_dynamic_video_size(self) -> None:
-        video_processor = self.video_processor
-        if video_processor is None:
+        if self.video_processor is None:
             return
-        limit = self.max_vision_tokens * int(video_processor.patch_size) ** 2 * int(video_processor.temporal_patch_size)
-        scope = {"size": video_processor.size}
-        self._cap_size_edges(scope, limit, "video")
-        video_processor.size = scope["size"]
-        self._cap_stored_pixels(video_processor, limit)
+        self._clamp_processor_defaults(self.video_processor, kind="video", video=True)
 
     def _clamp_dynamic_video_call_kwargs(self, kwargs: dict) -> None:
-        video_processor = self.video_processor
-        if video_processor is None:
+        if self.video_processor is None:
             return
-        limit = self.max_vision_tokens * int(video_processor.patch_size) ** 2 * int(video_processor.temporal_patch_size)
-        for scope in self._call_kwargs_scopes(kwargs, "videos_kwargs"):
-            self._reject_do_resize_false(scope, "video")
-            self._cap_pixel_kwargs(scope, limit, "video")
-            self._cap_size_edges(scope, limit, "video")
+        self._clamp_call_budgets(
+            kwargs,
+            processor=self.video_processor,
+            nested_key="videos_kwargs",
+            kind="video",
+            video=True,
+        )
 
 
 class MobilintQwen3VLProcessingInfo(Qwen3VLProcessingInfo):

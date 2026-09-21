@@ -30,6 +30,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
+from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
 from vllm_mblt.runtime_cache import (
     KVBlockIds,
     MbltRuntimeCacheManager,
@@ -913,6 +914,19 @@ class MbltWorker(WorkerBase):
 
         return grid_thw
 
+    def _validate_dynamic_qwen3_vl_grid(self, modality: str, grid_thw: Optional[torch.Tensor]) -> None:
+        """Enforce the compiled vision MXQ limit on actual processor output."""
+        if not self._supports_dynamic_qwen3_vl_inputs() or grid_thw is None:
+            return
+        token_counts = grid_thw.prod(dim=-1)
+        oversized = token_counts > QWEN3_VL_MAX_VISION_TOKENS
+        if bool(oversized.any()):
+            raise RuntimeError(
+                f"Qwen3-VL {modality} preprocessing produced {token_counts.tolist()} pre-merge vision tokens, "
+                f"exceeding the NPU encoder limit of {QWEN3_VL_MAX_VISION_TOKENS}. "
+                "Keep resizing enabled and reduce the input resolution or sampled video frames."
+            )
+
     @staticmethod
     def _normalize_multimodal_embeddings(embeddings: object) -> torch.Tensor:
         if isinstance(embeddings, torch.Tensor):
@@ -1066,9 +1080,11 @@ class MbltWorker(WorkerBase):
                 image_grid_thw = self._extract_multimodal_value(feature, "image_grid_thw")
                 if pixel_values is None:
                     raise RuntimeError("Image multimodal feature is missing pixel_values.")
+                image_grid_thw = self._normalize_grid_thw(image_grid_thw)
+                self._validate_dynamic_qwen3_vl_grid("image", image_grid_thw)
                 image_features = get_image_features(
                     pixel_values=self._to_torch_tensor(pixel_values, dtype=torch.float32),
-                    image_grid_thw=self._normalize_grid_thw(image_grid_thw),
+                    image_grid_thw=image_grid_thw,
                 )
                 image_embeds = self._normalize_multimodal_embeddings(image_features)
                 self._scatter_multimodal_embeddings(
@@ -1090,9 +1106,11 @@ class MbltWorker(WorkerBase):
                 video_grid_thw = self._extract_multimodal_value(feature, "video_grid_thw")
                 if pixel_values_videos is None:
                     raise RuntimeError("Video multimodal feature is missing pixel_values_videos.")
+                video_grid_thw = self._normalize_grid_thw(video_grid_thw)
+                self._validate_dynamic_qwen3_vl_grid("video", video_grid_thw)
                 video_features = get_video_features(
                     pixel_values_videos=self._to_torch_tensor(pixel_values_videos, dtype=torch.float32),
-                    video_grid_thw=self._normalize_grid_thw(video_grid_thw),
+                    video_grid_thw=video_grid_thw,
                 )
                 video_embeds = self._normalize_multimodal_embeddings(video_features)
                 self._scatter_multimodal_embeddings(
@@ -1281,20 +1299,19 @@ class MbltWorker(WorkerBase):
             for feature in mm_features:
                 modality = str(getattr(feature, "modality", ""))
                 if modality.startswith("image"):
-                    image_grid_thw = self._normalize_grid_thw(
-                        self._extract_multimodal_value(feature, "image_grid_thw")
-                    )
+                    image_grid_thw = self._normalize_grid_thw(self._extract_multimodal_value(feature, "image_grid_thw"))
                     if image_grid_thw is not None:
                         image_grids.append(image_grid_thw)
                 elif modality.startswith("video"):
-                    video_grid_thw = self._normalize_grid_thw(
-                        self._extract_multimodal_value(feature, "video_grid_thw")
-                    )
+                    video_grid_thw = self._normalize_grid_thw(self._extract_multimodal_value(feature, "video_grid_thw"))
                     if video_grid_thw is not None:
                         video_grids.append(video_grid_thw)
 
         get_rope_index = getattr(getattr(self.model, "model", None), "get_rope_index", None)
         if callable(get_rope_index) and (image_grids or video_grids):
+            # Qwen3-VL represents video timing with timestamp tokens inserted by
+            # its processor. Unlike Qwen2-VL, its get_rope_index() contract has
+            # no second_per_grid_ts input; the token offsets carry that timing.
             position_ids, mrope_delta = get_rope_index(
                 input_ids=input_ids,
                 image_grid_thw=torch.cat(image_grids, dim=0) if image_grids else None,

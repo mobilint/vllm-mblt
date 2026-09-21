@@ -5,6 +5,8 @@ from vllm.multimodal.inputs import MultiModalKwargsItems, MultiModalUUIDDict
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.multimodal.processing import MultiModalProcessingInfo
 
+QWEN3_VL_MAX_VISION_TOKENS = 4096
+
 
 class MobilintVLCachedProcessorMixin:
     """Shared Mobilint VL workaround for full multimodal cache hits.
