@@ -1276,19 +1276,29 @@ class MbltWorker(WorkerBase):
 
         input_ids = torch.as_tensor(prompt_token_ids, dtype=torch.long).view(1, -1)
         image_grids = []
+        video_grids = []
         if mm_features:
             for feature in mm_features:
-                if not str(getattr(feature, "modality", "")).startswith("image"):
-                    continue
-                image_grid_thw = self._normalize_grid_thw(self._extract_multimodal_value(feature, "image_grid_thw"))
-                if image_grid_thw is not None:
-                    image_grids.append(image_grid_thw)
+                modality = str(getattr(feature, "modality", ""))
+                if modality.startswith("image"):
+                    image_grid_thw = self._normalize_grid_thw(
+                        self._extract_multimodal_value(feature, "image_grid_thw")
+                    )
+                    if image_grid_thw is not None:
+                        image_grids.append(image_grid_thw)
+                elif modality.startswith("video"):
+                    video_grid_thw = self._normalize_grid_thw(
+                        self._extract_multimodal_value(feature, "video_grid_thw")
+                    )
+                    if video_grid_thw is not None:
+                        video_grids.append(video_grid_thw)
 
         get_rope_index = getattr(getattr(self.model, "model", None), "get_rope_index", None)
-        if callable(get_rope_index) and image_grids:
+        if callable(get_rope_index) and (image_grids or video_grids):
             position_ids, mrope_delta = get_rope_index(
                 input_ids=input_ids,
-                image_grid_thw=torch.cat(image_grids, dim=0),
+                image_grid_thw=torch.cat(image_grids, dim=0) if image_grids else None,
+                video_grid_thw=torch.cat(video_grids, dim=0) if video_grids else None,
             )
             delta = int(torch.as_tensor(mrope_delta).reshape(-1)[0].item())
             return self._build_rope_embeddings_from_position_ids(position_ids), delta

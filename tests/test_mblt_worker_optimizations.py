@@ -2374,7 +2374,42 @@ class TestMbltWorkerOptimizations:
         assert tuple(rope.shape) == (1, 5, 2)
         np.testing.assert_array_equal(rope[0, :, 0], np.arange(10, 15, dtype=np.float32))
         assert tuple(captured["rope_kwargs"]["image_grid_thw"].shape) == (1, 3)
+        assert captured["rope_kwargs"]["video_grid_thw"] is None
         assert captured["rope_kwargs"]["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
+
+    def test_build_prompt_rope_embeds_uses_qwen3_vl_rope_index_and_video_grid(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.cache_model = SimpleNamespace(
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(
+                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 2), (2, -1, 4)]
+            ),
+        )
+        captured = {}
+
+        def get_rope_index(**kwargs):
+            captured.update(kwargs)
+            return torch.arange(5).view(1, 1, -1).expand(3, 1, -1), torch.tensor([[3]])
+
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
+            get_language_model=lambda: SimpleNamespace(
+                rotary_emb=lambda _x, position_ids: position_ids[0].unsqueeze(-1).repeat(1, 1, 2).float()
+            ),
+            model=SimpleNamespace(get_rope_index=get_rope_index),
+        )
+        feature = self._make_mm_feature(
+            "video",
+            data={"video_grid_thw": torch.tensor([16, 12, 20]), "pixel_values_videos": torch.zeros(3840, 2)},
+        )
+
+        rope, delta = worker._build_prompt_rope_embeds([1, 2, 3, 4, 5], [feature], prompt_len=5)
+
+        assert rope is not None
+        assert delta == 3
+        assert captured["image_grid_thw"] is None
+        assert captured["video_grid_thw"].tolist() == [[16, 12, 20]]
 
     def test_build_rope_embeddings_passes_context_tensor_to_rotary_embedding(self) -> None:
         worker = self._make_worker()
