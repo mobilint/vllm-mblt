@@ -919,10 +919,11 @@ class MbltWorker(WorkerBase):
         if not self._supports_dynamic_qwen3_vl_inputs() or grid_thw is None:
             return
         token_counts = grid_thw.prod(dim=-1)
-        oversized = token_counts > QWEN3_VL_MAX_VISION_TOKENS
-        if bool(oversized.any()):
+        total_tokens = int(token_counts.sum().item())
+        if total_tokens > QWEN3_VL_MAX_VISION_TOKENS:
             raise RuntimeError(
-                f"Qwen3-VL {modality} preprocessing produced {token_counts.tolist()} pre-merge vision tokens, "
+                f"Qwen3-VL {modality} preprocessing produced {token_counts.tolist()} pre-merge vision tokens "
+                f"({total_tokens} total for one encoder call), "
                 f"exceeding the NPU encoder limit of {QWEN3_VL_MAX_VISION_TOKENS}. "
                 "Keep resizing enabled and reduce the input resolution or sampled video frames."
             )

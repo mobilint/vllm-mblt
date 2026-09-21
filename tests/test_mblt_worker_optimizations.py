@@ -2310,6 +2310,8 @@ class TestMbltWorkerOptimizations:
         [
             ("image", "image_grid_thw", "pixel_values", [1, 65, 64]),
             ("video", "video_grid_thw", "pixel_values_videos", [17, 16, 16]),
+            ("image", "image_grid_thw", "pixel_values", [[1, 50, 41], [1, 50, 41]]),
+            ("video", "video_grid_thw", "pixel_values_videos", [[9, 16, 16], [9, 16, 16]]),
         ],
     )
     def test_build_prompt_embeds_rejects_oversized_dynamic_vision_grid(
@@ -2317,7 +2319,7 @@ class TestMbltWorkerOptimizations:
         modality: str,
         grid_key: str,
         pixel_key: str,
-        grid: list[int],
+        grid: list[int] | list[list[int]],
     ) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
