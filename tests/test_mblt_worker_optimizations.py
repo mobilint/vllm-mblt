@@ -121,9 +121,46 @@ class TestMbltWorkerOptimizations:
                 session_id="session-a",
             )
 
-    def test_mobilint_vlm_request_constraints_reject_video(self) -> None:
+    def test_static_qwen3_vl_request_constraints_reject_video(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=False)
+        with pytest.raises(RuntimeError, match="does not support video"):
+            worker._validate_mobilint_vlm_request_constraints(
+                [self._make_mm_feature("video", offset=1, length=2)], session_id="session-a"
+            )
+
+    def test_dynamic_qwen3_vl_request_constraints_allow_video_and_multiple_images(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True)
+
+        worker._validate_mobilint_vlm_request_constraints(
+            [
+                self._make_mm_feature("video", offset=1, length=2),
+                self._make_mm_feature("image", offset=3, length=2),
+                self._make_mm_feature("image", offset=5, length=3),
+            ],
+            session_id="session-a",
+        )
+
+        assert worker._vlm_image_positions_by_session == {}
+
+    def test_dynamic_qwen3_vl_request_constraints_reject_unknown_modality(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True)
+
+        with pytest.raises(RuntimeError, match="dynamic vision.*audio"):
+            worker._validate_mobilint_vlm_request_constraints(
+                [self._make_mm_feature("audio", offset=1, length=2)], session_id="session-a"
+            )
+
+    def test_dynamic_vision_flag_does_not_relax_qwen2_vl_constraints(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen2_vl")
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", dynamic_vision=True)
+
         with pytest.raises(RuntimeError, match="does not support video"):
             worker._validate_mobilint_vlm_request_constraints(
                 [self._make_mm_feature("video", offset=1, length=2)], session_id="session-a"
@@ -803,9 +840,7 @@ class TestMbltWorkerOptimizations:
         assert completion_logprobs.token_logprobs[-1] == -0.5
 
     @pytest.mark.parametrize("prompt_token_ids", ([15339, 1917], [128000, 15339, 1917]))
-    def test_prompt_logprobs_include_actual_prompt_token_when_not_topk(
-        self, prompt_token_ids: list[int]
-    ) -> None:
+    def test_prompt_logprobs_include_actual_prompt_token_when_not_topk(self, prompt_token_ids: list[int]) -> None:
         worker = self._make_worker()
         sampling_params = SamplingParams.from_optional(logprobs=1, prompt_logprobs=1)
         req_state = self._make_request_state(worker, sampling_params, prompt_token_ids)
@@ -1382,9 +1417,7 @@ class TestMbltWorkerOptimizations:
         assert calls == [(1, prompt_pos - 1) for prompt_pos in range(1, len(prompt_token_ids))]
         assert sum(submitted_tokens for submitted_tokens, _cache_size in calls) == len(prompt_token_ids) - 1
         assert sum(submitted_tokens for submitted_tokens, _cache_size in calls) < len(prompt_token_ids) * 2
-        assert sum(submitted_tokens for submitted_tokens, _cache_size in calls) != sum(
-            range(1, len(prompt_token_ids))
-        )
+        assert sum(submitted_tokens for submitted_tokens, _cache_size in calls) != sum(range(1, len(prompt_token_ids)))
 
     def test_prompt_logprobs_fallback_uses_incremental_batch_cache_slot(self) -> None:
         worker = self._make_worker()
@@ -1501,10 +1534,7 @@ class TestMbltWorkerOptimizations:
         vocab_size = 320
 
         def infer(_inputs, *, params):
-            calls.extend(
-                (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
-                for param in params
-            )
+            calls.extend((int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params)
             return [np.zeros((len(params), vocab_size), dtype=np.float32)]
 
         worker.cache_model = SimpleNamespace(
@@ -1512,9 +1542,7 @@ class TestMbltWorkerOptimizations:
             get_model_output_shape=lambda: [(2, vocab_size)],
         )
 
-        outputs = worker._run_prompt_logprob_microsteps_batch(
-            [(0, "req", req_state, 256, 258, 7)]
-        )
+        outputs = worker._run_prompt_logprob_microsteps_batch([(0, "req", req_state, 256, 258, 7)])
 
         assert set(outputs) == {0}
         assert calls == [(1, 256, 7), (1, 257, 7)]
@@ -1537,10 +1565,7 @@ class TestMbltWorkerOptimizations:
 
         def infer(_inputs, *, params):
             calls.append(
-                tuple(
-                    (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
-                    for param in params
-                )
+                tuple((int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params)
             )
             return [np.zeros((len(params), vocab_size), dtype=np.float32)]
 
@@ -2222,6 +2247,130 @@ class TestMbltWorkerOptimizations:
         torch.testing.assert_close(deepstack[:, :1], torch.zeros(2, 1, 4))
         torch.testing.assert_close(deepstack[:, 3:], torch.zeros(2, 2, 4))
 
+    def test_build_prompt_embeds_scatters_multiple_images_and_video(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        base_prompt_embeds = torch.zeros(8, 4)
+        image_calls = []
+        video_calls = []
+
+        def get_image_features(**kwargs):
+            image_calls.append(kwargs)
+            value = float(len(image_calls))
+            embeds = torch.full((2, 4), value)
+            return ((embeds,), [embeds + 10])
+
+        def get_video_features(**kwargs):
+            video_calls.append(kwargs)
+            embeds = torch.full((2, 4), 3.0)
+            return ((embeds,), [embeds + 10])
+
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
+            get_image_features=get_image_features,
+            get_video_features=get_video_features,
+        )
+        features = [
+            self._make_mm_feature(
+                "image",
+                offset=0,
+                data={"pixel_values": torch.zeros(1, 3), "image_grid_thw": torch.tensor([1, 1, 2])},
+            ),
+            self._make_mm_feature(
+                "video",
+                offset=3,
+                data={
+                    "pixel_values_videos": torch.zeros(1, 3),
+                    "video_grid_thw": torch.tensor([2, 1, 1]),
+                },
+            ),
+            self._make_mm_feature(
+                "image",
+                offset=6,
+                data={"pixel_values": torch.zeros(1, 3), "image_grid_thw": torch.tensor([1, 1, 2])},
+            ),
+        ]
+
+        merged, deepstack = worker._build_prompt_embeds(
+            prompt_token_ids=None, prompt_embeds=base_prompt_embeds, mm_features=features
+        )
+
+        assert len(image_calls) == 2
+        assert len(video_calls) == 1
+        torch.testing.assert_close(merged[0:2], torch.full((2, 4), 1.0))
+        torch.testing.assert_close(merged[3:5], torch.full((2, 4), 3.0))
+        torch.testing.assert_close(merged[6:8], torch.full((2, 4), 2.0))
+        assert deepstack is not None
+        torch.testing.assert_close(deepstack[0, 0:2], torch.full((2, 4), 11.0))
+        torch.testing.assert_close(deepstack[0, 3:5], torch.full((2, 4), 13.0))
+        torch.testing.assert_close(deepstack[0, 6:8], torch.full((2, 4), 12.0))
+
+    @pytest.mark.parametrize(
+        ("modality", "grid_key", "pixel_key", "grid"),
+        [
+            ("image", "image_grid_thw", "pixel_values", [1, 65, 64]),
+            ("video", "video_grid_thw", "pixel_values_videos", [17, 16, 16]),
+            ("image", "image_grid_thw", "pixel_values", [[1, 50, 41], [1, 50, 41]]),
+            ("video", "video_grid_thw", "pixel_values_videos", [[9, 16, 16], [9, 16, 16]]),
+        ],
+    )
+    def test_build_prompt_embeds_rejects_oversized_dynamic_vision_grid(
+        self,
+        modality: str,
+        grid_key: str,
+        pixel_key: str,
+        grid: list[int] | list[list[int]],
+    ) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
+            get_image_features=lambda **_kwargs: pytest.fail("oversized image reached the NPU hook"),
+            get_video_features=lambda **_kwargs: pytest.fail("oversized video reached the NPU hook"),
+        )
+        feature = self._make_mm_feature(
+            modality,
+            data={grid_key: torch.tensor(grid), pixel_key: torch.zeros(1, 2)},
+        )
+
+        with pytest.raises(RuntimeError, match="exceeding the NPU encoder limit of 4096"):
+            worker._build_prompt_embeds(
+                prompt_token_ids=None,
+                prompt_embeds=torch.zeros(4, 4),
+                mm_features=[feature],
+            )
+
+    def test_build_prompt_rope_embeds_passes_mixed_dynamic_features_to_model_zoo(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.cache_model = SimpleNamespace(
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(
+                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 2), (2, -1, 4)]
+            ),
+        )
+        features = [self._make_mm_feature("image"), self._make_mm_feature("video", offset=3)]
+        captured = {}
+
+        def get_mrope_input_positions(prompt_token_ids, mm_features):
+            captured["prompt_token_ids"] = prompt_token_ids
+            captured["mm_features"] = mm_features
+            return torch.arange(5).view(1, 1, -1).expand(3, 1, -1), torch.tensor([[4]])
+
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
+            get_language_model=lambda: SimpleNamespace(
+                rotary_emb=lambda _x, position_ids: position_ids[0].unsqueeze(-1).repeat(1, 1, 2).float()
+            ),
+            get_mrope_input_positions=get_mrope_input_positions,
+        )
+
+        rope, delta = worker._build_prompt_rope_embeds([1, 2, 3, 4, 5], features, prompt_len=5)
+
+        assert rope is not None
+        assert delta == 4
+        assert captured == {"prompt_token_ids": [1, 2, 3, 4, 5], "mm_features": features}
+
     def test_build_prompt_rope_embeds_uses_qwen3_vl_rope_index_and_image_grid(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
@@ -2260,7 +2409,43 @@ class TestMbltWorkerOptimizations:
         assert tuple(rope.shape) == (1, 5, 2)
         np.testing.assert_array_equal(rope[0, :, 0], np.arange(10, 15, dtype=np.float32))
         assert tuple(captured["rope_kwargs"]["image_grid_thw"].shape) == (1, 3)
+        assert captured["rope_kwargs"]["video_grid_thw"] is None
         assert captured["rope_kwargs"]["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
+
+    def test_build_prompt_rope_embeds_uses_qwen3_vl_rope_index_and_video_grid(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker.cache_model = SimpleNamespace(
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(
+                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 2), (2, -1, 4)]
+            ),
+        )
+        captured = {}
+
+        def get_rope_index(**kwargs):
+            captured.update(kwargs)
+            return torch.arange(5).view(1, 1, -1).expand(3, 1, -1), torch.tensor([[3]])
+
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
+            get_language_model=lambda: SimpleNamespace(
+                rotary_emb=lambda _x, position_ids: position_ids[0].unsqueeze(-1).repeat(1, 1, 2).float()
+            ),
+            model=SimpleNamespace(get_rope_index=get_rope_index),
+        )
+        feature = self._make_mm_feature(
+            "video",
+            data={"video_grid_thw": torch.tensor([16, 12, 20]), "pixel_values_videos": torch.zeros(3840, 2)},
+        )
+
+        rope, delta = worker._build_prompt_rope_embeds([1, 2, 3, 4, 5], [feature], prompt_len=5)
+
+        assert rope is not None
+        assert delta == 3
+        assert captured["image_grid_thw"] is None
+        assert captured["video_grid_thw"].tolist() == [[16, 12, 20]]
+        assert "second_per_grid_ts" not in captured
 
     def test_build_rope_embeddings_passes_context_tensor_to_rotary_embedding(self) -> None:
         worker = self._make_worker()
@@ -2794,8 +2979,7 @@ class TestMbltWorkerOptimizations:
         np.testing.assert_array_equal(captured["inputs"][1][:, :2, :], deepstack_a)
         np.testing.assert_array_equal(captured["inputs"][1][:, 2:, :], np.zeros((2, 1, 4), dtype=np.float32))
         assert [
-            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
-            for param in captured["params"]
+            (int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in captured["params"]
         ] == [(2, 5, 1), (1, 7, 2)]
 
     def test_infer_logits_batch_dispatches_cache_rows_across_backend_models(self) -> None:
@@ -2810,10 +2994,7 @@ class TestMbltWorkerOptimizations:
                 calls.append(
                     (
                         marker,
-                        [
-                            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
-                            for param in params
-                        ],
+                        [(int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params],
                     )
                 )
                 barrier.wait(timeout=2)
@@ -2845,8 +3026,7 @@ class TestMbltWorkerOptimizations:
 
         def make_model(marker: str):
             return SimpleNamespace(
-                dump_cache_memory=lambda cache_id: calls.append((f"dump-{marker}", cache_id, None))
-                or [marker],
+                dump_cache_memory=lambda cache_id: calls.append((f"dump-{marker}", cache_id, None)) or [marker],
                 load_cache_memory=lambda blobs, cache_id: calls.append((f"load-{marker}", cache_id, blobs)),
             )
 
@@ -2869,11 +3049,7 @@ class TestMbltWorkerOptimizations:
         backend = SimpleNamespace(mxq_models=[cache_model], k_per_model=1)
         text_model = SimpleNamespace(npu_backend=backend)
         worker.cache_model = cache_model
-        worker.model = (
-            SimpleNamespace(model=SimpleNamespace(language_model=text_model))
-            if multimodal
-            else text_model
-        )
+        worker.model = SimpleNamespace(model=SimpleNamespace(language_model=text_model)) if multimodal else text_model
 
         assert worker._resolve_cache_backend() is backend
 
@@ -3040,8 +3216,7 @@ class TestMbltWorkerOptimizations:
         assert len(captured["inputs"]) == 1
         assert captured["inputs"][0].shape == (1, 1, 3, 4)
         assert [
-            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
-            for param in captured["params"]
+            (int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in captured["params"]
         ] == [(2, 0, 1), (1, 3, 2)]
 
     def test_max_batch_size_one_vlm_still_uses_single_request_infer_inputs(self) -> None:

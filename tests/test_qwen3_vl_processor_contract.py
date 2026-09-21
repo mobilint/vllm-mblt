@@ -1,11 +1,11 @@
-from copy import deepcopy
 from types import SimpleNamespace
 
-from mblt_model_zoo.hf_transformers.models.qwen3_vl.processing_qwen3_vl import (
-    MobilintQwen3VLProcessor,
-)
+import pytest
 
-from vllm_mblt.models.modeling_qwen3_vl import MobilintQwen3VLProcessingInfo
+from vllm_mblt.models.modeling_qwen3_vl import (
+    MobilintQwen3VLProcessingInfo,
+    MobilintQwen3VLSafeProcessor,
+)
 
 
 def test_processing_info_forwards_resolution_overrides_to_model_zoo() -> None:
@@ -24,7 +24,7 @@ def test_processing_info_forwards_resolution_overrides_to_model_zoo() -> None:
 
     assert calls == [
         (
-            MobilintQwen3VLProcessor,
+            MobilintQwen3VLSafeProcessor,
             {
                 "use_fast": False,
                 "max_pixels": 16_777_216,
@@ -35,24 +35,77 @@ def test_processing_info_forwards_resolution_overrides_to_model_zoo() -> None:
     ]
 
 
-def test_model_zoo_dynamic_processor_does_not_reintroduce_2048_token_cap() -> None:
-    processor = object.__new__(MobilintQwen3VLProcessor)
+def _make_safe_processor() -> MobilintQwen3VLSafeProcessor:
+    processor = object.__new__(MobilintQwen3VLSafeProcessor)
+    processor.image_processor = SimpleNamespace(
+        patch_size=16,
+        merge_size=2,
+        size={"longest_edge": 16_777_216, "shortest_edge": 65_536},
+        max_pixels=16_777_216,
+        min_pixels=65_536,
+    )
+    processor.video_processor = SimpleNamespace(
+        patch_size=16,
+        temporal_patch_size=2,
+        merge_size=2,
+        size={"longest_edge": 16_777_216, "shortest_edge": 65_536},
+        max_pixels=16_777_216,
+        min_pixels=65_536,
+        total_pixels=16_777_216,
+    )
+    return processor
+
+
+def test_dynamic_processor_caps_defaults_at_4096_vision_tokens() -> None:
+    processor = _make_safe_processor()
+
+    processor._clamp_dynamic_image_size()
+    processor._clamp_dynamic_video_size()
+
+    image_limit = 4096 * 16**2
+    video_limit = 4096 * 16**2 * 2
+    assert processor.image_processor.size["longest_edge"] == image_limit
+    assert processor.image_processor.max_pixels == image_limit
+    assert processor.video_processor.size["longest_edge"] == video_limit
+    assert processor.video_processor.max_pixels == video_limit
+    assert processor.video_processor.total_pixels == video_limit
+
+
+def test_dynamic_processor_caps_call_overrides_at_4096_vision_tokens() -> None:
+    processor = _make_safe_processor()
     image_kwargs = {
         "max_pixels": 16_777_216,
-        "do_resize": False,
         "images_kwargs": {"size": {"longest_edge": 16_777_216}},
     }
     video_kwargs = {
         "max_pixels": 16_777_216,
-        "do_resize": False,
-        "videos_kwargs": {"size": {"longest_edge": 16_777_216}},
+        "videos_kwargs": {
+            "min_pixels": 16_777_216,
+            "total_pixels": 16_777_216,
+            "size": {"longest_edge": 16_777_216},
+        },
     }
-    expected_image_kwargs = deepcopy(image_kwargs)
-    expected_video_kwargs = deepcopy(video_kwargs)
 
     processor._clamp_dynamic_image_call_kwargs(image_kwargs)
     processor._clamp_dynamic_video_call_kwargs(video_kwargs)
 
-    assert not hasattr(MobilintQwen3VLProcessor, "max_vision_tokens")
-    assert image_kwargs == expected_image_kwargs
-    assert video_kwargs == expected_video_kwargs
+    assert image_kwargs["max_pixels"] == 4096 * 16**2
+    assert image_kwargs["images_kwargs"]["size"]["longest_edge"] == 4096 * 16**2
+    assert video_kwargs["max_pixels"] == 4096 * 16**2 * 2
+    assert video_kwargs["videos_kwargs"]["min_pixels"] == 4096 * 16**2 * 2
+    assert video_kwargs["videos_kwargs"]["total_pixels"] == 4096 * 16**2 * 2
+    assert video_kwargs["videos_kwargs"]["size"]["longest_edge"] == 4096 * 16**2 * 2
+
+
+@pytest.mark.parametrize(
+    ("method", "nested_key"),
+    [
+        ("_clamp_dynamic_image_call_kwargs", "images_kwargs"),
+        ("_clamp_dynamic_video_call_kwargs", "videos_kwargs"),
+    ],
+)
+def test_dynamic_processor_rejects_resize_bypass(method: str, nested_key: str) -> None:
+    processor = _make_safe_processor()
+
+    with pytest.raises(ValueError, match="4096-token NPU vision-token ceiling"):
+        getattr(processor, method)({nested_key: {"do_resize": False}})

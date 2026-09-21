@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Qwen3-VL dynamic-vision artifacts now accept multi-image and video requests through the vLLM serving path.
+  Static-vision Qwen3-VL artifacts retain their single-image/no-video constraints, and Qwen2-VL behavior is
+  unchanged.
+- Dynamic Qwen3-VL preprocessing now caps each NPU vision encoder invocation at 4096 pre-merge tokens and rejects
+  `do_resize=False`, preventing oversized images or video frames from terminating the engine with an NPU shape error.
+
 ## 0.5.0
 
 ### Added

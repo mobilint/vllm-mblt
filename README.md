@@ -107,9 +107,14 @@ Current Mobilint Qwen2/3-VL notes:
 - The worker loads VLMs through `AutoModelForImageTextToText`.
 - Image inputs are processed through vLLM's multimodal pipeline and merged into Mobilint language-model prompt
   embeddings inside the custom worker.
-- The NPU path currently supports exactly one image in the initial multimodal request.
-- Subsequent turns in the same session must be text-only or reuse the same image-token position.
-- Video inputs are not supported by the current Mobilint Qwen2/3-VL NPU path.
+- Qwen3-VL dynamic-vision artifacts support multiple images and video inputs. Legacy static-vision Qwen3-VL
+  artifacts support exactly one image and reject video inputs.
+- Qwen2-VL supports exactly one image in the initial multimodal request and rejects video inputs.
+- For static-vision Qwen3-VL and Qwen2-VL, subsequent turns in the same session must be text-only or reuse the
+  same image-token position.
+- Dynamic Qwen3-VL image and video preprocessing is capped at 4096 pre-merge vision tokens per encoder invocation,
+  matching the NPU vision MXQ input limit. Oversized resolution overrides are clamped and `do_resize=False` is
+  rejected because it can bypass this safety limit.
 
 ## Runtime Tuning
 
@@ -414,8 +419,9 @@ Qwen3-VL dynamic-vision Batch16 artifacts forward packed text embeddings plus
 the matching packed RoPE and DeepStack tensors. Both the bundled 3-input text
 layout and the per-layer split 5-input layout are supported; batched split-static
 artifacts remain unsupported.
-Qwen3-VL dynamic image and video processor resolution overrides are passed through
-to the selected artifact; vllm-mblt does not impose the former 2048 vision-token cap.
+Qwen3-VL dynamic image and video processor resolution overrides are forwarded up to
+the NPU encoder's 4096 pre-merge vision-token limit. Larger overrides are clamped and
+`do_resize=False` is rejected so preprocessing cannot produce an unsupported MXQ input shape.
 Unsupported multimodal model types fail before runtime inference with a clear
 error.
 
