@@ -107,9 +107,13 @@ Current Mobilint Qwen2/3-VL notes:
 - The worker loads VLMs through `AutoModelForImageTextToText`.
 - Image inputs are processed through vLLM's multimodal pipeline and merged into Mobilint language-model prompt
   embeddings inside the custom worker.
-- The NPU path currently supports exactly one image in the initial multimodal request.
-- Subsequent turns in the same session must be text-only or reuse the same image-token position.
-- Video inputs are not supported by the current Mobilint Qwen2/3-VL NPU path.
+- Qwen3-VL dynamic-vision artifacts support multiple images and video inputs. Legacy static-vision Qwen3-VL
+  artifacts support exactly one image and reject video inputs.
+- Qwen2-VL supports exactly one image in the initial multimodal request and rejects video inputs.
+- For static-vision Qwen3-VL and Qwen2-VL, subsequent turns in the same session must be text-only or reuse the
+  same image-token position.
+- Dynamic-vision resolution limits are owned by the paired Model Zoo artifact and processor. `vllm-mblt` forwards
+  image and video processor overrides without imposing an additional token cap.
 
 ## Runtime Tuning
 

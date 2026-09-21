@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Qwen3-VL dynamic-vision artifacts now accept multi-image and video requests through the vLLM serving path.
+  Static-vision Qwen3-VL artifacts retain their single-image/no-video constraints, and Qwen2-VL behavior is
+  unchanged. Vision resolution remains governed by the paired Model Zoo processor and artifact.
+
 ## 0.5.0
 
 ### Added

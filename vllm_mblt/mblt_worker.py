@@ -238,9 +238,7 @@ class PrefixCacheCostModel:
     ) -> None:
         self.block_size = max(1, int(block_size))
         self.auto_threshold_enabled = bool(auto_threshold_enabled)
-        self.manual_min_hit_tokens = (
-            max(0, int(manual_min_hit_tokens)) if manual_min_hit_tokens is not None else None
-        )
+        self.manual_min_hit_tokens = max(0, int(manual_min_hit_tokens)) if manual_min_hit_tokens is not None else None
         self.margin = float(margin)
         if self.margin <= 0:
             self.margin = self.DEFAULT_MARGIN
@@ -592,6 +590,11 @@ class MbltWorker(WorkerBase):
         model_config = getattr(getattr(self, "model", None), "config", None)
         return _is_multimodal_hf_config(model_config)
 
+    def _supports_dynamic_qwen3_vl_inputs(self) -> bool:
+        """Return whether the loaded Qwen3-VL artifact supports dynamic vision."""
+        model_config = getattr(getattr(self, "model", None), "config", None)
+        return _is_qwen3_vl_hf_config(model_config) and bool(getattr(model_config, "dynamic_vision", False))
+
     @staticmethod
     def _multimodal_position_signature(
         placeholder: PlaceholderRange,
@@ -629,6 +632,18 @@ class MbltWorker(WorkerBase):
         if not self._is_multimodal_model():
             return
         if not mm_features:
+            return
+
+        if self._supports_dynamic_qwen3_vl_inputs():
+            unsupported = [
+                str(getattr(feature, "modality", ""))
+                for feature in mm_features
+                if not str(getattr(feature, "modality", "")).startswith(("image", "video"))
+            ]
+            if unsupported:
+                raise RuntimeError(
+                    f"Unsupported multimodal modalities for Mobilint Qwen3-VL dynamic vision on NPU: {unsupported}"
+                )
             return
 
         image_features = []
@@ -781,9 +796,7 @@ class MbltWorker(WorkerBase):
         block_size = self._kv_block_size()
         bucket_blocks = (1, 2, 4, 8)
         bucket_tokens = [
-            tokens
-            for tokens in (block_size * blocks for blocks in bucket_blocks)
-            if tokens <= self.max_seq_len
+            tokens for tokens in (block_size * blocks for blocks in bucket_blocks) if tokens <= self.max_seq_len
         ]
         if not bucket_tokens:
             bucket_tokens = [min(block_size, self.max_seq_len)]
@@ -1267,9 +1280,7 @@ class MbltWorker(WorkerBase):
             for feature in mm_features:
                 if not str(getattr(feature, "modality", "")).startswith("image"):
                     continue
-                image_grid_thw = self._normalize_grid_thw(
-                    self._extract_multimodal_value(feature, "image_grid_thw")
-                )
+                image_grid_thw = self._normalize_grid_thw(self._extract_multimodal_value(feature, "image_grid_thw"))
                 if image_grid_thw is not None:
                     image_grids.append(image_grid_thw)
 
@@ -1313,11 +1324,15 @@ class MbltWorker(WorkerBase):
 
         if end > req_state.prompt_len:
             decode_start = max(start, req_state.prompt_len)
-            position_ids = torch.arange(
-                decode_start + req_state.mrope_position_delta,
-                end + req_state.mrope_position_delta,
-                dtype=torch.long,
-            ).view(1, 1, -1).expand(3, 1, -1)
+            position_ids = (
+                torch.arange(
+                    decode_start + req_state.mrope_position_delta,
+                    end + req_state.mrope_position_delta,
+                    dtype=torch.long,
+                )
+                .view(1, 1, -1)
+                .expand(3, 1, -1)
+            )
             pieces.append(self._build_rope_embeddings_from_position_ids(position_ids))
 
         if not pieces:
@@ -1394,9 +1409,7 @@ class MbltWorker(WorkerBase):
             return ("rope", "deepstack")
 
         # Both leading axes are 1 or dynamic, so fall through to the weaker test.
-        matches_hidden = tuple(
-            int(shape[-1]) > 0 and int(shape[-1]) == hidden_size for shape in tail_shapes
-        )
+        matches_hidden = tuple(int(shape[-1]) > 0 and int(shape[-1]) == hidden_size for shape in tail_shapes)
         if matches_hidden == (True, False):
             return ("deepstack", "rope")
         if matches_hidden == (False, True):
@@ -1526,8 +1539,7 @@ class MbltWorker(WorkerBase):
                 raise RuntimeError("Qwen3-VL dynamic text MXQ requires RoPE embeddings.")
             if len(rope_shape) != 3:
                 raise RuntimeError(
-                    "Qwen3-VL text MXQ rope input must have rank 3 "
-                    f"(1, sequence, pe_size), but got shape={rope_shape}."
+                    f"Qwen3-VL text MXQ rope input must have rank 3 (1, sequence, pe_size), but got shape={rope_shape}."
                 )
             expected_rope_batch, expected_rope_seq, expected_rope_size = rope_shape
             if expected_rope_batch not in (-1, 1):
@@ -1560,8 +1572,7 @@ class MbltWorker(WorkerBase):
             expected_shape_layers, expected_seq_len, expected_hidden = deepstack_shape
             if split_deepstack and expected_shape_layers not in (-1, 1):
                 raise RuntimeError(
-                    "Split Qwen3-VL DeepStack inputs must each contain one layer, "
-                    f"but got shape={deepstack_shape}."
+                    f"Split Qwen3-VL DeepStack inputs must each contain one layer, but got shape={deepstack_shape}."
                 )
             if expected_seq_len > 0 and expected_seq_len != input_seq_len:
                 raise RuntimeError(
@@ -1592,9 +1603,7 @@ class MbltWorker(WorkerBase):
                 )
         deepstack_array = deepstack_embeds.astype(np.float32, copy=False)
         extras = {"deepstack": deepstack_array}
-        extras.update(
-            {f"deepstack_{index}": deepstack_array[index : index + 1] for index in range(expected_layers)}
-        )
+        extras.update({f"deepstack_{index}": deepstack_array[index : index + 1] for index in range(expected_layers)})
         if uses_rope_input:
             extras["rope"] = rope_embeds.astype(np.float32, copy=False)
         return [batched_input, *(extras[name] for name in extra_input_order)]
@@ -1710,9 +1719,7 @@ class MbltWorker(WorkerBase):
 
         deepstack_concat = np.concatenate(deepstack_chunks, axis=1)
         extras = {"deepstack": deepstack_concat}
-        extras.update(
-            {f"deepstack_{index}": deepstack_concat[index : index + 1] for index in range(expected_layers)}
-        )
+        extras.update({f"deepstack_{index}": deepstack_concat[index : index + 1] for index in range(expected_layers)})
         if not uses_rope_input:
             return [text_input, *(extras[name] for name in extra_input_order)]
 
@@ -2161,9 +2168,7 @@ class MbltWorker(WorkerBase):
                     chunk_end = chunk_start + chunk_len
                     chunk_embeds_batch.append(state.input_embeds[chunk_start:chunk_end])
                     chunk_deepstack_batch.append(
-                        None
-                        if state.deepstack_embeds is None
-                        else state.deepstack_embeds[:, chunk_start:chunk_end, :]
+                        None if state.deepstack_embeds is None else state.deepstack_embeds[:, chunk_start:chunk_end, :]
                     )
                     chunk_rope_batch.append(
                         None if state.rope_embeds is None else state.rope_embeds[:, chunk_start:chunk_end, :]
@@ -2539,11 +2544,7 @@ class MbltWorker(WorkerBase):
                     state.fallback_cache_size += int(input_embeds.shape[0])
                     state.current_prompt_pos += 1
 
-        return {
-            state.output_index: np.stack(state.rows, axis=0)
-            for state in states
-            if state.rows
-        }
+        return {state.output_index: np.stack(state.rows, axis=0) for state in states if state.rows}
 
     def _run_prompt_logprob_microsteps_batch(
         self,
@@ -2581,10 +2582,7 @@ class MbltWorker(WorkerBase):
                 "max_batch_size=%d ranges=%s cache_sizes=%s",
                 len(states),
                 self.max_batch_size,
-                [
-                    (state.req_id, state.start_idx, state.scheduled_end, state.prompt_logits_end)
-                    for state in states
-                ],
+                [(state.req_id, state.start_idx, state.scheduled_end, state.prompt_logits_end) for state in states],
                 [state.cache_size for state in states],
             )
         self._warn_last_logit_prompt_logprobs_once()
@@ -3056,8 +3054,7 @@ class MbltWorker(WorkerBase):
                 print(f"[cache] req={req_id} slot={slot_id} load-own matched={result.matched_tokens}/{target_tokens}")
             elif result.action == "load-shared":
                 print(
-                    f"[cache] req={req_id} slot={slot_id} "
-                    f"load-shared matched={result.matched_tokens}/{target_tokens}"
+                    f"[cache] req={req_id} slot={slot_id} load-shared matched={result.matched_tokens}/{target_tokens}"
                 )
             elif result.action == "skip-cost":
                 print(
@@ -3315,8 +3312,7 @@ class MbltWorker(WorkerBase):
                 # holding somebody else's KV, and snapshotting that under this
                 # req_id would publish a prefix the tokens do not match.
                 owns_live_slot = (
-                    finished_slot_id is not None
-                    and self.runtime_cache.live_slot_owner(finished_slot_id) == req_id
+                    finished_slot_id is not None and self.runtime_cache.live_slot_owner(finished_slot_id) == req_id
                 )
                 if (
                     owns_live_slot
