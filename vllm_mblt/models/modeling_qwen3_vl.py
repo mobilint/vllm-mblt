@@ -64,6 +64,7 @@ class MobilintQwen3VLSafeProcessor(MobilintQwen3VLProcessor):
         limit = self.max_vision_tokens * int(video_processor.patch_size) ** 2 * int(video_processor.temporal_patch_size)
         for scope in self._call_kwargs_scopes(kwargs, "videos_kwargs"):
             self._reject_do_resize_false(scope, "video")
+            self._cap_pixel_kwargs(scope, limit, "video")
             self._cap_size_edges(scope, limit, "video")
 
 

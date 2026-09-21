@@ -76,7 +76,11 @@ def test_dynamic_processor_caps_call_overrides_at_4096_vision_tokens() -> None:
         "images_kwargs": {"size": {"longest_edge": 16_777_216}},
     }
     video_kwargs = {
-        "videos_kwargs": {"size": {"longest_edge": 16_777_216}},
+        "max_pixels": 16_777_216,
+        "videos_kwargs": {
+            "min_pixels": 16_777_216,
+            "size": {"longest_edge": 16_777_216},
+        },
     }
 
     processor._clamp_dynamic_image_call_kwargs(image_kwargs)
@@ -84,6 +88,8 @@ def test_dynamic_processor_caps_call_overrides_at_4096_vision_tokens() -> None:
 
     assert image_kwargs["max_pixels"] == 4096 * 16**2
     assert image_kwargs["images_kwargs"]["size"]["longest_edge"] == 4096 * 16**2
+    assert video_kwargs["max_pixels"] == 4096 * 16**2 * 2
+    assert video_kwargs["videos_kwargs"]["min_pixels"] == 4096 * 16**2 * 2
     assert video_kwargs["videos_kwargs"]["size"]["longest_edge"] == 4096 * 16**2 * 2
 
 
