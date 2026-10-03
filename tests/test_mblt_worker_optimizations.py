@@ -2278,6 +2278,36 @@ class TestMbltWorkerOptimizations:
         assert output.sampled_token_ids[output.req_id_to_index["scored"]].tolist() == [41]
         assert output.sampled_token_ids[output.req_id_to_index["plain"]].tolist() == [42]
 
+    def test_batch_full_logits_rows_without_prompt_logprobs_drop_sequence_logits(self) -> None:
+        worker = self._make_batch_worker(max_batch_size=4)
+        vocab_size = 64
+        next_token = {0: [12, 13, 14, 41], 1: [22, 23, 42]}
+        infer_calls: list[tuple[tuple[int, int, int], ...]] = []
+        worker.cache_model = self._make_fake_batch_mxq(
+            full_logits=True,
+            vocab_size=vocab_size,
+            max_batch_size=4,
+            next_token=next_token,
+            infer_calls=infer_calls,
+        )
+
+        outputs = worker._infer_normal_logits_batch_chunked(
+            output_indices=[0, 1],
+            input_embeds_batch=[np.ones((4, 4), dtype=np.float32), np.ones((3, 4), dtype=np.float32)],
+            cache_sizes=[0, 0],
+            cache_ids=[0, 1],
+            keep_sequence_logits=[True, False],
+        )
+
+        assert infer_calls == [((4, 0, 0), (3, 0, 1))]
+        kept, dropped = outputs[0], outputs[1]
+        assert kept.full_sequence_logits is not None
+        assert kept.full_sequence_logits.argmax(axis=-1).tolist() == [12, 13, 14, 41]
+        assert dropped.full_sequence_logits is None
+        assert int(dropped.last_token_logits.argmax()) == 42
+        # Only the last row is kept, not a view into the [tokens, vocab] output.
+        assert dropped.last_token_logits.base is None
+
     def test_batch_last_logit_prompt_logprobs_still_use_microsteps(self) -> None:
         worker = self._make_batch_worker(max_batch_size=4)
         vocab_size = 64

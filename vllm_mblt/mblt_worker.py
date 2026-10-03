@@ -2188,9 +2188,19 @@ class MbltWorker(WorkerBase):
         cache_ids: list[int],
         deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
         rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
+        keep_sequence_logits: Optional[list[bool]] = None,
     ) -> dict[int, InferenceLogits]:
+        """Forward normal batch rows in chunks.
+
+        ``keep_sequence_logits`` marks the rows whose per-position logits are
+        read afterwards (prompt logprobs).  A full-logits MXQ returns one
+        vocab row per input token, so the others drop theirs and keep only a
+        copy of the last row instead of the whole chunk output.
+        """
         if not output_indices:
             return {}
+        if keep_sequence_logits is None:
+            keep_sequence_logits = [True] * len(output_indices)
         if not (len(output_indices) == len(input_embeds_batch) == len(cache_sizes) == len(cache_ids)):
             raise RuntimeError(
                 "Normal batch chunk inputs must have identical lengths: "
@@ -2207,6 +2217,11 @@ class MbltWorker(WorkerBase):
                 "Normal batch RoPE inputs must match input embeddings: "
                 f"input_embeds={len(input_embeds_batch)}, rope={len(rope_embeds_batch)}"
             )
+        if len(keep_sequence_logits) != len(output_indices):
+            raise RuntimeError(
+                "Normal batch sequence-logit flags must match output indices: "
+                f"indices={len(output_indices)}, keep_sequence_logits={len(keep_sequence_logits)}"
+            )
 
         token_cap = self._normal_batch_chunk_token_cap()
         states = [
@@ -2217,15 +2232,16 @@ class MbltWorker(WorkerBase):
                 rope_embeds=None if rope_embeds_batch is None else rope_embeds,
                 cache_size=cache_size,
                 cache_id=cache_id,
-                full_sequence_logits=[],
+                full_sequence_logits=[] if keep else None,
             )
-            for output_index, input_embeds, deepstack_embeds, rope_embeds, cache_size, cache_id in zip(
+            for output_index, input_embeds, deepstack_embeds, rope_embeds, cache_size, cache_id, keep in zip(
                 output_indices,
                 input_embeds_batch,
                 [None] * len(input_embeds_batch) if deepstack_embeds_batch is None else deepstack_embeds_batch,
                 [None] * len(input_embeds_batch) if rope_embeds_batch is None else rope_embeds_batch,
                 cache_sizes,
                 cache_ids,
+                keep_sequence_logits,
             )
         ]
 
@@ -2277,6 +2293,9 @@ class MbltWorker(WorkerBase):
                     state.offset += chunk_len
                     state.cache_size += chunk_len
                     state.last_token_logits = inference_logits.last_token_logits
+                    if state.full_sequence_logits is None and inference_logits.full_sequence_logits is not None:
+                        # A view would keep the whole [tokens, vocab] chunk output alive.
+                        state.last_token_logits = state.last_token_logits.copy()
                     if inference_logits.full_sequence_logits is None:
                         state.full_sequence_logits = None
                     elif state.full_sequence_logits is not None:
@@ -3932,6 +3951,10 @@ class MbltWorker(WorkerBase):
                     cache_ids=[cache_ids[i] for i in normal_indices],
                     deepstack_embeds_batch=[deepstack_embeds_batch[i] for i in normal_indices],
                     rope_embeds_batch=[rope_embeds_batch[i] for i in normal_indices],
+                    keep_sequence_logits=[
+                        self._num_prompt_logprobs(self.req_states[req_ids[i]].sampling_params) is not None
+                        for i in normal_indices
+                    ],
                 )
                 for i, inference_logits in normal_logits.items():
                     batched_logits[i] = inference_logits

@@ -10,6 +10,8 @@
   last-token logits). Last-logit batch MXQs, and any whose widths cannot tell, keep the microstep path.
 - Batched infer outputs are split from their last two axes, so a full-logits batch MXQ's `[1, 1, tokens, vocab]`
   output is sliced per request instead of being reshaped into rows.
+- Normal batch rows that do not request prompt logprobs keep only their last-token logits, not a full-logits
+  MXQ's per-position rows.
 
 ## 0.6.0
 
