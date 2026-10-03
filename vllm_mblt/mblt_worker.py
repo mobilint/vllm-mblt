@@ -1817,6 +1817,16 @@ class MbltWorker(WorkerBase):
             return None
         return max_width if max_width > 0 else None
 
+    @staticmethod
+    def _compiled_batch_rows(cache_model: Any) -> int:
+        get_cache_infos = getattr(cache_model, "get_cache_infos", None)
+        if not callable(get_cache_infos):
+            return 0
+        try:
+            return max((int(getattr(info, "num_batches", 0) or 0) for info in get_cache_infos()), default=0)
+        except Exception:
+            return 0
+
     def _batch_output_logits_mode(self, cache_model: Any, output_shape: tuple[int, ...]) -> str:
         """Classify a batch MXQ's ``[1, -1, vocab]`` logits as full-sequence or last-token.
 
@@ -1830,7 +1840,18 @@ class MbltWorker(WorkerBase):
 
         A batch MXQ whose token budget equals its row count cannot be told
         apart this way and stays ``unknown`` (1-token prompt-logprob
-        microsteps), as does a static sequence axis.
+        microsteps), as does a static sequence axis or an output buffer wider
+        than the input buffer.
+
+        Assumptions:
+
+        * Buffer info ``[0]`` is the text-embedding input and the logits
+          output, the same index ``get_model_output_shape()[0]`` is read at.
+        * The row bound is the larger of vLLM's ``max_batch_size`` and the
+          MXQ's compiled batch (its KV cache's ``num_batches``), so a
+          ``max_num_seqs`` override below the compiled batch cannot lower it
+          and make a last-logit MXQ whose token budget equals its compiled
+          batch read as full-sequence.
         """
 
         if int(output_shape[1]) != -1:
@@ -1839,7 +1860,10 @@ class MbltWorker(WorkerBase):
         output_width = self._buffer_max_width(cache_model, "get_output_buffer_info")
         if input_width is None or output_width is None:
             return "unknown"
-        if output_width == input_width and output_width > self.max_batch_size:
+        row_bound = max(int(self.max_batch_size), self._compiled_batch_rows(cache_model))
+        # ``output_width == input_width <= row_bound`` (a token budget no larger
+        # than the row count) is the undecidable case and falls through to unknown.
+        if output_width == input_width and output_width > row_bound:
             return "full_sequence"
         if output_width < input_width:
             return "last_token"
@@ -2076,6 +2100,11 @@ class MbltWorker(WorkerBase):
     ) -> list[InferenceLogits]:
         """Run one Model slot and parse its logits without changing row order."""
         batch_size = len(input_embeds_batch)
+        sequence_lengths = [int(input_embeds.shape[0]) for input_embeds in input_embeds_batch]
+        if any(seq_len <= 0 for seq_len in sequence_lengths):
+            # No row can be read back for an empty slice under either reading.
+            raise RuntimeError("Batched infer received an empty input embedding slice.")
+        total_tokens = sum(sequence_lengths)
         params = self._make_batch_params(
             sequence_lengths=[int(input_embeds.shape[0]) for input_embeds in input_embeds_batch],
             cache_sizes=cache_sizes,
@@ -2090,23 +2119,21 @@ class MbltWorker(WorkerBase):
 
         logits = infer_output[0] if isinstance(infer_output, (list, tuple)) else infer_output
         logits_np = np.asarray(logits)
-        sequence_lengths = [int(input_embeds.shape[0]) for input_embeds in input_embeds_batch]
-        total_tokens = sum(sequence_lengths)
         # qbruntime returns a batch MXQ's declared ``[1, -1, vocab]`` output as
         # ``[1, 1, rows, vocab]`` (measured on aries for rank-3 and rank-4
         # inputs), so read the rows off the last two axes.
         if logits_np.ndim >= 2 and all(int(dim) == 1 for dim in logits_np.shape[:-2]):
             rows = logits_np.reshape(-1, logits_np.shape[-1])
             if rows.shape[0] == total_tokens:
-                if any(seq_len <= 0 for seq_len in sequence_lengths):
-                    raise RuntimeError("Batched infer received an empty input embedding slice.")
                 # One row per packed input token: a full-logits MXQ, or a step in
                 # which every request is a single token (decode), where the
                 # per-token and last-token readings coincide.
                 outputs: list[InferenceLogits] = []
                 offset = 0
                 for seq_len in sequence_lengths:
-                    sequence_logits = rows[offset : offset + seq_len, :]
+                    # Copy the row's own slice: a view would keep the whole
+                    # [total_tokens, vocab] output alive as long as any row is.
+                    sequence_logits = rows[offset : offset + seq_len, :].copy()
                     outputs.append(
                         InferenceLogits(
                             last_token_logits=sequence_logits[-1, :],

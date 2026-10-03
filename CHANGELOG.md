@@ -12,6 +12,10 @@
   output is sliced per request instead of being reshaped into rows.
 - Normal batch rows that do not request prompt logprobs keep only their last-token logits, not a full-logits
   MXQ's per-position rows.
+- A full-logits batch MXQ returns `tokens x vocab x 4` bytes per packed prefill, so serving one needs up to
+  `max_num_batched_tokens x vocab x 4` bytes of host memory per step (about 1.2 GiB for Qwen3-0.6B at a 2048-token
+  budget), plus a per-row copy while it is split. Size the serving container's memory for it: on aries a 24 GiB
+  container failed the first such step with `Driver_FailedToAllocateHostMemory`, and 64 GiB served it.
 
 ## 0.6.0
 
