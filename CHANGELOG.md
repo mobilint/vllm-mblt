@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- Batch MXQs built with full logits now serve prompt logprobs (`echo=true`) from the prefill's per-position
+  logits instead of the 1-token microstep path. Batch MXQs declare `[1, -1, vocab]` either way; the worker tells
+  them apart by the output buffer's max width (equal to the input buffer's for full logits, the row count for
+  last-token logits). Last-logit batch MXQs, and any whose widths cannot tell, keep the microstep path.
+- Batched infer outputs are split from their last two axes, so a full-logits batch MXQ's `[1, 1, tokens, vocab]`
+  output is sliced per request instead of being reshaped into rows.
+
 ## 0.6.0
 
 ### Added

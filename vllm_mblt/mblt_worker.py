@@ -1800,6 +1800,51 @@ class MbltWorker(WorkerBase):
     def _shape_dim_matches_sequence(dim: int, input_seq_len: int) -> bool:
         return dim == -1 or dim == input_seq_len
 
+    @staticmethod
+    def _buffer_max_width(cache_model: Any, getter_name: str) -> Optional[int]:
+        getter = getattr(cache_model, getter_name, None)
+        if not callable(getter):
+            return None
+        try:
+            buffer_infos = getter()
+        except Exception:
+            return None
+        if not buffer_infos:
+            return None
+        try:
+            max_width = int(getattr(buffer_infos[0], "max_width"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return max_width if max_width > 0 else None
+
+    def _batch_output_logits_mode(self, cache_model: Any, output_shape: tuple[int, ...]) -> str:
+        """Classify a batch MXQ's ``[1, -1, vocab]`` logits as full-sequence or last-token.
+
+        A batch MXQ packs every scheduled row along the dynamic axis, so the
+        declared output shape is ``[1, -1, vocab]`` for both kinds: a last-logit
+        MXQ returns one position per row, a full-logits MXQ one per input token.
+        The bound of that dynamic axis tells them apart.  A full-logits MXQ
+        keeps every input position through lm_head, so its output buffer is as
+        wide as its input buffer (the packed token budget); a last-logit MXQ's
+        output buffer is only as wide as its row count.
+
+        A batch MXQ whose token budget equals its row count cannot be told
+        apart this way and stays ``unknown`` (1-token prompt-logprob
+        microsteps), as does a static sequence axis.
+        """
+
+        if int(output_shape[1]) != -1:
+            return "unknown"
+        input_width = self._buffer_max_width(cache_model, "get_input_buffer_info")
+        output_width = self._buffer_max_width(cache_model, "get_output_buffer_info")
+        if input_width is None or output_width is None:
+            return "unknown"
+        if output_width == input_width and output_width > self.max_batch_size:
+            return "full_sequence"
+        if output_width < input_width:
+            return "last_token"
+        return "unknown"
+
     def _runtime_output_logits_mode(self, input_seq_len: int) -> str:
         """Best-effort classify MXQ logits as full-sequence, last-token, or unknown."""
 
@@ -1817,7 +1862,7 @@ class MbltWorker(WorkerBase):
         output_shape = tuple(output_shapes[0])
         if len(output_shape) == 3:
             if self._is_batch_model():
-                return "unknown"
+                return self._batch_output_logits_mode(cache_model, output_shape)
             if self._shape_dim_matches_sequence(int(output_shape[1]), input_seq_len):
                 return "full_sequence"
             if input_seq_len > 1 and int(output_shape[1]) == 1:
@@ -2045,27 +2090,36 @@ class MbltWorker(WorkerBase):
 
         logits = infer_output[0] if isinstance(infer_output, (list, tuple)) else infer_output
         logits_np = np.asarray(logits)
-        if logits_np.ndim == 3:
-            offset = 0
-            outputs: list[InferenceLogits] = []
-            for input_embeds in input_embeds_batch:
-                seq_len = int(input_embeds.shape[0])
-                if seq_len <= 0:
+        sequence_lengths = [int(input_embeds.shape[0]) for input_embeds in input_embeds_batch]
+        total_tokens = sum(sequence_lengths)
+        # qbruntime returns a batch MXQ's declared ``[1, -1, vocab]`` output as
+        # ``[1, 1, rows, vocab]`` (measured on aries for rank-3 and rank-4
+        # inputs), so read the rows off the last two axes.
+        if logits_np.ndim >= 2 and all(int(dim) == 1 for dim in logits_np.shape[:-2]):
+            rows = logits_np.reshape(-1, logits_np.shape[-1])
+            if rows.shape[0] == total_tokens:
+                if any(seq_len <= 0 for seq_len in sequence_lengths):
                     raise RuntimeError("Batched infer received an empty input embedding slice.")
-                sequence_logits = logits_np[0, offset : offset + seq_len, :]
-                outputs.append(
-                    InferenceLogits(
-                        last_token_logits=sequence_logits[-1, :],
-                        full_sequence_logits=sequence_logits,
+                # One row per packed input token: a full-logits MXQ, or a step in
+                # which every request is a single token (decode), where the
+                # per-token and last-token readings coincide.
+                outputs: list[InferenceLogits] = []
+                offset = 0
+                for seq_len in sequence_lengths:
+                    sequence_logits = rows[offset : offset + seq_len, :]
+                    outputs.append(
+                        InferenceLogits(
+                            last_token_logits=sequence_logits[-1, :],
+                            full_sequence_logits=sequence_logits,
+                        )
                     )
-                )
-                offset += seq_len
-            if offset != logits_np.shape[1]:
+                    offset += seq_len
+                return outputs
+            if logits_np.ndim >= 3 and rows.shape[0] != batch_size:
                 raise RuntimeError(
                     "Batched infer returned logits with unexpected sequence length: "
-                    f"shape={logits_np.shape}, expected_tokens={offset}"
+                    f"shape={logits_np.shape}, expected_tokens={total_tokens} or rows={batch_size}"
                 )
-            return outputs
         if logits_np.size % batch_size != 0:
             raise RuntimeError(
                 f"Batched infer returned logits with unexpected shape: shape={logits_np.shape}, batch_size={batch_size}"
