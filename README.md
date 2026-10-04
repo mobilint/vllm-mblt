@@ -20,15 +20,15 @@
 **vllm-mblt** is an out-of-tree [vLLM](https://github.com/vllm-project/vllm) plugin that integrates
 [Mobilint](https://www.mobilint.com/) NPU runtime support into the vLLM serving and benchmarking stack.
 
-It provides a custom vLLM platform, worker, and model registry hooks so Mobilint-optimized LLM/VLM artifacts
-can be served through familiar vLLM commands and OpenAI-compatible APIs.
+It provides a custom vLLM platform, worker, and model registry hooks so Mobilint-optimized LLM, VLM and ASR
+artifacts can be served through familiar vLLM commands and OpenAI-compatible APIs.
 
 ## Highlights
 
 - **Out-of-tree vLLM plugin**: registers the `mblt` platform without patching vLLM itself.
 - **Mobilint NPU worker**: dispatches text-generation and multimodal execution to Mobilint runtime models.
 - **Model registry integration**: supports Mobilint wrappers for Llama, HyperCLOVAX, EXAONE/EXAONE4, Qwen2/3,
-  and Qwen2/3-VL families.
+  Qwen2/3-VL, and Qwen3-ASR families.
 - **Runtime-aware scheduling**: reads model-configured `npu_prefill_chunk_size` and `max_batch_size` values to
   tune chunked prefill and scheduler concurrency automatically.
 - **vLLM benchmark compatibility**: works with `vllm serve`, `vllm bench serve`, and `vllm bench throughput`.
@@ -38,6 +38,7 @@ can be served through familiar vLLM commands and OpenAI-compatible APIs.
 - Python 3.10+
 - `vllm==0.11.2`
 - `mblt-model-zoo[transformers] >= 2.7.0`
+- For Qwen3-ASR, the `qwen-asr` extra: `pip install "vllm-mblt[qwen-asr]"`
 - A Mobilint NPU environment. If you are not yet a Mobilint customer, please contact
   [tech-support@mobilint.com](mailto:tech-support@mobilint.com).
 
@@ -115,6 +116,45 @@ Current Mobilint Qwen2/3-VL notes:
 - Dynamic Qwen3-VL image and video preprocessing is capped at 4096 pre-merge vision tokens per encoder invocation,
   matching the NPU vision MXQ input limit. Oversized resolution overrides are clamped and `do_resize=False` is
   rejected because it can bypass this safety limit.
+
+### 4. Serve a Speech-to-Text Model
+
+Qwen3-ASR needs the optional `qwen-asr` extra:
+
+```bash
+pip install "vllm-mblt[qwen-asr]"
+vllm serve mobilint/Qwen3-ASR-1.7B --trust-remote-code --max-num-seqs 1
+```
+
+It serves vLLM's OpenAI-compatible transcription endpoint:
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F file=@sample.flac -F model=mobilint/Qwen3-ASR-1.7B -F language=en
+```
+
+Current Mobilint Qwen3-ASR notes:
+
+- Pass `language` to get plain text. Without it the model detects the language itself and its native preface
+  (for example `language English<asr_text>`) is returned as part of `text`, once per chunk.
+- vllm-mblt clamps `max_model_len` to 2048 for this model, so longer prompts get a 400: the artifact config
+  declares 65536, but a request whose audio runs past token 2048 can stall the NPU.
+- `--max-num-seqs 1`: the artifact config declares no `max_batch_size`, so without the flag vLLM interleaves
+  requests on the batch-1 compiled decoder, and four concurrent requests take roughly 3-3.5x as long as sending
+  them one by one.
+- The optional `prompt` field reaches the model as context, such as names or terms the audio contains.
+- On `/v1/audio/transcriptions`, audio longer than the artifact's 30 s window is split by vLLM and transcribed
+  chunk by chunk. The chat endpoint takes each clip whole, so send long recordings to the transcription endpoint.
+- On the chat endpoint, the artifact's chat template keeps only the system message and the audio, so put any
+  context in the system message. Replies start with the model's preface, such as `language English<asr_text>`.
+- One audio clip per request. `/v1/audio/translations` returns 400: the model transcribes but does not
+  translate.
+- vllm-mblt turns off vLLM's multimodal processor cache for this model. In vLLM 0.11.2, a request refused
+  after preprocessing, such as one over the length limit, leaves that cache out of step with the engine, and
+  sending the same audio again would stop the server from accepting requests.
+- vLLM 0.11.2 can hang the whole API server while splitting some malformed long uploads (fixed in vLLM 0.25.0
+  by [vllm-project/vllm#46463](https://github.com/vllm-project/vllm/pull/46463), after the version this plugin
+  pins). Validate or re-encode uploads in front of a public deployment.
 
 ## Runtime Tuning
 
@@ -357,6 +397,7 @@ Notes:
 | Qwen3 | `MobilintQwen3ForCausalLM` |
 | Qwen2-VL | `MobilintQwen2VLForConditionalGeneration` |
 | Qwen3-VL | `MobilintQwen3VLForConditionalGeneration` |
+| Qwen3-ASR | `MobilintQwen3ASRForConditionalGeneration` |
 
 Model artifacts are available through Mobilint model repositories such as the
 [Mobilint Hugging Face Hub](https://huggingface.co/mobilint).

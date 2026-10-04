@@ -6,6 +6,7 @@ import pytest
 import torch
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.logprobs import Logprob
+from vllm.model_executor import model_loader
 from vllm.sampling_params import SamplingParams
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.engine.logprobs import LogprobsProcessor, create_prompt_logprobs
@@ -52,6 +53,32 @@ class TestMbltWorkerOptimizations:
         assert not _is_qwen3_vl_hf_config(SimpleNamespace(model_type="qwen2_vl"))
         assert not _is_qwen3_vl_hf_config(SimpleNamespace(architectures=["MobilintQwen3VLForConditionalGeneration"]))
 
+    def test_multimodal_hf_config_excludes_audio_text_qwen3_asr(self) -> None:
+        # Every caller of _is_multimodal_hf_config means "image-text model"; the audio path must not
+        # pick up the vision_/text_ kwarg handling, AutoModelForImageTextToText or the VLM guards.
+        assert not _is_multimodal_hf_config(SimpleNamespace(model_type="mobilint-qwen3_asr"))
+
+    @pytest.mark.parametrize(
+        ("model_cls_attrs", "expected"),
+        [
+            ({}, ("generate",)),
+            ({"supports_transcription": True}, ("generate", "transcription")),
+            ({"supports_transcription": True, "supports_transcription_only": True}, ("transcription",)),
+        ],
+        ids=["text-model", "transcription-model", "transcription-only-model"],
+    )
+    def test_supported_tasks_follow_the_registered_model_class(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        model_cls_attrs: dict[str, bool],
+        expected: tuple[str, ...],
+    ) -> None:
+        worker = self._make_worker()
+        model_cls = type("FakeModel", (), model_cls_attrs)
+        monkeypatch.setattr(model_loader, "get_model_cls", lambda _model_config: model_cls)
+
+        assert worker.get_supported_tasks() == expected
+
     def test_qwen3_vl_composite_config_resolves_text_vocab_size_for_default_top_k(self) -> None:
         worker = self._make_worker()
         worker.model.config = SimpleNamespace(
@@ -85,6 +112,35 @@ class TestMbltWorkerOptimizations:
 
         with pytest.raises(RuntimeError, match="Unable to resolve a positive vocab_size"):
             worker._make_cached_sampling_state(SamplingParams.from_optional(top_k=0), [1])
+
+    def test_qwen3_asr_composite_config_resolves_thinker_vocab_size_for_default_top_k(self) -> None:
+        worker = self._make_worker()
+        worker.model.config = SimpleNamespace(
+            model_type="mobilint-qwen3_asr",
+            thinker_config=SimpleNamespace(text_config=SimpleNamespace(vocab_size=151936)),
+        )
+
+        cached_state = worker._make_cached_sampling_state(SamplingParams.from_optional(top_k=0), [1, 2, 3])
+
+        assert cached_state.top_k == 151936
+
+    def test_vocab_size_resolution_falls_back_to_hf_thinker_text_config(self) -> None:
+        worker = self._make_worker()
+        worker.model.config = SimpleNamespace(model_type="mobilint-qwen3_asr")
+        worker.model_config.hf_config = SimpleNamespace(
+            thinker_config=SimpleNamespace(text_config=SimpleNamespace(vocab_size=151936))
+        )
+
+        assert worker._resolve_vocab_size() == 151936
+
+    def test_vocab_size_resolution_prefers_shallower_configs_over_thinker_config(self) -> None:
+        worker = self._make_worker()
+        worker.model.config = SimpleNamespace(
+            vocab_size=32000,
+            thinker_config=SimpleNamespace(text_config=SimpleNamespace(vocab_size=151936)),
+        )
+
+        assert worker._resolve_vocab_size() == 32000
 
     def test_multimodal_model_detection_uses_mobilint_model_type_only(self) -> None:
         worker = self._make_worker()
@@ -2597,6 +2653,121 @@ class TestMbltWorkerOptimizations:
         torch.testing.assert_close(deepstack[1, 1:3], deepstack_layers[1])
         torch.testing.assert_close(deepstack[:, :1], torch.zeros(2, 1, 4))
         torch.testing.assert_close(deepstack[:, 3:], torch.zeros(2, 2, 4))
+
+    def _make_audio_feature(
+        self,
+        *,
+        input_features: object = None,
+        feature_attention_mask: object = None,
+    ) -> SimpleNamespace:
+        data = {}
+        if input_features is not None:
+            data["input_features"] = input_features
+        if feature_attention_mask is not None:
+            data["feature_attention_mask"] = feature_attention_mask
+        return self._make_mm_feature("audio", offset=1, length=2, data=data)
+
+    def test_build_prompt_embeds_scatters_audio_features_into_prompt_embeds(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_asr")
+        base_prompt_embeds = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        original_prompt_embeds = base_prompt_embeds.clone()
+        audio_embeds = torch.full((2, 4), 7.0)
+        captured = {}
+
+        def get_audio_features(**kwargs):
+            captured.update(kwargs)
+            return audio_embeds
+
+        worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32000), get_audio_features=get_audio_features)
+        # One clip as vLLM delivers it after slicing the batched field: no leading clip axis, bfloat16
+        # features (vLLM casts processor outputs to the model dtype) and the processor's int32 mask.
+        feature = self._make_audio_feature(
+            input_features=torch.zeros(128, 6, dtype=torch.bfloat16),
+            feature_attention_mask=torch.ones(6, dtype=torch.int32),
+        )
+        merged, deepstack = worker._build_prompt_embeds(
+            prompt_token_ids=None, prompt_embeds=base_prompt_embeds, mm_features=[feature]
+        )
+
+        torch.testing.assert_close(merged[:1], original_prompt_embeds[:1])
+        torch.testing.assert_close(merged[1:3], audio_embeds)
+        torch.testing.assert_close(merged[3:], original_prompt_embeds[3:])
+        torch.testing.assert_close(base_prompt_embeds, original_prompt_embeds)
+        assert deepstack is None
+        # get_audio_features() indexes clips on dim 0, so both tensors gain that axis together.
+        assert tuple(captured["input_features"].shape) == (1, 128, 6)
+        assert captured["input_features"].dtype == torch.float32
+        assert tuple(captured["feature_attention_mask"].shape) == (1, 6)
+        assert captured["feature_attention_mask"].dtype == torch.long
+
+    def test_build_prompt_embeds_keeps_audio_features_that_already_carry_a_clip_axis(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_asr")
+        captured = {}
+
+        def get_audio_features(**kwargs):
+            captured.update(kwargs)
+            return torch.ones(2, 4)
+
+        worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32000), get_audio_features=get_audio_features)
+        feature = self._make_audio_feature(
+            input_features=torch.zeros(1, 128, 6),
+            feature_attention_mask=torch.ones(1, 6, dtype=torch.long),
+        )
+        worker._build_prompt_embeds(prompt_token_ids=None, prompt_embeds=torch.zeros(5, 4), mm_features=[feature])
+
+        assert tuple(captured["input_features"].shape) == (1, 128, 6)
+        assert tuple(captured["feature_attention_mask"].shape) == (1, 6)
+
+    @pytest.mark.parametrize(
+        ("input_features", "feature_attention_mask", "message"),
+        [
+            (None, torch.ones(6, dtype=torch.long), "missing input_features"),
+            (torch.zeros(128, 6), None, "missing feature_attention_mask"),
+            # Two clips of features against one mask row: zip() in get_audio_features() would drop a clip.
+            (torch.zeros(2, 128, 6), torch.ones(1, 6, dtype=torch.long), "must describe the same clips"),
+            # A clip axis on only one tensor: get_audio_features() would pair mel bins with clip lengths.
+            (torch.zeros(128, 6), torch.ones(1, 6, dtype=torch.long), "must describe the same clips"),
+            # One axis too many on either tensor, with the clip counts still agreeing.
+            (torch.zeros(1, 1, 128, 6), torch.ones(1, 6, dtype=torch.long), "must describe the same clips"),
+            (torch.zeros(1, 128, 6), torch.ones(1, 1, 6, dtype=torch.long), "must describe the same clips"),
+        ],
+        ids=[
+            "missing-features",
+            "missing-mask",
+            "clip-count-mismatch",
+            "clip-axis-on-one-tensor",
+            "features-4d",
+            "mask-3d",
+        ],
+    )
+    def test_build_prompt_embeds_rejects_malformed_audio_features(
+        self,
+        input_features: object,
+        feature_attention_mask: object,
+        message: str,
+    ) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_asr")
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(vocab_size=32000),
+            get_audio_features=lambda **_kwargs: pytest.fail("malformed audio reached the NPU hook"),
+        )
+        feature = self._make_audio_feature(input_features=input_features, feature_attention_mask=feature_attention_mask)
+
+        with pytest.raises(RuntimeError, match=message):
+            worker._build_prompt_embeds(prompt_token_ids=None, prompt_embeds=torch.zeros(5, 4), mm_features=[feature])
+
+    def test_build_prompt_embeds_rejects_audio_for_model_without_audio_tower(self) -> None:
+        worker = self._make_worker()
+        feature = self._make_audio_feature(
+            input_features=torch.zeros(128, 6),
+            feature_attention_mask=torch.ones(6, dtype=torch.long),
+        )
+
+        with pytest.raises(RuntimeError, match="does not expose get_audio_features"):
+            worker._build_prompt_embeds(prompt_token_ids=None, prompt_embeds=torch.zeros(5, 4), mm_features=[feature])
 
     def test_build_prompt_embeds_scatters_multiple_images_and_video(self) -> None:
         worker = self._make_worker()

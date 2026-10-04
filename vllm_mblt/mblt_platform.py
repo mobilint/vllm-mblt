@@ -17,6 +17,8 @@ _MULTIMODAL_HF_MODEL_TYPES = frozenset(
         "mobilint-qwen3_vl",
     }
 )
+# Qwen3-ASR audio past this token can stall the NPU; the artifact config declares 65536.
+_QWEN3_ASR_MAX_MODEL_LEN = 2048
 _TRUE_ENV_VALUES = {"1", "true", "TRUE", "True"}
 # A batch LLM compiled at a global scheme mixes core modes inside one mxq (the
 # collective segments target the cluster GlobalCore, the iterative ones Core0),
@@ -98,6 +100,10 @@ def _get_config_field_value(config: object, field_name: str) -> object:
 def _is_multimodal_hf_config(hf_config: object) -> bool:
     model_type = _get_config_field_value(hf_config, "model_type")
     return isinstance(model_type, str) and model_type in _MULTIMODAL_HF_MODEL_TYPES
+
+
+def _is_qwen3_asr_hf_config(hf_config: object) -> bool:
+    return _get_config_field_value(hf_config, "model_type") == "mobilint-qwen3_asr"
 
 
 def _prefer_text_runtime(vllm_config: "VllmConfig") -> bool:
@@ -343,6 +349,32 @@ class MbltPlatform(Platform):
             cache_config.block_size = 128  # type: ignore
         if cache_config.enable_prefix_caching is None:
             cache_config.enable_prefix_caching = True
+
+        # vLLM 0.11.2's front end records a multimodal item as sent to the engine before the
+        # length checks run. If the request is then refused, the engine never receives the item,
+        # and a later request with the same audio arrives without it: the engine's input thread
+        # fails an assert and stops accepting requests. Qwen3-ASR rarely sees the same audio twice,
+        # so the cache gains it little.
+        multimodal_config = getattr(getattr(vllm_config, "model_config", None), "multimodal_config", None)
+        if (
+            _is_qwen3_asr_hf_config(_get_hf_config(vllm_config))
+            and getattr(multimodal_config, "mm_processor_cache_gb", 0) > 0
+        ):
+            logger.info(
+                "Disabling the multimodal processor cache for Qwen3-ASR (mm_processor_cache_gb=%s -> 0).",
+                multimodal_config.mm_processor_cache_gb,
+            )
+            multimodal_config.mm_processor_cache_gb = 0
+
+        if _is_qwen3_asr_hf_config(_get_hf_config(vllm_config)):
+            model_config = vllm_config.model_config
+            if model_config.max_model_len > _QWEN3_ASR_MAX_MODEL_LEN:
+                logger.warning(
+                    "Clamping max_model_len from %d to %d for Qwen3-ASR.",
+                    model_config.max_model_len,
+                    _QWEN3_ASR_MAX_MODEL_LEN,
+                )
+                model_config.max_model_len = _QWEN3_ASR_MAX_MODEL_LEN
 
         scheduler_config: SchedulerConfig = vllm_config.scheduler_config
 

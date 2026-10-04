@@ -91,6 +91,13 @@ _MULTIMODAL_SHARED_BACKEND_KWARG_FIELDS = _MBLT_BACKEND_KWARG_FIELDS - {"mxq_pat
 _MULTIMODAL_BACKEND_PREFIXES = ("vision_", "text_")
 
 
+# NOTE: "mobilint-qwen3_asr" is deliberately NOT a member of _MULTIMODAL_HF_MODEL_TYPES above.
+# Its call sites mean "image-text model" (vision_/text_ kwarg normalisation,
+# AutoModelForImageTextToText, the single-image constraints), and joining the set would discard
+# Qwen3-ASR's encoder_/decoder_ device-placement kwargs. Qwen3-ASR is served at max_batch_size 1:
+# the batch path's _ensure_batch_vlm_supported refuses multimodal requests from non-VLM models.
+
+
 def _is_multimodal_hf_config(hf_config: object) -> bool:
     model_type = getattr(hf_config, "model_type", None)
     return isinstance(model_type, str) and model_type in _MULTIMODAL_HF_MODEL_TYPES
@@ -1066,6 +1073,7 @@ class MbltWorker(WorkerBase):
 
         get_image_features = getattr(self.model, "get_image_features", None)
         get_video_features = getattr(self.model, "get_video_features", None)
+        get_audio_features = getattr(self.model, "get_audio_features", None)
         supports_deepstack_input = self._supports_deepstack_input()
         deepstack_prompt_embeds: Optional[torch.Tensor] = None
 
@@ -1126,6 +1134,48 @@ class MbltWorker(WorkerBase):
                         feature.mm_position,
                         self._extract_deepstack_embeddings(video_features),
                     )
+            elif modality.startswith("audio"):
+                if not callable(get_audio_features):
+                    raise RuntimeError(f"Model {type(self.model).__name__} does not expose get_audio_features().")
+                input_features = self._extract_multimodal_value(feature, "input_features")
+                if input_features is None:
+                    raise RuntimeError("Audio multimodal feature is missing input_features.")
+                feature_attention_mask = self._extract_multimodal_value(feature, "feature_attention_mask")
+                if feature_attention_mask is None:
+                    # qwen_asr's get_audio_features() falls back to feature_attention_mask.sum(-1) when the
+                    # mask is None, so a missing mask would surface as an AttributeError.
+                    raise RuntimeError(
+                        "Audio multimodal feature is missing feature_attention_mask; the feature "
+                        "extractor must run with return_attention_mask=True."
+                    )
+                input_features = self._to_torch_tensor(input_features, dtype=torch.float32)
+                feature_attention_mask = self._to_torch_tensor(feature_attention_mask, dtype=torch.long)
+                # Features arrive per item, without the leading clip axis along which get_audio_features()
+                # zips input_features with the mask's lengths. Add the axis to both or to neither, so the
+                # two can never disagree about how many clips they describe.
+                if input_features.ndim == 2 and feature_attention_mask.ndim == 1:
+                    input_features = input_features.unsqueeze(0)
+                    feature_attention_mask = feature_attention_mask.unsqueeze(0)
+                if (
+                    input_features.ndim != 3
+                    or feature_attention_mask.ndim != 2
+                    or input_features.shape[0] != feature_attention_mask.shape[0]
+                ):
+                    raise RuntimeError(
+                        "Audio features and attention mask must describe the same clips: "
+                        f"input_features={tuple(input_features.shape)}, "
+                        f"feature_attention_mask={tuple(feature_attention_mask.shape)}."
+                    )
+                audio_features = get_audio_features(
+                    input_features=input_features,
+                    feature_attention_mask=feature_attention_mask,
+                )
+                audio_embeds = self._normalize_multimodal_embeddings(audio_features)
+                self._scatter_multimodal_embeddings(
+                    merged_prompt_embeds,
+                    feature.mm_position,
+                    audio_embeds,
+                )
             else:
                 raise NotImplementedError(f"Unsupported multimodal modality for MBLT worker: {modality}")
 
@@ -2365,6 +2415,18 @@ class MbltWorker(WorkerBase):
                 getattr(self.model_config, "hf_config", None),
                 "text_config.vocab_size",
                 "model_config.hf_config.text_config.vocab_size",
+            ),
+            # Composite audio-text models (Qwen3-ASR) nest the language model under
+            # a thinker sub-config.
+            (
+                getattr(self.model, "config", None),
+                "thinker_config.text_config.vocab_size",
+                "model.config.thinker_config.text_config.vocab_size",
+            ),
+            (
+                getattr(self.model_config, "hf_config", None),
+                "thinker_config.text_config.vocab_size",
+                "model_config.hf_config.thinker_config.text_config.vocab_size",
             ),
         )
         for root, path, _source in candidates:
@@ -3675,6 +3737,23 @@ class MbltWorker(WorkerBase):
         pass
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        """Advertise transcription from the model class, not the HF model_type.
+
+        vLLM builds the handlers for /v1/audio/transcriptions and /v1/audio/translations
+        from this one flag, and OpenAISpeechToText calls ``model_cls.get_speech_to_text_config()``
+        while the app starts. Deriving it from the class that actually serves those
+        endpoints keeps the two in step. Follows
+        GPUModelRunner.get_supported_generation_tasks(), but checks the registered
+        class, since this worker never instantiates it.
+        """
+        from vllm.model_executor.model_loader import get_model_cls
+        from vllm.model_executor.models import supports_transcription
+
+        model_cls = get_model_cls(self.model_config)
+        if supports_transcription(model_cls):
+            if getattr(model_cls, "supports_transcription_only", False):
+                return ("transcription",)
+            return ("generate", "transcription")
         return ("generate",)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:

@@ -1,4 +1,4 @@
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 
 def register():
@@ -30,4 +30,9 @@ def register_model():
     ModelRegistry.register_model(
         "MobilintQwen3VLForConditionalGeneration",
         "vllm_mblt.models.modeling_qwen3_vl:MobilintQwen3VLForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
+        "MobilintQwen3ASRForConditionalGeneration",
+        "vllm_mblt.models.modeling_qwen3_asr:MobilintQwen3ASRForConditionalGeneration",
     )

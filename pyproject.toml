@@ -45,6 +45,13 @@ classifiers = [
 Home = "https://www.mobilint.com/"
 Repository = "https://github.com/mobilint/vllm-mblt"
 
+[project.optional-dependencies]
+# Serving mobilint/Qwen3-ASR-1.7B. Needs the mblt-model-zoo release whose Qwen3-ASR composite exposes
+# get_input_embeddings and get_audio_features on its outer class.
+qwen-asr = [
+    "mblt-model-zoo[qwen-asr]>2.10.0",
+]
+
 [project.entry-points."vllm.platform_plugins"]
 mblt = "vllm_mblt:register"
 
