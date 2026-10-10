@@ -402,6 +402,7 @@ class MbltWorker(WorkerBase):
             max_finished_snapshots=self.MAX_FINISHED_CACHE_SNAPSHOTS,
             dump_runtime_cache=self._dump_runtime_cache,
             load_runtime_cache=self._load_runtime_cache,
+            enable_prefix_caching=self._prefix_caching_enabled(),
         )
         self.prefix_cache_cost_model = PrefixCacheCostModel.from_config(
             self.vllm_config,
@@ -442,7 +443,15 @@ class MbltWorker(WorkerBase):
             dump_runtime_cache=self._dump_runtime_cache,
             load_runtime_cache=self._load_runtime_cache,
         )
+        self.runtime_cache.enable_prefix_caching = self._prefix_caching_enabled()
         self.runtime_cache.reset_slots(max_batch_size=self.max_batch_size)
+
+    def _prefix_caching_enabled(self) -> bool:
+        # MbltPlatform.check_and_update_config turns an unset (None) value
+        # into True, so treat None the same way here.
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        enabled = getattr(cache_config, "enable_prefix_caching", None)
+        return True if enabled is None else bool(enabled)
 
     def _is_batch_model(self) -> bool:
         return self.max_batch_size > 1
@@ -3505,7 +3514,10 @@ class MbltWorker(WorkerBase):
     ) -> None:
         finished_req_state = self.req_states.pop(req_id, None)
         finished_slot_id = finished_req_state.cache_slot_id if finished_req_state is not None else None
-        if finished_req_state is not None:
+        # Dump-on-finish only feeds cross-request prefix reuse. Without prefix
+        # caching nothing can load it, and the synchronous dump would delay the
+        # next request's prefill (issue #28).
+        if finished_req_state is not None and self._prefix_caching_enabled():
             should_dump = self.runtime_cache.should_dump_snapshot_after_step(
                 req_id,
                 finished_req_state.num_computed_tokens,

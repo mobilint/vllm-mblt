@@ -1126,3 +1126,67 @@ class TestMbltRuntimeCacheLiveTokenTracking:
         assert manager.owned_live_cache_tokens("req", None) is None
         assert manager.owned_live_cache_tokens("other", slot_id) == 4
         assert manager.owned_live_cache_tokens("other", None) == 4
+
+
+class TestMbltRuntimeCacheWithoutPrefixCaching:
+    def _make_manager(self, *, max_batch_size: int = 1) -> MbltRuntimeCacheManager:
+        return MbltRuntimeCacheManager(
+            max_batch_size=max_batch_size,
+            block_size=4,
+            enable_prefix_caching=False,
+        )
+
+    def test_prefix_caching_defaults_to_enabled(self) -> None:
+        assert _make_manager().enable_prefix_caching
+
+    def test_choose_snapshot_ignores_other_requests_snapshot(self) -> None:
+        manager = self._make_manager()
+        _store_snapshot(manager, "old", [1, 2], 8, cache_token_ids=range(8))
+        manager.touch_finished_snapshot("old")
+
+        match = manager.choose_snapshot(_request("new", (1, 2), 8, cache_token_ids=range(8)))
+
+        assert match.snapshot is None
+        assert match.matched_tokens == 0
+
+    def test_choose_snapshot_still_matches_full_and_partial_own_snapshot(self) -> None:
+        manager = self._make_manager()
+        _store_snapshot(manager, "req", [1, 2], 6, cache_token_ids=range(6))
+
+        full = manager.choose_snapshot(_request("req", (1, 2), 6, cache_token_ids=range(6)))
+        partial = manager.choose_snapshot(_request("req", (1, 2), 7, cache_token_ids=range(7)))
+
+        assert (full.req_id, full.matched_tokens, full.is_own_snapshot) == ("req", 6, True)
+        assert (partial.req_id, partial.matched_tokens, partial.is_own_snapshot) == ("req", 6, True)
+
+    def test_choose_snapshot_rejects_own_snapshot_with_different_tokens(self) -> None:
+        manager = self._make_manager()
+        _store_snapshot(manager, "req", [1, 2], 8, cache_token_ids=range(8))
+
+        match = manager.choose_snapshot(_request("req", (1, 2), 8, cache_token_ids=[9] * 8))
+
+        assert match.snapshot is None
+
+    def test_load_snapshot_for_slot_never_loads_another_requests_snapshot(self) -> None:
+        manager = self._make_manager(max_batch_size=2)
+        loads: list[object] = []
+        _store_snapshot(manager, "old", [1, 2], 8, cache_token_ids=range(8))
+        manager.touch_finished_snapshot("old")
+
+        result = manager.load_snapshot_for_slot(
+            _request("new", (1, 2), 8, cache_slot_id=0, cache_token_ids=range(8)),
+            load_runtime_cache=lambda blobs, slot_id: loads.append((blobs, slot_id)) or True,
+        )
+
+        assert result.cache_miss
+        assert loads == []
+
+    def test_mark_snapshot_finished_drops_snapshot_instead_of_keeping_it(self) -> None:
+        manager = self._make_manager()
+        _store_snapshot(manager, "req", [1, 2], 8, cache_token_ids=range(8))
+
+        assert manager.mark_snapshot_finished("req") == []
+
+        assert manager.get_snapshot("req") is None
+        assert list(manager.finished_snapshot_lru) == []
+        assert manager.choose_prefix_snapshot((1, 2), 8).snapshot is None
