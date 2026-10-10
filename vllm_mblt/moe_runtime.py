@@ -42,6 +42,9 @@ class MbltMoECacheModel:
         self.cache = model.build_mobilint_cache(1)
         self.shared_mxq_models: list[Any] = list(model.get_shared_mxq_models())
         self.vocab_size = int(model.config.vocab_size)
+        self.max_cache_size = min(
+            int(shared.get_input_buffer_info()[0].max_cache_size) for shared in self.shared_mxq_models
+        )
 
     def get_model_output_shape(self) -> list[tuple[int, ...]]:
         """Report last-token logits, so prompt logprobs take the worker's 1-token microstep path."""

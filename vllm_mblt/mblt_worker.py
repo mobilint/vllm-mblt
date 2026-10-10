@@ -3632,6 +3632,12 @@ class MbltWorker(WorkerBase):
                 )
             self.cache_model = MbltMoECacheModel(self.model)
             self.cache_backend = None
+            if self.max_seq_len > self.cache_model.max_cache_size:
+                raise RuntimeError(
+                    f"max_model_len={self.max_seq_len} exceeds the KV capacity of the MoE shared MXQs "
+                    f"({self.cache_model.max_cache_size} tokens). Pass --max-model-len "
+                    f"{self.cache_model.max_cache_size} or lower."
+                )
         else:
             self.cache_model = self.model.get_cache_mxq_model()
             self.cache_backend = self._resolve_cache_backend()

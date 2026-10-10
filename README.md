@@ -163,7 +163,7 @@ Qwen3-30B-A3B needs the optional `qwen3-moe` extra, which installs `transformers
 
 ```bash
 pip install "vllm-mblt[qwen3-moe]"
-vllm serve mobilint/Qwen3-30B-A3B --trust-remote-code --max-model-len 4096
+vllm serve mobilint/Qwen3-30B-A3B --trust-remote-code
 ```
 
 Current Mobilint Qwen3-MoE notes:
@@ -174,7 +174,11 @@ Current Mobilint Qwen3-MoE notes:
 - Non-batch serving only. MoE releases cannot be compiled as batch MXQs, so the config pins `max_batch_size` to 1,
   the scheduler runs one sequence at a time, and `--model-loader-extra-config '{"max_batch_size": N}'` with
   `N > 1` is refused.
-- The KV cache lives in all 48 shared MXQs, so a prefix-cache snapshot holds every layer's cache memory.
+- vllm-mblt clamps `max_model_len` to 4096 for this model: the artifact config declares 40960, but the shared
+  MXQs hold 4096 tokens of KV. The worker also checks the loaded MXQs and refuses to start when `max_model_len`
+  exceeds their capacity.
+- The KV cache lives in all 48 shared MXQs, so a prefix-cache snapshot holds every layer's cache memory
+  (192 MiB for Qwen3-30B-A3B).
 - Placement follows the release config: shared MXQs round-robin over devices 0-2, experts over all 24 cores of
   those devices, and `lm_head` on `2:0:0`. Override it with the `shared_`, `expert_`, and `lm_head_` prefixed
   layout keys (for example `expert_target_cores`) and `num_expert_workers`.
@@ -503,6 +507,29 @@ Unsupported multimodal model types fail before runtime inference with a clear
 error.
 
 Implementation file: [`vllm_mblt/mblt_worker.py`](vllm_mblt/mblt_worker.py)
+
+## Known Issues
+
+### Offline `LLM` scripts can hang or abort at exit
+
+An offline `vllm.LLM` script can print all its results and then never exit, or abort at exit with
+`terminate called without an active exception`. Both come from vLLM 0.11.2's synchronous engine client, not from
+this plugin, and they happen with any model. `vllm serve` is not affected.
+
+- **Hang.** The engine-core process is stopped only by a `weakref.finalize` callback. When the script imports
+  `transformers` (which imports `filelock`) before vLLM, the `weakref` exit hook is registered before
+  `multiprocessing`'s, so at exit `multiprocessing` waits for the engine-core process, which nothing has told to
+  stop.
+- **Abort.** When the last outputs carry logprobs tensors, vLLM's output thread can free them while the
+  interpreter is shutting down, and torch's destructor aborts the process.
+
+Workaround: shut the engine down yourself before the script ends.
+
+```python
+llm = LLM(model=..., trust_remote_code=True)
+...
+llm.llm_engine.engine_core.shutdown()
+```
 
 ## Tests
 

@@ -14,9 +14,13 @@ from vllm_mblt.runtime_cache import MbltRuntimeCacheManager
 
 
 class _FakeSharedMxq:
-    def __init__(self, index: int) -> None:
+    def __init__(self, index: int, max_cache_size: int = 4096) -> None:
         self.index = index
+        self.max_cache_size = max_cache_size
         self.loaded: list[tuple[object, int]] = []
+
+    def get_input_buffer_info(self) -> list[SimpleNamespace]:
+        return [SimpleNamespace(max_cache_size=self.max_cache_size)]
 
     def dump_cache_memory(self, cache_id: int = 0) -> list[bytes]:
         return [f"layer{self.index}-slot{cache_id}".encode()]
@@ -39,9 +43,10 @@ class _FakeMoECache:
 class _FakeMoEModel:
     """Duck-types the transformers-mblt MoE surface the adapter relies on."""
 
-    def __init__(self, num_layers: int = 3, vocab_size: int = 11) -> None:
+    def __init__(self, num_layers: int = 3, vocab_size: int = 11, max_cache_sizes: tuple[int, ...] = ()) -> None:
         self.config = SimpleNamespace(vocab_size=vocab_size, model_type="mobilint-qwen3_moe")
-        self.shared = [_FakeSharedMxq(index) for index in range(num_layers)]
+        sizes = max_cache_sizes or (4096,) * num_layers
+        self.shared = [_FakeSharedMxq(index, sizes[index]) for index in range(num_layers)]
         self.calls: list[dict[str, object]] = []
         self.built_caches: list[int] = []
 
@@ -141,8 +146,9 @@ def test_moe_cache_model_rejects_snapshot_with_wrong_layer_count() -> None:
         cache_model.load_cache_memory([[b"a"], [b"b"]])
 
 
-def _make_loading_worker(max_batch_size: int) -> MbltWorker:
+def _make_loading_worker(max_batch_size: int, max_seq_len: int = 4096) -> MbltWorker:
     worker = MbltWorker.__new__(MbltWorker)
+    worker.max_seq_len = max_seq_len
     worker.rank = 0
     worker.local_rank = 0
     worker.model = None
@@ -189,6 +195,22 @@ def test_load_model_refuses_batch_serving_for_moe(monkeypatch) -> None:
         worker.load_model()
 
 
+def test_moe_cache_model_reports_the_smallest_shared_kv_capacity() -> None:
+    model = _FakeMoEModel(num_layers=3, max_cache_sizes=(4096, 2048, 4096))
+
+    assert MbltMoECacheModel(model).max_cache_size == 2048
+
+
+def test_load_model_refuses_max_model_len_above_moe_kv_capacity(monkeypatch) -> None:
+    worker = _make_loading_worker(max_batch_size=1, max_seq_len=8192)
+    monkeypatch.setattr(
+        "vllm_mblt.mblt_worker.AutoModelForCausalLM.from_pretrained", lambda *args, **kwargs: _FakeMoEModel()
+    )
+
+    with pytest.raises(RuntimeError, match="--max-model-len 4096"):
+        worker.load_model()
+
+
 def test_load_model_forwards_moe_role_placement_kwargs(monkeypatch) -> None:
     worker = _make_loading_worker(max_batch_size=1)
     worker.load_config = SimpleNamespace(
@@ -227,9 +249,28 @@ def test_platform_refuses_batch_configuration_for_moe() -> None:
         hf_model_type="mobilint-qwen3_moe",
         loader_extra_config={"max_batch_size": 4},
     )
+    vllm_config.model_config.max_model_len = 4096
 
     with pytest.raises(ValueError, match="non-batch"):
         MbltPlatform.check_and_update_config(vllm_config)
+
+
+def test_platform_clamps_moe_max_model_len_to_kv_capacity() -> None:
+    vllm_config = _make_vllm_config({"single": 128}, hf_model_type="mobilint-qwen3_moe", max_batch_size=1)
+    vllm_config.model_config.max_model_len = 40960
+
+    MbltPlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.model_config.max_model_len == 4096
+
+
+def test_platform_keeps_smaller_moe_max_model_len() -> None:
+    vllm_config = _make_vllm_config({"single": 128}, hf_model_type="mobilint-qwen3_moe", max_batch_size=1)
+    vllm_config.model_config.max_model_len = 2048
+
+    MbltPlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.model_config.max_model_len == 2048
 
 
 def test_platform_serves_moe_one_sequence_at_a_time() -> None:
@@ -240,6 +281,7 @@ def test_platform_serves_moe_one_sequence_at_a_time() -> None:
         max_batch_size=1,
         scheduler_max_num_seqs=256,
     )
+    vllm_config.model_config.max_model_len = 4096
 
     MbltPlatform.check_and_update_config(vllm_config)
 

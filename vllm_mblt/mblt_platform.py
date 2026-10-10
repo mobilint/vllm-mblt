@@ -19,6 +19,9 @@ _MULTIMODAL_HF_MODEL_TYPES = frozenset(
 )
 # MoE releases cannot be compiled as batch MXQs, so they serve one sequence at a time.
 _MIXTURE_OF_EXPERTS_HF_MODEL_TYPES = frozenset({"mobilint-qwen3_moe"})
+# KV capacity (max_cache_size) of the released Qwen3-30B-A3B shared MXQs; the artifact config declares 40960.
+# The worker checks the loaded MXQs against max_model_len, so a release compiled smaller still fails at startup.
+_MIXTURE_OF_EXPERTS_MAX_MODEL_LEN = 4096
 # Qwen3-ASR audio past this token can stall the NPU; the artifact config declares 65536.
 _QWEN3_ASR_MAX_MODEL_LEN = 2048
 _TRUE_ENV_VALUES = {"1", "true", "TRUE", "True"}
@@ -381,6 +384,16 @@ class MbltPlatform(Platform):
                     _QWEN3_ASR_MAX_MODEL_LEN,
                 )
                 model_config.max_model_len = _QWEN3_ASR_MAX_MODEL_LEN
+
+        if _is_mixture_of_experts_hf_config(_get_hf_config(vllm_config)):
+            model_config = vllm_config.model_config
+            if model_config.max_model_len > _MIXTURE_OF_EXPERTS_MAX_MODEL_LEN:
+                logger.warning(
+                    "Clamping max_model_len from %d to %d for Mixture-of-Experts models.",
+                    model_config.max_model_len,
+                    _MIXTURE_OF_EXPERTS_MAX_MODEL_LEN,
+                )
+                model_config.max_model_len = _MIXTURE_OF_EXPERTS_MAX_MODEL_LEN
 
         scheduler_config: SchedulerConfig = vllm_config.scheduler_config
 

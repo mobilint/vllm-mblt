@@ -10,8 +10,14 @@
   Prefix-cache snapshots dump and restore the KV cache of every per-layer shared MXQ.
 - Only non-batch serving is supported: a `max_batch_size` above 1 is refused at startup, because MoE releases
   cannot be compiled as batch MXQs.
+- `max_model_len` is clamped to 4096 for MoE models, the KV capacity of the released shared MXQs, and the worker
+  refuses to start when the loaded MXQs hold fewer tokens than `max_model_len`.
 - `--model-loader-extra-config` forwards the MoE role layout keys (`shared_*`, `expert_*`, `lm_head_*`) and
   `num_expert_workers` to the model.
+
+### Documentation
+
+- README lists the vLLM 0.11.2 offline `LLM` exit hang and abort under Known Issues, with a workaround.
 
 ## 0.7.0
 
