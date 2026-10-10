@@ -25,3 +25,4 @@ build/
 .venv/
 .build-venv/
 uv.lock
+artifacts/
