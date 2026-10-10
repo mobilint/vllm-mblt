@@ -17,6 +17,8 @@ _MULTIMODAL_HF_MODEL_TYPES = frozenset(
         "mobilint-qwen3_vl",
     }
 )
+# MoE releases cannot be compiled as batch MXQs, so they serve one sequence at a time.
+_MIXTURE_OF_EXPERTS_HF_MODEL_TYPES = frozenset({"mobilint-qwen3_moe"})
 # Qwen3-ASR audio past this token can stall the NPU; the artifact config declares 65536.
 _QWEN3_ASR_MAX_MODEL_LEN = 2048
 _TRUE_ENV_VALUES = {"1", "true", "TRUE", "True"}
@@ -100,6 +102,10 @@ def _get_config_field_value(config: object, field_name: str) -> object:
 def _is_multimodal_hf_config(hf_config: object) -> bool:
     model_type = _get_config_field_value(hf_config, "model_type")
     return isinstance(model_type, str) and model_type in _MULTIMODAL_HF_MODEL_TYPES
+
+
+def _is_mixture_of_experts_hf_config(hf_config: object) -> bool:
+    return _get_config_field_value(hf_config, "model_type") in _MIXTURE_OF_EXPERTS_HF_MODEL_TYPES
 
 
 def _is_qwen3_asr_hf_config(hf_config: object) -> bool:
@@ -392,6 +398,15 @@ class MbltPlatform(Platform):
                 getattr(scheduler_config, "long_prefill_token_threshold", None),
             )
         resolved_max_batch_size = resolve_model_max_batch_size(vllm_config)
+        if (
+            _is_mixture_of_experts_hf_config(_get_hf_config(vllm_config))
+            and resolved_max_batch_size is not None
+            and resolved_max_batch_size > 1
+        ):
+            raise ValueError(
+                "Mixture-of-Experts models support only non-batch serving, "
+                f"but max_batch_size={resolved_max_batch_size} was configured."
+            )
         effective_max_num_seqs = None
         if resolved_max_batch_size is not None:
             configured_max_num_seqs = _coerce_positive_int(getattr(scheduler_config, "max_num_seqs", None))

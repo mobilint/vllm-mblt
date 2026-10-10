@@ -23,6 +23,10 @@ def register_model():
     ModelRegistry.register_model("MobilintQwen3ForCausalLM", "vllm_mblt.models.modeling_qwen3:MobilintQwen3ForCausalLM")
 
     ModelRegistry.register_model(
+        "MobilintQwen3MoEForCausalLM", "vllm_mblt.models.modeling_qwen3_moe:MobilintQwen3MoEForCausalLM"
+    )
+
+    ModelRegistry.register_model(
         "MobilintQwen2VLForConditionalGeneration",
         "vllm_mblt.models.modeling_qwen2_vl:MobilintQwen2VLForConditionalGeneration",
     )

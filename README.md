@@ -28,7 +28,7 @@ artifacts can be served through familiar vLLM commands and OpenAI-compatible API
 - **Out-of-tree vLLM plugin**: registers the `mblt` platform without patching vLLM itself.
 - **Mobilint NPU worker**: dispatches text-generation and multimodal execution to Mobilint runtime models.
 - **Model registry integration**: supports Mobilint wrappers for Llama, HyperCLOVAX, EXAONE/EXAONE4, Qwen2/3,
-  Qwen2/3-VL, and Qwen3-ASR families.
+  Qwen2/3-VL, Qwen3-ASR, and Qwen3-MoE families.
 - **Runtime-aware scheduling**: reads model-configured `npu_prefill_chunk_size` and `max_batch_size` values to
   tune chunked prefill and scheduler concurrency automatically.
 - **vLLM benchmark compatibility**: works with `vllm serve`, `vllm bench serve`, and `vllm bench throughput`.
@@ -39,6 +39,7 @@ artifacts can be served through familiar vLLM commands and OpenAI-compatible API
 - `vllm==0.11.2`
 - `mblt-model-zoo[transformers] >= 2.7.0`
 - For Qwen3-ASR, the `qwen-asr` extra: `pip install "vllm-mblt[qwen-asr]"`
+- For Qwen3-MoE (`mobilint/Qwen3-30B-A3B`), the `qwen3-moe` extra: `pip install "vllm-mblt[qwen3-moe]"`
 - A Mobilint NPU environment. If you are not yet a Mobilint customer, please contact
   [tech-support@mobilint.com](mailto:tech-support@mobilint.com).
 
@@ -156,6 +157,31 @@ Current Mobilint Qwen3-ASR notes:
   by [vllm-project/vllm#46463](https://github.com/vllm-project/vllm/pull/46463), after the version this plugin
   pins). Validate or re-encode uploads in front of a public deployment.
 
+### 5. Serve a Mixture-of-Experts Model
+
+Qwen3-30B-A3B needs the optional `qwen3-moe` extra, which installs `transformers-mblt>=0.2.0`:
+
+```bash
+pip install "vllm-mblt[qwen3-moe]"
+vllm serve mobilint/Qwen3-30B-A3B --trust-remote-code --max-model-len 4096
+```
+
+Current Mobilint Qwen3-MoE notes:
+
+- transformers-mblt runs the whole forward pass: the per-layer shared MXQs, host-side top-8 routing, the expert
+  MXQs in parallel across devices, and `lm_head`. vllm-mblt only feeds it embeddings at the scheduled KV offset
+  and samples from the logits it returns.
+- Non-batch serving only. MoE releases cannot be compiled as batch MXQs, so the config pins `max_batch_size` to 1,
+  the scheduler runs one sequence at a time, and `--model-loader-extra-config '{"max_batch_size": N}'` with
+  `N > 1` is refused.
+- The KV cache lives in all 48 shared MXQs, so a prefix-cache snapshot holds every layer's cache memory.
+- Placement follows the release config: shared MXQs round-robin over devices 0-2, experts over all 24 cores of
+  those devices, and `lm_head` on `2:0:0`. Override it with the `shared_`, `expert_`, and `lm_head_` prefixed
+  layout keys (for example `expert_target_cores`) and `num_expert_workers`.
+- Prompt logprobs use the 1-token microstep path: the last layer only emits the last token's hidden state.
+- Greedy output can differ from run to run where two tokens are nearly tied: transformers-mblt adds the expert
+  outputs in the order they finish.
+
 ## Runtime Tuning
 
 ### Runtime Layout Overrides
@@ -182,6 +208,15 @@ keys when the vision encoder and text model need different placement:
 vllm serve mobilint/Qwen3-VL-2B-Instruct \
   --trust-remote-code \
   --model-loader-extra-config '{"dev_no": 0, "core_mode": "global4", "vision_core_mode": "single"}'
+```
+
+For Mixture-of-Experts models such as `mobilint/Qwen3-30B-A3B`, unprefixed keys are not used. Each MXQ role
+takes its own prefix (`shared_`, `expert_`, `lm_head_`), as in transformers-mblt:
+
+```bash
+vllm serve mobilint/Qwen3-30B-A3B \
+  --trust-remote-code \
+  --model-loader-extra-config '{"lm_head_target_cores": ["2:0:1"], "num_expert_workers": 16}'
 ```
 
 For VLM-specific MXQ path overrides, use `vision_mxq_path` and/or `text_mxq_path`; a single top-level `mxq_path`
@@ -398,6 +433,7 @@ Notes:
 | Qwen2-VL | `MobilintQwen2VLForConditionalGeneration` |
 | Qwen3-VL | `MobilintQwen3VLForConditionalGeneration` |
 | Qwen3-ASR | `MobilintQwen3ASRForConditionalGeneration` |
+| Qwen3-MoE | `MobilintQwen3MoEForCausalLM` |
 
 Model artifacts are available through Mobilint model repositories such as the
 [Mobilint Hugging Face Hub](https://huggingface.co/mobilint).
@@ -481,6 +517,7 @@ vllm_mblt/
 ├── __init__.py                 # vLLM plugin and model registration entry points
 ├── mblt_platform.py            # platform config overrides and runtime-aware defaults
 ├── mblt_worker.py              # custom worker, prefill/decode flow, KV snapshot logic
+├── moe_runtime.py              # Mixture-of-Experts cache-model adapter over transformers-mblt
 ├── tracing.py                  # qbruntime NPU event tracing behind vLLM's profiler hook
 └── models/                     # Mobilint model wrappers for LLM/VLM families
 
@@ -488,5 +525,6 @@ tests/
 ├── test_kv_cache_swap_spec.py
 ├── test_mblt_platform_prefill.py
 ├── test_mblt_tracing.py
-└── test_mblt_worker_optimizations.py
+├── test_mblt_worker_optimizations.py
+└── test_qwen3_moe.py
 ```
