@@ -22,11 +22,16 @@ class RecordingCacheModel:
         self.loads.append((blobs, cache_id))
 
 
-def _make_worker(*, max_batch_size: int = 1, block_size: int = 4) -> MbltWorker:
+def _make_worker(
+    *,
+    max_batch_size: int = 1,
+    block_size: int = 4,
+    enable_prefix_caching: bool | None = None,
+) -> MbltWorker:
     worker = MbltWorker.__new__(MbltWorker)
     worker.max_batch_size = max_batch_size
     worker.vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(block_size=block_size, enable_prefix_caching=enable_prefix_caching),
         model_config=SimpleNamespace(max_model_len=128, hf_config=SimpleNamespace(model_type="qwen2")),
     )
     worker.model_config = worker.vllm_config.model_config
@@ -42,6 +47,7 @@ def _make_worker(*, max_batch_size: int = 1, block_size: int = 4) -> MbltWorker:
         max_finished_snapshots=MbltWorker.MAX_FINISHED_CACHE_SNAPSHOTS,
         dump_runtime_cache=worker._dump_runtime_cache,
         load_runtime_cache=worker._load_runtime_cache,
+        enable_prefix_caching=worker._prefix_caching_enabled(),
     )
     return worker
 
@@ -201,3 +207,162 @@ class TestKvCacheSwapBehavior:
         assert worker.cache_model.dumps == [{"cache_id": 1}]
         assert worker.cache_model.loads == [(["dump:1:1"], 1)]
         assert worker.runtime_cache.live_slot_owner(1) == "req"
+
+
+class TestKvCacheSwapWithoutPrefixCaching:
+    """--no-enable-prefix-caching keeps swap snapshots but drops prefix reuse (issue #28)."""
+
+    @staticmethod
+    def _store_foreign_snapshot(worker: MbltWorker) -> None:
+        # A finished snapshot from another request on the same physical blocks
+        # with the same tokens: with prefix caching on this is a load-shared
+        # hit; without it, physical block numbers prove nothing.
+        worker.runtime_cache.store_snapshot(
+            req_id="old",
+            blobs=["old-cache"],
+            block_ids=([1, 2],),
+            first_seq_blocks=(1, 2),
+            num_tokens=8,
+            cache_token_ids=tuple(range(8)),
+        )
+        worker.runtime_cache.touch_finished_snapshot("old")
+
+    def test_unset_prefix_caching_flag_defaults_to_enabled(self) -> None:
+        worker = _make_worker(enable_prefix_caching=None)
+
+        assert worker._prefix_caching_enabled()
+        assert worker.runtime_cache.enable_prefix_caching
+
+    def test_finished_request_is_not_dumped_without_prefix_caching(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=False)
+        worker.req_states["finished"] = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
+        worker.runtime_cache.mark_loaded_request("finished", 8)
+
+        worker._finalize_finished_request("finished")
+
+        assert worker.cache_model.dumps == []
+        assert worker.runtime_cache.get_snapshot("finished") is None
+        assert list(worker.runtime_cache.finished_snapshot_lru) == []
+        assert worker.runtime_cache.loaded_req_id is None
+        assert "finished" not in worker.req_states
+
+    def test_finished_request_is_dumped_with_prefix_caching(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=True)
+        worker.req_states["finished"] = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
+        worker.runtime_cache.mark_loaded_request("finished", 8)
+
+        worker._finalize_finished_request("finished")
+
+        assert worker.cache_model.dumps == [{"cache_id": None}]
+        assert worker.runtime_cache.get_snapshot("finished") is not None
+        assert list(worker.runtime_cache.finished_snapshot_lru) == ["finished"]
+
+    def test_finished_batch_request_is_not_dumped_and_releases_slot_without_prefix_caching(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=False)
+        slot_id = worker._assign_cache_slot("finished")
+        worker.req_states["finished"] = _make_request_state(
+            worker, block_ids=([1, 2],), num_computed_tokens=8, cache_slot_id=slot_id
+        )
+        worker.runtime_cache.mark_slot_owner(slot_id, "finished", 8)
+
+        worker._finalize_finished_request("finished")
+
+        assert worker.cache_model.dumps == []
+        assert worker.runtime_cache.get_snapshot("finished") is None
+        assert worker.runtime_cache.live_slot_owner(slot_id) is None
+        assert worker.runtime_cache.free_cache_slots == [0, 1]
+
+    def test_finished_batch_request_is_dumped_with_prefix_caching(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        slot_id = worker._assign_cache_slot("finished")
+        worker.req_states["finished"] = _make_request_state(
+            worker, block_ids=([1, 2],), num_computed_tokens=8, cache_slot_id=slot_id
+        )
+        worker.runtime_cache.mark_slot_owner(slot_id, "finished", 8)
+
+        worker._finalize_finished_request("finished")
+
+        assert worker.cache_model.dumps == [{"cache_id": slot_id}]
+        assert worker.runtime_cache.get_snapshot("finished") is not None
+
+    def test_non_batch_swap_still_dumps_and_loads_own_snapshot_without_prefix_caching(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=False)
+        a_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+        b_state = _make_request_state(worker, block_ids=([3, 4],), num_computed_tokens=0, prompt_len=8)
+        worker.req_states = {"a": a_state, "b": b_state}
+        worker.runtime_cache.mark_loaded_request("a", 8)
+
+        # Switching to b dumps a's live cache so a can resume later.
+        assert worker._load_snapshot_if_needed("b", b_state) == 0
+        assert worker.cache_model.dumps == [{"cache_id": None}]
+        assert worker.runtime_cache.get_snapshot("a") is not None
+        worker.runtime_cache.mark_loaded_request("b", 8)
+        b_state.num_computed_tokens = 8
+
+        # Switching back to a dumps b, then loads a's own snapshot.
+        assert worker._load_snapshot_if_needed("a", a_state) == 8
+        assert worker.cache_model.dumps == [{"cache_id": None}, {"cache_id": None}]
+        assert worker.cache_model.loads == [(["dump:1:None"], None)]
+        assert worker.runtime_cache.loaded_req_id == "a"
+
+    def test_non_batch_swap_loads_partial_own_snapshot_without_prefix_caching(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=False)
+        # a decoded one more token inside the same block after its last dump,
+        # so its own snapshot holds a 6-token prefix of the 7 it needs.
+        a_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=7, prompt_len=8)
+        worker.req_states["a"] = a_state
+        worker.runtime_cache.store_snapshot(
+            req_id="a",
+            blobs=["a-cache"],
+            block_ids=a_state.block_ids,
+            first_seq_blocks=a_state.first_seq_blocks,
+            num_tokens=6,
+            cache_token_ids=tuple(range(6)),
+        )
+
+        assert worker._load_snapshot_if_needed("a", a_state) == 6
+        assert worker.cache_model.loads == [(["a-cache"], None)]
+
+    def test_new_request_never_loads_another_requests_snapshot_without_prefix_caching(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=False)
+        self._store_foreign_snapshot(worker)
+        new_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+        worker.req_states["new"] = new_state
+
+        assert worker._load_snapshot_if_needed("new", new_state) == 0
+        assert worker.cache_model.loads == []
+
+    def test_new_batch_request_never_loads_another_requests_snapshot_without_prefix_caching(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=False)
+        self._store_foreign_snapshot(worker)
+        slot_id = worker._assign_cache_slot("new")
+        new_state = _make_request_state(
+            worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8, cache_slot_id=slot_id
+        )
+        worker.req_states["new"] = new_state
+
+        assert worker._load_snapshot_if_needed("new", new_state, slot_id=slot_id) == 0
+        assert worker.cache_model.loads == []
+        assert worker.runtime_cache.live_slot_owner(slot_id) == "new"
+
+    def test_same_foreign_snapshot_is_loaded_shared_with_prefix_caching(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=True)
+        self._store_foreign_snapshot(worker)
+        new_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+        worker.req_states["new"] = new_state
+
+        assert worker._load_snapshot_if_needed("new", new_state) == 8
+        assert worker.cache_model.loads == [(["old-cache"], None)]
+
+    def test_finished_swap_snapshot_is_dropped_without_prefix_caching(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=False)
+        worker.req_states["a"] = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+        worker.runtime_cache.mark_loaded_request("a", 8)
+        worker._dump_loaded_request_before_switch(next_req_id="b")
+        assert worker.runtime_cache.get_snapshot("a") is not None
+
+        worker._finalize_finished_request("a")
+
+        assert worker.runtime_cache.snapshot_count() == 0
+        assert list(worker.runtime_cache.finished_snapshot_lru) == []
+        assert len(worker.cache_model.dumps) == 1

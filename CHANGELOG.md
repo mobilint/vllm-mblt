@@ -15,6 +15,15 @@
 - `--model-loader-extra-config` forwards the MoE role layout keys (`shared_*`, `expert_*`, `lm_head_*`) and
   `num_expert_workers` to the model.
 
+### Fixed
+
+- With `--no-enable-prefix-caching`, a finished request's KV cache is no longer dumped. The synchronous dump ran
+  on the engine loop and delayed the next request's prefill, though nothing could reuse it: without prefix caching
+  a snapshot can only be matched by physical block number (#28).
+- With prefix caching off, a request loads only its own snapshot, never another request's, and a finished
+  request's snapshot is dropped instead of kept in the finished-snapshot LRU. Non-batch request swapping still
+  dumps the live request before switching and loads it back, including a partial snapshot.
+
 ### Documentation
 
 - README lists the vLLM 0.11.2 offline `LLM` exit hang and abort under Known Issues, with a workaround.

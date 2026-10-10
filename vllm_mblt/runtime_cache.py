@@ -104,6 +104,7 @@ class MbltRuntimeCacheManager:
         max_finished_snapshots: int | None = None,
         dump_runtime_cache: RuntimeCacheDumpFn | None = None,
         load_runtime_cache: RuntimeCacheLoadFn | None = None,
+        enable_prefix_caching: bool = True,
     ) -> None:
         if max_finished_snapshots is None:
             max_finished_snapshots = max_finished_cache_snapshots
@@ -113,6 +114,11 @@ class MbltRuntimeCacheManager:
         self.block_size = int(block_size)
         self.max_batch_size = max(0, int(max_batch_size))
         self.max_finished_cache_snapshots = int(max_finished_snapshots)
+        # When False (``--no-enable-prefix-caching``) snapshots exist only to
+        # swap a request's own KV out and back in on a single-cache model. A
+        # request may load only its own snapshot, and a finished request's
+        # snapshot is dropped instead of kept for cross-request prefix reuse.
+        self.enable_prefix_caching = bool(enable_prefix_caching)
         self._dump_runtime_cache_fn = dump_runtime_cache
         self._load_runtime_cache_fn = load_runtime_cache
 
@@ -524,6 +530,8 @@ class MbltRuntimeCacheManager:
             return RuntimeCacheSnapshotMatch(snapshot=None, matched_tokens=0)
 
         own_snapshot = self.snapshots.get(request.req_id)
+        if not self.enable_prefix_caching:
+            return self._choose_own_snapshot_only(request, own_snapshot)
         if own_snapshot is not None:
             matched_tokens = self.compatible_tokens(
                 target_blocks=self._request_index_blocks(request),
@@ -546,6 +554,43 @@ class MbltRuntimeCacheManager:
                 )
 
         return self.choose_prefix_snapshot(request)
+
+    def _choose_own_snapshot_only(
+        self,
+        request: RuntimeCacheRequest,
+        own_snapshot: RuntimeCacheSnapshot | None,
+    ) -> RuntimeCacheSnapshotMatch:
+        """Match only the request's own snapshot, allowing a partial prefix.
+
+        Without prefix caching vLLM gives no block hashes, so a cross-request
+        match could only be made by physical block number. Those numbers are
+        recycled across requests, so such a match is not a prefix-cache hit
+        and is never attempted. The request's own swap snapshot is still
+        used, including a partial one (a snapshot is re-dumped only when the
+        request crosses a block boundary), and the remainder is recomputed.
+        """
+        if own_snapshot is None:
+            return RuntimeCacheSnapshotMatch(snapshot=None, matched_tokens=0)
+        matched_tokens = self.compatible_tokens(
+            target_blocks=self._request_index_blocks(request),
+            target_tokens=request.num_computed_tokens,
+            snapshot_blocks=self._snapshot_index_blocks(own_snapshot),
+            snapshot_tokens=own_snapshot.num_tokens,
+            target_token_ids=request.cache_token_ids,
+            snapshot_token_ids=own_snapshot.cache_token_ids,
+            target_multimodal_identity=request.multimodal_cache_identity,
+            snapshot_multimodal_identity=own_snapshot.multimodal_cache_identity,
+            target_prompt_embed_identity=request.prompt_embed_cache_identity,
+            snapshot_prompt_embed_identity=own_snapshot.prompt_embed_cache_identity,
+        )
+        if matched_tokens <= 0:
+            return RuntimeCacheSnapshotMatch(snapshot=None, matched_tokens=0)
+        return RuntimeCacheSnapshotMatch(
+            snapshot=own_snapshot,
+            matched_tokens=matched_tokens,
+            req_id=request.req_id,
+            is_own_snapshot=True,
+        )
 
     def verify_prompt_embed_match(
         self,
@@ -839,6 +884,12 @@ class MbltRuntimeCacheManager:
         self.finished_snapshot_lru[req_id] = None
 
     def mark_snapshot_finished(self, req_id: str) -> list[str]:
+        if not self.enable_prefix_caching:
+            # Nothing can reuse a finished request's KV without prefix
+            # caching, so drop a swap snapshot it may still hold rather than
+            # keep it in the finished LRU.
+            self.remove_snapshot(req_id)
+            return []
         self.touch_finished_snapshot(req_id)
         return self.evict_old_finished_snapshots()
 
