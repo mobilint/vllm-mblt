@@ -31,6 +31,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
+from vllm_mblt.moe_runtime import MbltMoECacheModel, is_mixture_of_experts_model
 from vllm_mblt.runtime_cache import (
     KVBlockIds,
     MbltRuntimeCacheManager,
@@ -83,10 +84,23 @@ _MBLT_BACKEND_KWARG_FIELDS = frozenset(
         "npu_prefill_chunk_size",
     }
 )
-_MBLT_BACKEND_KWARG_PREFIXES = ("", "text_", "vision_", "encoder_", "decoder_", "base_", "draft_", "fc_")
+_MBLT_BACKEND_KWARG_PREFIXES = (
+    "",
+    "text_",
+    "vision_",
+    "encoder_",
+    "decoder_",
+    "base_",
+    "draft_",
+    "fc_",
+    # Mixture-of-Experts roles: per-layer shared MXQs, expert MXQs, and lm_head.
+    "shared_",
+    "expert_",
+    "lm_head_",
+)
 _MBLT_BACKEND_KWARG_NAMES = frozenset(
     f"{prefix}{field}" for prefix in _MBLT_BACKEND_KWARG_PREFIXES for field in _MBLT_BACKEND_KWARG_FIELDS
-)
+) | {"num_expert_workers"}
 _MULTIMODAL_SHARED_BACKEND_KWARG_FIELDS = _MBLT_BACKEND_KWARG_FIELDS - {"mxq_path"}
 _MULTIMODAL_BACKEND_PREFIXES = ("vision_", "text_")
 
@@ -3608,8 +3622,25 @@ class MbltWorker(WorkerBase):
 
         start = time.perf_counter()
         self._log_init_stage("load_model:before_get_cache_mxq_model")
-        self.cache_model = self.model.get_cache_mxq_model()
-        self.cache_backend = self._resolve_cache_backend()
+        if is_mixture_of_experts_model(self.model):
+            # The KV cache lives in every per-layer shared MXQ and transformers-mblt runs the whole
+            # forward; the adapter only presents it as one single-slot cache model.
+            if self._is_batch_model():
+                raise RuntimeError(
+                    "Mixture-of-Experts models support only non-batch serving: "
+                    f"max_batch_size={self.max_batch_size}."
+                )
+            self.cache_model = MbltMoECacheModel(self.model)
+            self.cache_backend = None
+            if self.max_seq_len > self.cache_model.max_cache_size:
+                raise RuntimeError(
+                    f"max_model_len={self.max_seq_len} exceeds the KV capacity of the MoE shared MXQs "
+                    f"({self.cache_model.max_cache_size} tokens). Pass --max-model-len "
+                    f"{self.cache_model.max_cache_size} or lower."
+                )
+        else:
+            self.cache_model = self.model.get_cache_mxq_model()
+            self.cache_backend = self._resolve_cache_backend()
         cache_models = self._get_cache_models()
         backend_capacity = len(cache_models) * max(
             1, int(getattr(self.cache_backend, "k_per_model", self.max_batch_size) or 1)
