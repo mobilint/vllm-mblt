@@ -77,6 +77,7 @@ def test_a_batch_step_runs_every_request_on_its_own_cache_in_one_forward() -> No
     assert call["attention_mask"].tolist() == [[0, 0, 1], [1, 1, 1]]  # left-padded
     assert call["inputs_embeds"][1].tolist() == [[2.0] * 3] * 3
     assert call["logits_to_keep"] == 1
+    assert call["npu_prefill_chunk_size"] == 3  # the step as vLLM sized it, not re-split by the model
     assert [output.last_token_logits[0] for output in outputs] == [0.0, 1.0]
     # The 1-token row samples from its own token, not from the 3-wide batch's padding.
     assert [output.last_token_logits[1] for output in outputs] == [0.0, 2.0]
@@ -146,20 +147,95 @@ def test_calibration_before_any_request_runs_on_a_scratch_cache() -> None:
     [
         ({}, True),
         ({"env": "1"}, False),
-        ({"multimodal": True}, False),
         ({"model_type": "mobilint-qwen3_asr"}, False),
         ({"inputs": 2}, False),
         ({"moe": True}, False),
+        ({"qwen3_vl": True}, True),
+        ({"qwen3_vl": True, "batch": True, "rope_input": True}, True),
+        ({"qwen3_vl": True, "batch": True}, False),
     ],
-    ids=["text", "env-direct", "image-text", "audio-text", "extra-mxq-inputs", "moe"],
+    ids=[
+        "text",
+        "env-direct",
+        "audio-text",
+        "extra-mxq-inputs",
+        "moe",
+        "qwen3-vl-non-batch",
+        "qwen3-vl-batch-rope-input",
+        "qwen3-vl-batch-static",
+    ],
 )
 def test_which_models_forward_through_transformers_mblt(monkeypatch, change, expected) -> None:
     worker = MbltWorker.__new__(MbltWorker)
+    worker.max_batch_size = 16 if change.get("batch") else 1
     worker.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=change.get("model_type", "llama")))
     worker.cache_model = MbltMoECacheModel.__new__(MbltMoECacheModel) if change.get("moe") else object()
-    worker._is_multimodal_model = lambda: change.get("multimodal", False)
+    worker._supports_deepstack_input = lambda: change.get("qwen3_vl", False)
+    worker._text_mxq_uses_rope_input = lambda: change.get("rope_input", False)
     worker._get_cache_model = lambda: worker.cache_model
     worker._cache_model_input_shapes = lambda _model: [(1, -1, 8)] * change.get("inputs", 1)
     monkeypatch.setenv("VLLM_MBLT_DIRECT_INFER", change.get("env", "0"))
 
     assert worker._can_forward_through_model() is expected
+
+
+class _RecordingTextDecoder(_RecordingModel):
+    """An image-text model's text decoder: it returns the logits as ``last_hidden_state``."""
+
+    def __call__(self, **kwargs):
+        return SimpleNamespace(last_hidden_state=super().__call__(**kwargs).logits)
+
+
+def _make_vl_worker(*, max_batch_size: int) -> MbltWorker:
+    worker = _make_worker(max_batch_size=max_batch_size)
+    decoder = _RecordingTextDecoder()
+    worker.model = SimpleNamespace(get_language_model=lambda: decoder)
+    worker._is_multimodal_model = lambda: True
+    worker._text_mxq_uses_rope_input = lambda: True
+    return worker
+
+
+def test_row_positions_continue_the_prompt_m_rope_positions_then_add_the_offset() -> None:
+    prompt = torch.tensor([[0, 1, 2, 2, 3], [0, 1, 2, 3, 3], [0, 1, 2, 3, 4]])  # an image squeezes positions
+    state = SimpleNamespace(prompt_position_ids=prompt, mrope_position_delta=-1)
+
+    assert MbltWorker._row_position_ids(state, 3, 7).tolist() == [[2, 3, 4, 5], [3, 3, 4, 5], [3, 4, 4, 5]]
+    assert MbltWorker._row_position_ids(None, 2, 4).tolist() == [[2, 3]] * 3  # calibration: plain text
+
+
+def test_an_image_text_step_feeds_each_row_its_positions_and_deepstack_to_the_text_decoder() -> None:
+    worker = _make_vl_worker(max_batch_size=4)
+    _activate(worker, "image", 0, 0)
+    _activate(worker, "text", 1, 6)
+    worker.req_states["image"].prompt_position_ids = torch.tensor([[0, 1, 1], [0, 1, 2], [0, 2, 1]])
+    worker.req_states["image"].mrope_position_delta = -1
+    worker.req_states["text"].prompt_position_ids = None
+    deepstack = np.arange(2 * 3 * 3, dtype=np.float32).reshape(2, 3, 3)  # (layers, tokens, hidden)
+
+    worker._infer_logits_batch_with_sequence(
+        [np.ones((3, 3), dtype=np.float32), np.ones((1, 3), dtype=np.float32)],
+        cache_sizes=[0, 6],
+        cache_ids=[0, 1],
+        deepstack_embeds_batch=[deepstack, None],
+    )
+
+    (call,) = worker.model.get_language_model().calls
+    assert call["position_ids"][:, 0].tolist() == [[0, 1, 1], [0, 1, 2], [0, 2, 1]]
+    assert call["position_ids"][:, 1].tolist() == [[0, 0, 6]] * 3  # left-padded text row at its own position
+    assert call["visual_pos_masks"].tolist() == [[True, True, True], [False, False, True]]
+    layer0 = call["deepstack_visual_embeds"][0]
+    assert layer0[:3].tolist() == deepstack[0].tolist() and layer0[3:].tolist() == [[0.0, 0.0, 0.0]]
+    assert len(call["deepstack_visual_embeds"]) == 2
+
+
+def test_a_text_only_step_on_an_image_text_model_sends_no_deepstack() -> None:
+    worker = _make_vl_worker(max_batch_size=1)
+    _activate(worker, "text", None, 4)
+    worker.req_states["text"].prompt_position_ids = None
+
+    logits = worker._infer_logits(np.ones((2, 3), dtype=np.float32), None, cache_size=4)
+
+    (call,) = worker.model.get_language_model().calls
+    assert "deepstack_visual_embeds" not in call
+    assert call["position_ids"][:, 0].tolist() == [[4, 5]] * 3
+    assert logits.shape == (VOCAB,)

@@ -36,10 +36,15 @@ class RequestCacheSlots:
         k_per_model: int = 1,
         *,
         moe: Optional[Any] = None,
+        cache_cls: type = MobilintCache,
+        cache_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         self.models = list(models)
         self.k_per_model = max(1, int(k_per_model))
         self.moe = moe
+        # The cache type the model's forward expects (Qwen3-VL: MobilintDeepStackCache) and its extra arguments.
+        self.cache_cls = cache_cls
+        self.cache_kwargs = dict(cache_kwargs or {})
         # What MobilintCache.bind_rows reads to place rows: the worker's own topology, not a model-zoo backend.
         self._topology = SimpleNamespace(mxq_models=self.models, k_per_model=self.k_per_model)
 
@@ -58,7 +63,9 @@ class RequestCacheSlots:
         """Return an empty cache for the request on ``slot_id``."""
         if self.moe is not None:
             return self.moe.new_cache()
-        return MobilintCache(self.models, per_model_batch=self.k_per_model, slots=[self._row_slot(slot_id)])
+        return self.cache_cls(
+            self.models, per_model_batch=self.k_per_model, slots=[self._row_slot(slot_id)], **self.cache_kwargs
+        )
 
     def kv_nbytes_per_cache(self) -> Optional[int]:
         """Host bytes one request's KV takes once saved: the compiled KV buffers of one slot.
