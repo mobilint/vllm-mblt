@@ -48,6 +48,7 @@ def _make_worker(*, max_batch_size: int, full_logits: bool = False) -> MbltWorke
     worker.max_batch_size = max_batch_size
     worker.req_states = {}
     worker.model = _RecordingModel()
+    worker.cache_model = object()  # the text MXQ handle; tests never call it on this route
     worker._forward_through_model = True
     worker._runtime_output_logits_mode = lambda _length: "full_sequence" if full_logits else "last_token"
     attach_request_caches(worker, k_per_model=max(max_batch_size, 1))
@@ -149,7 +150,7 @@ def test_calibration_before_any_request_runs_on_a_scratch_cache() -> None:
         ({"env": "1"}, False),
         ({"model_type": "mobilint-qwen3_asr"}, False),
         ({"inputs": 2}, False),
-        ({"moe": True}, False),
+        ({"moe": True}, True),
         ({"qwen3_vl": True}, True),
         ({"qwen3_vl": True, "batch": True, "rope_input": True}, True),
         ({"qwen3_vl": True, "batch": True}, False),
@@ -239,3 +240,16 @@ def test_a_text_only_step_on_an_image_text_model_sends_no_deepstack() -> None:
     assert "deepstack_visual_embeds" not in call
     assert call["position_ids"][:, 0].tolist() == [[4, 5]] * 3
     assert logits.shape == (VOCAB,)
+
+
+def test_a_mixture_of_experts_step_runs_on_the_request_cache_with_the_model_s_own_prefill_split() -> None:
+    worker = _make_worker(max_batch_size=1)
+    worker.cache_model = MbltMoECacheModel.__new__(MbltMoECacheModel)
+    _activate(worker, "moe", None, 7)
+
+    worker._infer_logits(np.ones((3, 3), dtype=np.float32), None, cache_size=7)
+
+    (call,) = worker.model.calls
+    assert call["past_key_values"] is worker.req_states["moe"].kv_cache  # not a joined view
+    assert "npu_prefill_chunk_size" not in call
+    assert call["starts"] == [7]

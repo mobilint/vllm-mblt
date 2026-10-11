@@ -2157,15 +2157,15 @@ class MbltWorker(WorkerBase):
     def _can_forward_through_model(self) -> bool:
         """Whether infers go through the transformers-mblt forward instead of the MXQ directly.
 
-        Text models and Qwen2-VL with a plain text MXQ do, and so does Qwen3-VL: non-batch with any text MXQ
-        layout, batch with a RoPE-input text MXQ (the only layout the batched deepstack forward takes). Audio-text
-        models still feed the MXQ themselves, and a Mixture-of-Experts adapter already runs the forward.
-        ``VLLM_MBLT_DIRECT_INFER=1`` keeps every model on the direct MXQ path.
+        Text models, Mixture-of-Experts models and Qwen2-VL with a plain text MXQ do, and so does Qwen3-VL:
+        non-batch with any text MXQ layout, batch with a RoPE-input text MXQ (the only layout the batched deepstack
+        forward takes). Audio-text models still feed the MXQ themselves. ``VLLM_MBLT_DIRECT_INFER=1`` keeps every
+        model on the direct MXQ path.
         """
         if os.getenv("VLLM_MBLT_DIRECT_INFER", "0") in _TRUE_ENV_VALUES:
             return False
         if isinstance(self.cache_model, MbltMoECacheModel):
-            return False
+            return True
         model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)
         if model_type == "mobilint-qwen3_asr":
             return False
@@ -2257,18 +2257,21 @@ class MbltWorker(WorkerBase):
         extra = {}
         if self._is_multimodal_model():
             extra = self._vl_forward_inputs(slot_ids, cache_sizes, lengths, attention_mask, deepstack_batch)
+        if not isinstance(self.cache_model, MbltMoECacheModel):
+            # vLLM already sized the step for the MXQ (chunked prefill): feed it in one infer, as the direct path
+            # did, rather than re-splitting it at the model's own prefill chunk size. The split changes the NPU's
+            # numerics as well as the number of infers. A Mixture-of-Experts forward keeps its own split: its
+            # shared MXQs take at most that many tokens per infer.
+            extra["npu_prefill_chunk_size"] = width
         with torch.no_grad():
             output = self._forward_model()(
                 inputs_embeds=inputs_embeds,
                 # A single row needs no mask: a batch MXQ makes one up, a non-batch MXQ takes the single-row path.
                 attention_mask=attention_mask if rows > 1 else None,
-                past_key_values=join_request_caches(caches),
+                # A single request runs on its own cache (a Mixture-of-Experts cache cannot be joined).
+                past_key_values=caches[0] if rows == 1 else join_request_caches(caches),
                 use_cache=True,
                 logits_to_keep=0 if keep_all else 1,
-                # vLLM already sized the step for the MXQ (chunked prefill): feed it in one infer, as the direct
-                # path did, rather than re-splitting it at the model's own prefill chunk size. The split changes
-                # the NPU's numerics as well as the number of infers.
-                npu_prefill_chunk_size=width,
                 **extra,
             )
         # A causal LM returns ``logits``; an image-text model's text decoder returns them as ``last_hidden_state``.
