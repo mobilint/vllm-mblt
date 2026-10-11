@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Mixture-of-Experts models (Qwen3-30B-A3B) now run through the same `_forward_rows` route as the other models:
+  the request's own `MobilintMixtureOfExpertsCache` goes to the model forward directly (it cannot be joined), and the
+  forward keeps its own prefill split, which the shared MXQs' width requires. Outputs stay within the model's
+  run-to-run variation, and throughput is unchanged.
 - Qwen2-VL and Qwen3-VL now run through the transformers-mblt forward as well, calling the text decoder with the
   merged embeddings. Each request keeps its prompt's M-RoPE positions and passes them as `position_ids`
   (transformers-mblt builds the RoPE input), and Qwen3-VL passes its deepstack features with them; Qwen3-VL request
