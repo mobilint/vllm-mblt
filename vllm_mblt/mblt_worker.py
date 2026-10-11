@@ -32,12 +32,14 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
 from vllm_mblt.moe_runtime import MbltMoECacheModel, is_mixture_of_experts_model
+from vllm_mblt.request_cache import RequestCacheSlots
 from vllm_mblt.runtime_cache import (
     KVBlockIds,
     MbltRuntimeCacheManager,
     PromptEmbedCacheIdentity,
     RuntimeCacheLoadResult,
     RuntimeCacheRequest,
+    RuntimeCacheSnapshot,
     append_block_ids,
     first_seq_blocks,
     normalize_block_ids,
@@ -181,6 +183,8 @@ class RequestState:
     explicit_prompt_embeds: bool = False
     next_prompt_logprob_pos: int = 1
     in_progress_prompt_logprobs: Optional[LogprobsTensors] = None
+    # This request's KV: a transformers-mblt cache on the request's NPU slot (see vllm_mblt.request_cache).
+    kv_cache: Optional[Any] = None
 
 
 @dataclass
@@ -389,7 +393,6 @@ class MbltWorker(WorkerBase):
         self._infer_output_buffers: Optional[list[np.ndarray]] = None
 
         self.req_states: Dict[str, RequestState] = {}
-        self._warned_batch_cache_snapshot_unsupported = False
         self._warned_last_logit_prompt_logprobs = False
         self._live_cache_prefix_incomplete_count = 0
         self._vlm_image_positions_by_session: dict[str, tuple[int, int, Optional[tuple[bool, ...]]]] = {}
@@ -400,10 +403,11 @@ class MbltWorker(WorkerBase):
             max_batch_size=self.max_batch_size,
             block_size=self._kv_block_size(),
             max_finished_snapshots=self.MAX_FINISHED_CACHE_SNAPSHOTS,
-            dump_runtime_cache=self._dump_runtime_cache,
-            load_runtime_cache=self._load_runtime_cache,
             enable_prefix_caching=self._prefix_caching_enabled(),
         )
+        self.request_caches: Optional[RequestCacheSlots] = None
+        # Per slot (None on a non-batch model): the request whose cache the next infer on that slot binds.
+        self._slot_caches: dict[Optional[int], tuple[str, Any]] = {}
         self.prefix_cache_cost_model = PrefixCacheCostModel.from_config(
             self.vllm_config,
             block_size=self._kv_block_size(),
@@ -439,10 +443,16 @@ class MbltWorker(WorkerBase):
         logger.info("[mblt-init] %s %s%s", stage, details, suffix)
 
     def _reset_cache_slots(self) -> None:
-        self.runtime_cache.set_io_adapters(
-            dump_runtime_cache=self._dump_runtime_cache,
-            load_runtime_cache=self._load_runtime_cache,
-        )
+        if isinstance(self.cache_model, MbltMoECacheModel):
+            self.request_caches = RequestCacheSlots([], moe=self.cache_model)
+        elif self._is_batch_model():
+            self.request_caches = RequestCacheSlots(
+                self._get_cache_models(),
+                max(1, int(getattr(self.cache_backend, "k_per_model", self.max_batch_size) or 1)),
+            )
+        else:
+            self.request_caches = RequestCacheSlots([self._get_cache_model()])
+        self._slot_caches = {}
         self.runtime_cache.enable_prefix_caching = self._prefix_caching_enabled()
         self.runtime_cache.reset_slots(max_batch_size=self.max_batch_size)
 
@@ -783,35 +793,51 @@ class MbltWorker(WorkerBase):
     def _release_cache_slot(self, req_id: str) -> None:
         self.runtime_cache.release_slot(req_id)
 
-    def _dump_runtime_cache(self, slot_id: Optional[int] = None) -> Optional[list[Any]]:
-        if slot_id is None:
-            return self._get_cache_model().dump_cache_memory()
-        cache_model, _, local_slot_id = self._cache_slot(slot_id)
-        return cache_model.dump_cache_memory(cache_id=local_slot_id)
+    def _request_cache(self, req_state: RequestState, slot_id: Optional[int]) -> Any:
+        """Return the request's cache, building an empty one on its slot the first time."""
+        if req_state.kv_cache is None:
+            req_state.kv_cache = self.request_caches.new_cache(slot_id)
+        return req_state.kv_cache
 
-    def _load_runtime_cache(self, blobs: list[Any], slot_id: Optional[int] = None) -> bool:
-        if slot_id is None:
-            self._get_cache_model().load_cache_memory(blobs)
-        else:
-            cache_model, _, local_slot_id = self._cache_slot(slot_id)
-            cache_model.load_cache_memory(blobs, cache_id=local_slot_id)
-        return True
+    def _slot_key(self, slot_id: Optional[int]) -> Optional[int]:
+        return slot_id if self._is_batch_model() else None
 
-    def _timed_load_runtime_cache(self, blobs: list[Any], slot_id: Optional[int] = None) -> bool:
-        load_runtime_cache = getattr(self.runtime_cache, "_load_runtime_cache_fn", None) or self._load_runtime_cache
-        start = time.perf_counter()
-        loaded = load_runtime_cache(blobs, slot_id)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        self._ensure_prefix_cache_cost_model().observe_load(slot_id, elapsed_ms)
-        return loaded
+    def _activate_request_cache(self, req_id: str, req_state: RequestState, slot_id: Optional[int]) -> None:
+        """Make the infers on ``slot_id`` in this step run on ``req_id``'s cache."""
+        self._slot_caches[self._slot_key(slot_id)] = (req_id, self._request_cache(req_state, slot_id))
 
-    def _timed_dump_runtime_cache(self, slot_id: Optional[int] = None) -> Optional[list[Any]]:
-        dump_runtime_cache = getattr(self.runtime_cache, "_dump_runtime_cache_fn", None) or self._dump_runtime_cache
-        start = time.perf_counter()
-        blobs = dump_runtime_cache(slot_id)
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        self._ensure_prefix_cache_cost_model().observe_dump(slot_id, elapsed_ms)
-        return blobs
+    def _slot_cache(self, slot_id: Optional[int]) -> Optional[Any]:
+        """The cache the next infer on ``slot_id`` binds; ``None`` only before any request ran (calibration)."""
+        entry = self._slot_caches.get(self._slot_key(slot_id))
+        if entry is None:
+            if self.req_states:
+                raise RuntimeError(f"No request cache is active on cache slot {slot_id}.")
+            return None
+        return entry[1]
+
+    def _prepare_slot(self, slot_id: Optional[int], cache_size: int) -> Optional[Any]:
+        """Bind the slot's request cache at ``cache_size`` before an infer; return it for :meth:`_commit_slot`."""
+        cache = self._slot_cache(slot_id)
+        self.request_caches.prepare(cache, self._slot_key(slot_id), cache_size)
+        return cache
+
+    def _commit_slot(self, cache: Optional[Any], num_tokens: int) -> None:
+        self.request_caches.commit(cache, num_tokens)
+
+    def _own_prefix_length(self, slot_id: Optional[int]) -> int:
+        """Tokens the slot's request cache holds, before a prompt-logprob replay of the request's own prefix."""
+        cache = self._slot_cache(slot_id)
+        return int(cache.get_seq_length()) if cache is not None else 0
+
+    def _restore_own_prefix_length(self, slot_id: Optional[int], length: int) -> None:
+        """Undo a prompt-logprob replay's rewind of the request's cache.
+
+        The replay rewrites positions the slot already holds with the same tokens, so the slot still holds the
+        request's KV up to the length it had before the replay.
+        """
+        cache = self._slot_cache(slot_id)
+        if cache is not None and cache.get_seq_length() < length:
+            cache.set_seq_length(length)
 
     def _calibrate_prefix_cache_prefill_costs(self) -> None:
         cost_model = self._ensure_prefix_cache_cost_model()
@@ -1203,31 +1229,6 @@ class MbltWorker(WorkerBase):
                 raise NotImplementedError(f"Unsupported multimodal modality for MBLT worker: {modality}")
 
         return merged_prompt_embeds, deepstack_prompt_embeds
-
-    def _dump_loaded_request_before_switch(
-        self,
-        next_req_id: str,
-        print_debug: bool = False,
-    ) -> None:
-        loaded_req_id = self.runtime_cache.loaded_req_id
-        if loaded_req_id is None or loaded_req_id == next_req_id:
-            return
-        loaded_req_state = self.req_states.get(loaded_req_id)
-        if loaded_req_state is None:
-            return
-        if not self.runtime_cache.should_dump_snapshot_after_step(
-            loaded_req_id,
-            loaded_req_state.num_computed_tokens,
-        ):
-            return
-        self._dump_snapshot(
-            req_id=loaded_req_id,
-            req_state=loaded_req_state,
-            next_num_tokens=loaded_req_state.num_computed_tokens,
-            print_debug=print_debug,
-        )
-        if print_debug:
-            print(f"[cache] req={loaded_req_id} dump-before-switch next={next_req_id}")
 
     def _build_input_embeds(
         self,
@@ -2026,19 +2027,18 @@ class MbltWorker(WorkerBase):
         live_tokens: Optional[int],
         target_tokens: int,
     ) -> None:
-        """Report a live runtime cache that is missing part of the request prefix.
+        """Report a request cache that holds fewer tokens than the scheduler expects.
 
-        Reaching this means the accelerator cache no longer holds the prefix the
-        request is about to continue from, which is exactly the state that used
-        to be served silently as fluent-but-wrong output. The caller rebuilds
-        the prefix instead, but the divergence is a bug signal and must be
-        visible in the log rather than only in the generated text.
+        A request's cache keeps every token the worker computed for it, so a
+        shorter cache means the worker and the scheduler disagree about the
+        request's progress. The caller continues from the tokens the cache
+        holds (or a longer snapshot), which is correct, but the divergence is a
+        bug signal and must be visible in the log.
         """
         self._live_cache_prefix_incomplete_count = getattr(self, "_live_cache_prefix_incomplete_count", 0) + 1
         logger.warning(
-            "MBLT runtime cache holds fewer tokens than the scheduler expects for req_id=%s "
-            "(cache_id=%s, live_tokens=%s, expected=%d). Rebuilding the prefix instead of "
-            "decoding against stale KV. occurrences=%d",
+            "MBLT request cache holds fewer tokens than the scheduler expects for req_id=%s "
+            "(cache_id=%s, live_tokens=%s, expected=%d). Recomputing the rest of the prefix. occurrences=%d",
             req_id,
             slot_id,
             live_tokens,
@@ -2083,6 +2083,7 @@ class MbltWorker(WorkerBase):
         cache_model = self._get_cache_model()
         infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
         output_buffers = self._infer_output_buffers
+        request_cache = self._prepare_slot(None, cache_size)
 
         if output_buffers is not None and self._can_reuse_output_buffers(
             cache_model,
@@ -2094,6 +2095,7 @@ class MbltWorker(WorkerBase):
                 outputs=output_buffers,
                 cache_size=cache_size,
             )
+            self._commit_slot(request_cache, int(input_embeds.shape[0]))
             if infer_output is None:
                 return self._last_token_logits(output_buffers[0])
             return self._last_token_logits(infer_output[0])
@@ -2101,6 +2103,7 @@ class MbltWorker(WorkerBase):
         infer_output = cache_model.infer(infer_inputs, cache_size=cache_size)
         if infer_output is None:
             raise RuntimeError("mxq infer result is None!")
+        self._commit_slot(request_cache, int(input_embeds.shape[0]))
 
         logits = infer_output[0]
         self._infer_output_buffers = [np.empty_like(logits)]
@@ -2116,6 +2119,7 @@ class MbltWorker(WorkerBase):
         cache_model = self._get_cache_model()
         infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
         output_buffers = self._infer_output_buffers
+        request_cache = self._prepare_slot(None, cache_size)
 
         if output_buffers is not None and self._can_reuse_output_buffers(
             cache_model,
@@ -2134,6 +2138,7 @@ class MbltWorker(WorkerBase):
                 raise RuntimeError("mxq infer result is None!")
             logits = infer_output[0]
             self._infer_output_buffers = [np.empty_like(logits)]
+        self._commit_slot(request_cache, int(input_embeds.shape[0]))
 
         logits_np = np.asarray(logits)
         return InferenceLogits(
@@ -2246,6 +2251,10 @@ class MbltWorker(WorkerBase):
             cache_model, model_idx, local_cache_id = self._cache_slot(cache_id)
             models[model_idx] = cache_model
             groups.setdefault(model_idx, []).append((row_index, local_cache_id))
+        # Bind on this thread before the per-card infers fan out: the owner table is not thread-safe.
+        request_caches = [
+            self._prepare_slot(cache_id, int(cache_size)) for cache_id, cache_size in zip(cache_ids, cache_sizes)
+        ]
 
         outputs: list[Optional[InferenceLogits]] = [None] * len(input_embeds_batch)
 
@@ -2278,6 +2287,8 @@ class MbltWorker(WorkerBase):
 
         if any(output is None for output in outputs):
             raise RuntimeError("Multi-card batched infer did not produce every requested output row.")
+        for request_cache, input_embeds in zip(request_caches, input_embeds_batch):
+            self._commit_slot(request_cache, int(input_embeds.shape[0]))
         return [output for output in outputs if output is not None]
 
     def _infer_normal_logits_batch_chunked(
@@ -2585,6 +2596,7 @@ class MbltWorker(WorkerBase):
         # O(N) submitted embeddings instead of replaying every full prefix.
         rows: list[np.ndarray] = []
         fallback_cache_size = 0
+        own_prefix = self._own_prefix_length(cache_id)
         for prompt_pos in range(start_idx + 1, prompt_end):
             if fallback_cache_size == 0:
                 # Prime the fallback cache with the prefix that predicts
@@ -2637,6 +2649,8 @@ class MbltWorker(WorkerBase):
             # " Paris" top-1 rows).
             rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1).copy())
             fallback_cache_size += int(input_embeds.shape[0])
+
+        self._restore_own_prefix_length(cache_id, own_prefix)
 
         if not rows:
             return None
@@ -2703,6 +2717,7 @@ class MbltWorker(WorkerBase):
         if not states:
             return {}
 
+        own_prefixes = [(state.cache_id, self._own_prefix_length(state.cache_id)) for state in states]
         while True:
             active_states = [state for state in states if state.current_prompt_pos < state.prompt_end]
             if not active_states:
@@ -2756,6 +2771,9 @@ class MbltWorker(WorkerBase):
                     state.rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1).copy())
                     state.fallback_cache_size += int(input_embeds.shape[0])
                     state.current_prompt_pos += 1
+
+        for cache_id, own_prefix in own_prefixes:
+            self._restore_own_prefix_length(cache_id, own_prefix)
 
         return {state.output_index: np.stack(state.rows, axis=0) for state in states if state.rows}
 
@@ -3080,217 +3098,75 @@ class MbltWorker(WorkerBase):
         slot_id: Optional[int] = None,
         print_debug: bool = False,
     ) -> int:
-        if self._is_batch_model():
-            return self._load_snapshot_for_batch_slot(
-                req_id=req_id,
-                req_state=req_state,
-                slot_id=slot_id,
-                print_debug=print_debug,
-            )
+        """Put the request's KV prefix on its slot for this step; return how many tokens of it the slot holds.
 
-        self._dump_loaded_request_before_switch(
-            next_req_id=req_id,
-            print_debug=print_debug,
-        )
+        The request's own cache is used when it holds the prefix. Otherwise the longest matching prefix snapshot
+        is copied into it when loading beats recomputing, or the prefix is recomputed.
+        """
+        if self._is_batch_model() and slot_id is None:
+            raise RuntimeError(f"Batch execution requires a cache slot for req_id={req_id}.")
+        slot_label = f" slot={slot_id}" if slot_id is not None else ""
+        target_tokens = req_state.num_computed_tokens
 
         if self._should_recompute_prompt_logprobs_from_start(req_state):
-            self.runtime_cache.clear_loaded_request()
             if print_debug:
-                print(f"[cache] req={req_id} bypass-prefix-cache-for-prompt-logprobs")
-            return 0
-
-        target_tokens = req_state.num_computed_tokens
-        result = self._load_snapshot_for_request_with_cost_policy(
-            RuntimeCacheRequest(
-                req_id=req_id,
-                block_ids=req_state.block_ids,
-                first_seq_blocks=req_state.first_seq_blocks,
-                num_computed_tokens=target_tokens,
-                first_seq_block_hashes=req_state.first_seq_block_hashes,
-                cache_slot_id=slot_id,
-                cache_token_ids=self._cache_token_ids(req_state, target_tokens),
-                multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
-                prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
+                print(f"[cache] req={req_id}{slot_label} bypass-prefix-cache-for-prompt-logprobs")
+            matched_tokens = 0
+        else:
+            result = self._load_request_prefix(
+                RuntimeCacheRequest(
+                    req_id=req_id,
+                    block_ids=req_state.block_ids,
+                    first_seq_blocks=req_state.first_seq_blocks,
+                    num_computed_tokens=target_tokens,
+                    first_seq_block_hashes=req_state.first_seq_block_hashes,
+                    cache_slot_id=slot_id,
+                    cache_token_ids=self._cache_token_ids(req_state, target_tokens),
+                    multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
+                    prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
+                ),
+                req_state,
             )
-        )
-        if print_debug:
-            if result.action == "skip-empty":
-                print(f"[cache] req={req_id} skip-load target_tokens=0")
-            elif result.action == "reuse-live":
-                print(f"[cache] req={req_id} reuse-live-cache matched={target_tokens}/{target_tokens}")
-            elif result.action == "load-own":
-                print(f"[cache] req={req_id} load-own matched={result.matched_tokens}/{target_tokens}")
-            elif result.action == "load-shared":
-                print(f"[cache] req={req_id} load-shared matched={result.matched_tokens}/{target_tokens}")
-            elif result.action == "skip-cost":
-                print(f"[cache] req={req_id} skip-load-cost matched={result.matched_tokens}/{target_tokens}")
-            elif result.action == "live-prefix-incomplete":
-                print(
-                    f"[cache] req={req_id} live-prefix-incomplete "
-                    f"live={result.live_cache_tokens} expected={target_tokens} rebuild matched=0/{target_tokens}"
-                )
-            else:
-                print(f"[cache] req={req_id} cache-miss fallback matched=0/{target_tokens}")
-        return result.matched_tokens
+            matched_tokens = result.matched_tokens
+            if print_debug:
+                if result.action == "skip-empty":
+                    print(f"[cache] req={req_id}{slot_label} skip-load target_tokens=0")
+                elif result.action == "reuse-live":
+                    print(f"[cache] req={req_id}{slot_label} reuse-live-cache matched={target_tokens}/{target_tokens}")
+                elif result.action in ("load-own", "load-shared", "skip-cost"):
+                    action = "skip-load-cost" if result.action == "skip-cost" else result.action
+                    print(f"[cache] req={req_id}{slot_label} {action} matched={matched_tokens}/{target_tokens}")
+                elif result.action == "live-prefix-incomplete":
+                    print(
+                        f"[cache] req={req_id}{slot_label} live-prefix-incomplete "
+                        f"live={result.live_cache_tokens} expected={target_tokens} "
+                        f"matched={matched_tokens}/{target_tokens}"
+                    )
+                else:
+                    print(f"[cache] req={req_id}{slot_label} cache-miss fallback matched=0/{target_tokens}")
+        return matched_tokens
 
-    def _load_snapshot_for_request_with_cost_policy(
-        self,
-        request: RuntimeCacheRequest,
-    ) -> RuntimeCacheLoadResult:
-        target_tokens = request.num_computed_tokens
-        if target_tokens <= 0:
-            self.runtime_cache.clear_loaded_request()
-            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True, action="skip-empty")
-
-        self.runtime_cache.observe_request_blocks(
-            request.req_id,
-            request.block_ids,
-            first_seq_block_hashes=request.first_seq_block_hashes,
-        )
-
-        live_prefix_incomplete = False
-        live_cache_tokens: Optional[int] = None
-        if self.runtime_cache.loaded_req_id == request.req_id:
-            if not self.runtime_cache.live_request_prefix_incomplete(target_tokens):
-                return RuntimeCacheLoadResult(
-                    matched_tokens=target_tokens,
-                    reused_live_cache=True,
-                    action="reuse-live",
-                    snapshot_req_id=request.req_id,
-                    live_cache_tokens=self.runtime_cache.loaded_req_tokens,
-                )
-            live_prefix_incomplete = True
-            live_cache_tokens = self.runtime_cache.loaded_req_tokens
-            self._warn_live_cache_prefix_incomplete(
-                req_id=request.req_id,
-                slot_id=None,
-                live_tokens=live_cache_tokens,
-                target_tokens=target_tokens,
-            )
-            self.runtime_cache.clear_loaded_request(request.req_id)
-
-        match = self.runtime_cache.choose_snapshot(request)
-        if match.snapshot is None or match.matched_tokens <= 0:
-            self.runtime_cache.clear_loaded_request()
-            return RuntimeCacheLoadResult(
-                matched_tokens=0,
-                cache_miss=True,
-                action="live-prefix-incomplete" if live_prefix_incomplete else "cache-miss",
-                live_prefix_incomplete=live_prefix_incomplete,
-                live_cache_tokens=live_cache_tokens,
-            )
-
-        if not self._ensure_prefix_cache_cost_model().should_load(
-            matched_tokens=match.matched_tokens,
-            cache_id=None,
-        ):
-            self.runtime_cache.clear_loaded_request()
-            return RuntimeCacheLoadResult(
-                matched_tokens=0,
-                cache_miss=True,
-                loaded_snapshot_req_id=match.req_id,
-                is_own_snapshot=match.is_own_snapshot,
-                action="skip-cost",
-                snapshot_req_id=match.req_id,
-            )
-
-        match = self.runtime_cache.verify_prompt_embed_match(request, match)
-        if match.snapshot is None or match.matched_tokens <= 0:
-            self.runtime_cache.clear_loaded_request()
-            return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True)
-        if not self._ensure_prefix_cache_cost_model().should_load(
-            matched_tokens=match.matched_tokens,
-            cache_id=None,
-        ):
-            self.runtime_cache.clear_loaded_request()
-            return RuntimeCacheLoadResult(
-                matched_tokens=0,
-                cache_miss=True,
-                loaded_snapshot_req_id=match.req_id,
-                is_own_snapshot=match.is_own_snapshot,
-                action="skip-cost",
-                snapshot_req_id=match.req_id,
-            )
-
-        if self._timed_load_runtime_cache(match.snapshot.blobs, None):
-            self.runtime_cache.mark_loaded_request(request.req_id, match.matched_tokens)
-            return RuntimeCacheLoadResult(
-                matched_tokens=match.matched_tokens,
-                loaded=True,
-                loaded_snapshot_req_id=match.req_id,
-                is_own_snapshot=match.is_own_snapshot,
-                action="load-own" if match.is_own_snapshot else "load-shared",
-                snapshot_req_id=match.req_id,
-                live_prefix_incomplete=live_prefix_incomplete,
-            )
-
-        self.runtime_cache.clear_loaded_request()
-        return RuntimeCacheLoadResult(
-            matched_tokens=0,
-            cache_miss=True,
-            live_prefix_incomplete=live_prefix_incomplete,
-        )
-
-    def _load_snapshot_for_batch_slot(
+    def _start_request_step(
         self,
         req_id: str,
         req_state: RequestState,
-        slot_id: Optional[int],
+        cache_size: int,
+        slot_id: Optional[int] = None,
         print_debug: bool = False,
-    ) -> int:
-        if slot_id is None:
-            raise RuntimeError(f"Batch execution requires a cache slot for req_id={req_id}.")
+    ) -> None:
+        """Make this step's infers on the request's slot run on its cache, from ``cache_size`` tokens."""
+        previous = self._slot_caches.get(self._slot_key(slot_id))
+        self._activate_request_cache(req_id, req_state, slot_id)
+        # Bind now rather than at the first infer: the request that held the slot is saved to host memory here,
+        # so the snapshot below copies it without another dump.
+        self._prepare_slot(slot_id, cache_size)
+        if previous is not None and previous[0] != req_id:
+            self._snapshot_switched_out_request(previous[0], next_req_id=req_id, print_debug=print_debug)
 
-        if self._should_recompute_prompt_logprobs_from_start(req_state):
-            if print_debug:
-                print(f"[cache] req={req_id} slot={slot_id} bypass-prefix-cache-for-prompt-logprobs")
-            return 0
-
-        target_tokens = req_state.num_computed_tokens
-        result = self._load_snapshot_for_slot_with_cost_policy(
-            RuntimeCacheRequest(
-                req_id=req_id,
-                block_ids=req_state.block_ids,
-                first_seq_blocks=req_state.first_seq_blocks,
-                num_computed_tokens=target_tokens,
-                first_seq_block_hashes=req_state.first_seq_block_hashes,
-                cache_slot_id=slot_id,
-                cache_token_ids=self._cache_token_ids(req_state, target_tokens),
-                multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
-                prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
-            )
-        )
-        if print_debug:
-            if result.action == "reuse-live":
-                print(f"[cache] req={req_id} slot={slot_id} reuse-live-cache matched={target_tokens}/{target_tokens}")
-            elif result.action == "load-own":
-                print(f"[cache] req={req_id} slot={slot_id} load-own matched={result.matched_tokens}/{target_tokens}")
-            elif result.action == "load-shared":
-                print(
-                    f"[cache] req={req_id} slot={slot_id} load-shared matched={result.matched_tokens}/{target_tokens}"
-                )
-            elif result.action == "skip-cost":
-                print(
-                    f"[cache] req={req_id} slot={slot_id} "
-                    f"skip-load-cost matched={result.matched_tokens}/{target_tokens}"
-                )
-            elif result.action == "live-prefix-incomplete":
-                print(
-                    f"[cache] req={req_id} slot={slot_id} live-prefix-incomplete "
-                    f"live={result.live_cache_tokens} expected={target_tokens} rebuild matched=0/{target_tokens}"
-                )
-            else:
-                print(f"[cache] req={req_id} slot={slot_id} cache-miss fallback matched=0/{target_tokens}")
-        return result.matched_tokens
-
-    def _load_snapshot_for_slot_with_cost_policy(
-        self,
-        request: RuntimeCacheRequest,
-    ) -> RuntimeCacheLoadResult:
+    def _load_request_prefix(self, request: RuntimeCacheRequest, req_state: RequestState) -> RuntimeCacheLoadResult:
+        """Choose where the request's KV prefix comes from: its own cache, a prefix snapshot, or a recompute."""
         slot_id = request.cache_slot_id
-        if slot_id is None:
-            raise RuntimeError(f"Batch execution requires a cache slot for req_id={request.req_id}.")
-
+        own_cache = self._request_cache(req_state, slot_id)
         target_tokens = request.num_computed_tokens
         if target_tokens <= 0:
             return RuntimeCacheLoadResult(matched_tokens=0, cache_miss=True, action="skip-empty")
@@ -3301,95 +3177,107 @@ class MbltWorker(WorkerBase):
             first_seq_block_hashes=request.first_seq_block_hashes,
         )
 
-        live_prefix_incomplete = False
-        live_cache_tokens: Optional[int] = None
-        if self.runtime_cache.live_slot_owner(slot_id) == request.req_id:
-            if not self.runtime_cache.live_slot_prefix_incomplete(slot_id, target_tokens):
-                return RuntimeCacheLoadResult(
-                    matched_tokens=target_tokens,
-                    reused_live_cache=True,
-                    action="reuse-live",
-                    snapshot_req_id=request.req_id,
-                    live_cache_tokens=self.runtime_cache.live_slot_tokens(slot_id),
-                )
-            live_prefix_incomplete = True
-            live_cache_tokens = self.runtime_cache.live_slot_tokens(slot_id)
+        own_tokens = int(own_cache.get_seq_length())
+        if own_tokens >= target_tokens:
+            return RuntimeCacheLoadResult(
+                matched_tokens=target_tokens,
+                reused_live_cache=True,
+                action="reuse-live",
+                snapshot_req_id=request.req_id,
+                live_cache_tokens=own_tokens,
+            )
+        if own_tokens > 0:
             self._warn_live_cache_prefix_incomplete(
                 req_id=request.req_id,
                 slot_id=slot_id,
-                live_tokens=live_cache_tokens,
+                live_tokens=own_tokens,
                 target_tokens=target_tokens,
             )
-            self.runtime_cache.clear_slot_owner(slot_id)
+        # Falling short of a snapshot, the request continues from the tokens its own cache holds.
+        fallback = RuntimeCacheLoadResult(
+            matched_tokens=own_tokens,
+            reused_live_cache=own_tokens > 0,
+            cache_miss=own_tokens == 0,
+            action="live-prefix-incomplete" if own_tokens > 0 else "cache-miss",
+            live_prefix_incomplete=own_tokens > 0,
+            live_cache_tokens=own_tokens if own_tokens > 0 else None,
+        )
 
+        cost_model = self._ensure_prefix_cache_cost_model()
         match = self.runtime_cache.choose_snapshot(request)
-        if match.snapshot is not None and match.matched_tokens > 0:
-            if not self._ensure_prefix_cache_cost_model().should_load(
-                matched_tokens=match.matched_tokens,
-                cache_id=slot_id,
-            ):
-                self.runtime_cache.mark_slot_owner(slot_id, request.req_id, 0)
-                return RuntimeCacheLoadResult(
-                    matched_tokens=0,
-                    cache_miss=True,
-                    loaded_snapshot_req_id=match.req_id,
-                    is_own_snapshot=match.is_own_snapshot,
-                    action="skip-cost",
-                    snapshot_req_id=match.req_id,
-                    live_prefix_incomplete=live_prefix_incomplete,
-                )
+        if match.snapshot is None or match.matched_tokens <= own_tokens:
+            return fallback
+        if not cost_model.should_load(matched_tokens=match.matched_tokens, cache_id=slot_id):
+            fallback.action = "skip-cost"
+            fallback.loaded_snapshot_req_id = match.req_id
+            fallback.is_own_snapshot = match.is_own_snapshot
+            fallback.snapshot_req_id = match.req_id
+            return fallback
+        match = self.runtime_cache.verify_prompt_embed_match(request, match)
+        if match.snapshot is None or match.matched_tokens <= own_tokens:
+            return fallback
+        if not cost_model.should_load(matched_tokens=match.matched_tokens, cache_id=slot_id):
+            fallback.action = "skip-cost"
+            fallback.loaded_snapshot_req_id = match.req_id
+            fallback.is_own_snapshot = match.is_own_snapshot
+            fallback.snapshot_req_id = match.req_id
+            return fallback
 
-            match = self.runtime_cache.verify_prompt_embed_match(request, match)
-            if match.snapshot is None or match.matched_tokens <= 0:
-                self.runtime_cache.mark_slot_owner(slot_id, request.req_id, 0)
-                return RuntimeCacheLoadResult(
-                    matched_tokens=0,
-                    cache_miss=True,
-                    action="live-prefix-incomplete" if live_prefix_incomplete else "cache-miss",
-                    live_prefix_incomplete=live_prefix_incomplete,
-                    live_cache_tokens=live_cache_tokens,
-                )
-            if not self._ensure_prefix_cache_cost_model().should_load(
-                matched_tokens=match.matched_tokens,
-                cache_id=slot_id,
-            ):
-                self.runtime_cache.mark_slot_owner(slot_id, request.req_id, 0)
-                return RuntimeCacheLoadResult(
-                    matched_tokens=0,
-                    cache_miss=True,
-                    loaded_snapshot_req_id=match.req_id,
-                    is_own_snapshot=match.is_own_snapshot,
-                    action="skip-cost",
-                    snapshot_req_id=match.req_id,
-                    live_prefix_incomplete=live_prefix_incomplete,
-                )
-
-            if self._timed_load_runtime_cache(match.snapshot.blobs, slot_id):
-                self.runtime_cache.mark_slot_owner(slot_id, request.req_id, match.matched_tokens)
-                return RuntimeCacheLoadResult(
-                    matched_tokens=match.matched_tokens,
-                    loaded=True,
-                    loaded_snapshot_req_id=match.req_id,
-                    is_own_snapshot=match.is_own_snapshot,
-                    action="load-own" if match.is_own_snapshot else "load-shared",
-                    snapshot_req_id=match.req_id,
-                    live_prefix_incomplete=live_prefix_incomplete,
-                )
-
-        self.runtime_cache.mark_slot_owner(slot_id, request.req_id, 0)
+        self._restore_snapshot(req_state, slot_id, match.snapshot, match.matched_tokens)
         return RuntimeCacheLoadResult(
-            matched_tokens=0,
-            cache_miss=True,
-            action="live-prefix-incomplete" if live_prefix_incomplete else "cache-miss",
-            live_prefix_incomplete=live_prefix_incomplete,
-            live_cache_tokens=live_cache_tokens,
+            matched_tokens=match.matched_tokens,
+            loaded=True,
+            loaded_snapshot_req_id=match.req_id,
+            is_own_snapshot=match.is_own_snapshot,
+            action="load-own" if match.is_own_snapshot else "load-shared",
+            snapshot_req_id=match.req_id,
+            live_prefix_incomplete=own_tokens > 0,
         )
 
-    def _owned_live_cache_tokens(self, req_id: str, slot_id: Optional[int]) -> Optional[int]:
-        return self.runtime_cache.owned_live_cache_tokens(
-            req_id,
-            slot_id if self._is_batch_model() else None,
+    def _restore_snapshot(
+        self,
+        req_state: RequestState,
+        slot_id: Optional[int],
+        snapshot: RuntimeCacheSnapshot,
+        num_tokens: int,
+    ) -> None:
+        """Give the request a cache holding the snapshot's first ``num_tokens`` tokens, on the request's slot."""
+        slot_key = self._slot_key(slot_id)
+        snapshot_cache = snapshot.blobs
+        start = time.perf_counter()
+        if self.request_caches.holds_slot(snapshot_cache, slot_key):
+            # The finished request that left this snapshot ran on this slot and nothing has used it since: the
+            # request takes over that cache, KV in place, and the snapshot keeps a host copy instead.
+            snapshot.blobs = snapshot_cache.copy()
+            snapshot_cache.set_seq_length(int(num_tokens))
+            req_state.kv_cache = snapshot_cache
+            self._ensure_prefix_cache_cost_model().observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
+            return
+        cache = self.request_caches.relocate(snapshot_cache, slot_key, num_tokens)
+        self.request_caches.prepare(cache, slot_key, num_tokens)
+        req_state.kv_cache = cache
+        self._ensure_prefix_cache_cost_model().observe_load(slot_id, (time.perf_counter() - start) * 1000.0)
+
+    def _snapshot_switched_out_request(self, req_id: str, *, next_req_id: str, print_debug: bool = False) -> None:
+        """Keep the prefix of a request that just lost the non-batch slot, so other requests can start from it.
+
+        Its own KV is safe either way: the slot's owner table saved it to the request's cache.
+        """
+        if not self.runtime_cache.enable_prefix_caching:
+            return
+        req_state = self.req_states.get(req_id)
+        if req_state is None:
+            return
+        if not self.runtime_cache.should_dump_snapshot_after_step(req_id, req_state.num_computed_tokens):
+            return
+        dumped = self._dump_snapshot(
+            req_id=req_id,
+            req_state=req_state,
+            next_num_tokens=req_state.num_computed_tokens,
+            print_debug=print_debug,
         )
+        if dumped and print_debug:
+            print(f"[cache] req={req_id} dump-before-switch next={next_req_id}")
 
     def _dump_snapshot(
         self,
@@ -3399,14 +3287,14 @@ class MbltWorker(WorkerBase):
         slot_id: Optional[int] = None,
         print_debug: bool = False,
     ) -> bool:
-        # A snapshot must never advertise more tokens than its blobs contain.
-        # The scheduler's num_computed_tokens is the caller's label of choice,
-        # but the live cache can legitimately hold a shorter prefix of this
-        # request (a cost-policy skip, a rebuilt prefix). Labeling the longer
-        # count would let a later load resume past KV that is not there, which
-        # is the same silent-wrong-output failure this tracking exists to stop.
-        live_tokens = self._owned_live_cache_tokens(req_id, slot_id)
-        if live_tokens is not None and live_tokens < max(0, int(next_num_tokens)):
+        """Store a copy of the request's first ``next_num_tokens`` tokens as its prefix snapshot."""
+        cache = req_state.kv_cache
+        live_tokens = int(cache.get_seq_length()) if cache is not None else 0
+        # A snapshot must never advertise more tokens than its cache holds. The scheduler's
+        # num_computed_tokens is the caller's label of choice, but the request's cache can legitimately hold a
+        # shorter prefix (a rebuilt prefix). Labeling the longer count would let a later load resume past KV
+        # that is not there.
+        if live_tokens < max(0, int(next_num_tokens)):
             if live_tokens <= 0:
                 return False
             if not self.runtime_cache.should_dump_snapshot_after_step(req_id, live_tokens):
@@ -3418,27 +3306,13 @@ class MbltWorker(WorkerBase):
                 )
             next_num_tokens = live_tokens
 
-        blobs = self._timed_dump_runtime_cache(slot_id)
-        if blobs is None:
-            if self._is_batch_model() and not self._warned_batch_cache_snapshot_unsupported:
-                logger.warning(
-                    "Batch cache runtime does not expose slot-scoped dump/load APIs. "
-                    "Finished-request prefix snapshots are disabled for batch-compiled models."
-                )
-                self._warned_batch_cache_snapshot_unsupported = True
-            return False
-
-        self.runtime_cache.store_snapshot(
-            req_id=req_id,
-            blobs=blobs,
-            block_ids=req_state.block_ids,
-            first_seq_blocks=req_state.first_seq_blocks,
-            first_seq_block_hashes=req_state.first_seq_block_hashes,
-            num_tokens=next_num_tokens,
-            cache_token_ids=self._cache_token_ids(req_state, next_num_tokens),
-            multimodal_cache_identity=self._cache_multimodal_identity(req_state, next_num_tokens),
-            prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
-        )
+        resident = bool(cache.is_resident)
+        start = time.perf_counter()
+        snapshot_cache = cache.copy()  # saves the KV from the slot first when the slot still holds it
+        if resident:
+            self._ensure_prefix_cache_cost_model().observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
+        snapshot_cache.set_seq_length(int(next_num_tokens))
+        self._store_snapshot(req_id, req_state, snapshot_cache, next_num_tokens)
         if print_debug:
             num_blocks = len(req_state.first_seq_blocks)
             print(
@@ -3446,6 +3320,19 @@ class MbltWorker(WorkerBase):
                 f"blocks={num_blocks} snapshots={self.runtime_cache.snapshot_count()}"
             )
         return True
+
+    def _store_snapshot(self, req_id: str, req_state: RequestState, cache: Any, num_tokens: int) -> None:
+        self.runtime_cache.store_snapshot(
+            req_id=req_id,
+            blobs=cache,
+            block_ids=req_state.block_ids,
+            first_seq_blocks=req_state.first_seq_blocks,
+            first_seq_block_hashes=req_state.first_seq_block_hashes,
+            num_tokens=num_tokens,
+            cache_token_ids=self._cache_token_ids(req_state, num_tokens),
+            multimodal_cache_identity=self._cache_multimodal_identity(req_state, num_tokens),
+            prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
+        )
 
     @staticmethod
     def _cache_token_ids(req_state: RequestState, num_tokens: int) -> tuple[int, ...] | None:
@@ -3514,51 +3401,24 @@ class MbltWorker(WorkerBase):
     ) -> None:
         finished_req_state = self.req_states.pop(req_id, None)
         finished_slot_id = finished_req_state.cache_slot_id if finished_req_state is not None else None
-        # Dump-on-finish only feeds cross-request prefix reuse. Without prefix
-        # caching nothing can load it, and the synchronous dump would delay the
-        # next request's prefill (issue #28).
-        if finished_req_state is not None and self._prefix_caching_enabled():
-            should_dump = self.runtime_cache.should_dump_snapshot_after_step(
-                req_id,
-                finished_req_state.num_computed_tokens,
-            )
-            if self._is_batch_model():
-                # Only the request that still owns the live slot can be dumped:
-                # a request that was aborted before it ever ran leaves the slot
-                # holding somebody else's KV, and snapshotting that under this
-                # req_id would publish a prefix the tokens do not match.
-                owns_live_slot = (
-                    finished_slot_id is not None and self.runtime_cache.live_slot_owner(finished_slot_id) == req_id
-                )
-                if (
-                    owns_live_slot
-                    and should_dump
-                    and self._dump_snapshot(
-                        req_id=req_id,
-                        req_state=finished_req_state,
-                        next_num_tokens=finished_req_state.num_computed_tokens,
-                        slot_id=finished_slot_id,
-                        print_debug=print_debug,
-                    )
-                    and print_debug
-                ):
-                    print(f"[cache] req={req_id} slot={finished_slot_id} dump-on-finish")
-            elif (
-                self.runtime_cache.loaded_req_id == req_id
-                and should_dump
-                and self._dump_snapshot(
-                    req_id=req_id,
-                    req_state=finished_req_state,
-                    next_num_tokens=finished_req_state.num_computed_tokens,
-                    print_debug=print_debug,
-                )
-                and print_debug
-            ):
-                print(f"[cache] req={req_id} dump-on-finish")
+        slot_key = self._slot_key(finished_slot_id)
+        active = self._slot_caches.get(slot_key)
+        if active is not None and active[0] == req_id:
+            del self._slot_caches[slot_key]
+        cache = finished_req_state.kv_cache if finished_req_state is not None else None
+        # The finished request's cache becomes its prefix snapshot as it is: its KV stays on the slot and is
+        # saved to host memory only when another cache takes the slot, or never if the snapshot is dropped
+        # first. Without prefix caching nothing can load it, so it is dropped (issue #28).
+        if cache is not None and self._prefix_caching_enabled():
+            num_tokens = min(int(finished_req_state.num_computed_tokens), int(cache.get_seq_length()))
+            if num_tokens > 0:
+                cache.set_seq_length(num_tokens)
+                self._store_snapshot(req_id, finished_req_state, cache, num_tokens)
+                if print_debug:
+                    print(f"[cache] req={req_id} slot={finished_slot_id} keep-on-finish tokens={num_tokens}")
         for evicted_req_id in self.runtime_cache.mark_snapshot_finished(req_id):
             if print_debug:
                 print(f"[cache] evict-finished req={evicted_req_id} reason=lru-cap")
-        self.runtime_cache.clear_loaded_request(req_id)
         if self._is_batch_model():
             self._release_cache_slot(req_id)
 
@@ -4051,6 +3911,7 @@ class MbltWorker(WorkerBase):
                     slot_id=slot_id,
                     print_debug=print_debug,
                 )
+                self._start_request_step(req_id, req_state, cache_size, slot_id=slot_id, print_debug=print_debug)
                 input_embeds = self._build_input_embeds(req_state, cache_size, scheduled_end)
                 deepstack_embeds = self._build_deepstack_input_embeds(req_state, cache_size, scheduled_end)
                 rope_embeds = self._build_rope_input_embeds(req_state, cache_size, scheduled_end)
@@ -4143,7 +4004,6 @@ class MbltWorker(WorkerBase):
             for i, req_id in enumerate(req_ids):
                 req_state = self.req_states[req_id]
                 req_state.num_computed_tokens = next_cache_sizes[i]
-                self.runtime_cache.mark_slot_owner(cache_ids[i], req_id, next_cache_sizes[i])
                 if self._should_sample_after_step(
                     req_state,
                     scheduled_end_positions[i],
@@ -4178,6 +4038,7 @@ class MbltWorker(WorkerBase):
                     req_state,
                     print_debug=print_debug,
                 )
+                self._start_request_step(req_id, req_state, cache_size, print_debug=print_debug)
                 scheduled_end = scheduled_end_positions[i]
                 input_embeds = self._build_input_embeds(req_state, cache_size, scheduled_end)
                 deepstack_embeds = self._build_deepstack_input_embeds(
@@ -4251,11 +4112,7 @@ class MbltWorker(WorkerBase):
                         cache_size=0,
                         rope_embeds=rope_embeds,
                     )
-                # The live accelerator KV now belongs to this request at
-                # next_cache_size tokens, so later same-request decode can reuse it
-                # without forcing a block-boundary snapshot dump.
                 req_state.num_computed_tokens = next_cache_size
-                self.runtime_cache.mark_loaded_request(req_id, next_cache_size)
                 if self._should_sample_after_step(
                     req_state,
                     scheduled_end,

@@ -8,18 +8,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm_mblt.mblt_worker import MbltWorker, RequestState
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager
 
-
-class RecordingCacheModel:
-    def __init__(self) -> None:
-        self.dumps: list[dict[str, int | None]] = []
-        self.loads: list[tuple[list[object], int | None]] = []
-
-    def dump_cache_memory(self, cache_id: int | None = None) -> list[object]:
-        self.dumps.append({"cache_id": cache_id})
-        return [f"dump:{len(self.dumps)}:{cache_id}"]
-
-    def load_cache_memory(self, blobs: list[object], cache_id: int | None = None) -> None:
-        self.loads.append((blobs, cache_id))
+from .kv_slot_fakes import attach_request_caches, make_snapshot_cache
 
 
 def _make_worker(
@@ -36,19 +25,16 @@ def _make_worker(
     )
     worker.model_config = worker.vllm_config.model_config
     worker.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32000))
-    worker.cache_model = RecordingCacheModel()
     worker.req_states = {}
-    worker._warned_batch_cache_snapshot_unsupported = False
     worker.empty_logits_processors = LogitsProcessors(None)
     worker.empty_prompt_token_ids = None
     worker.runtime_cache = MbltRuntimeCacheManager(
         max_batch_size=max_batch_size,
         block_size=block_size,
         max_finished_snapshots=MbltWorker.MAX_FINISHED_CACHE_SNAPSHOTS,
-        dump_runtime_cache=worker._dump_runtime_cache,
-        load_runtime_cache=worker._load_runtime_cache,
         enable_prefix_caching=worker._prefix_caching_enabled(),
     )
+    (worker.cache_model,) = attach_request_caches(worker, k_per_model=max_batch_size)
     return worker
 
 
@@ -85,88 +71,78 @@ def _make_request_state(
     )
 
 
+def _run(worker: MbltWorker, req_id: str, req_state: RequestState, num_tokens: int) -> int:
+    """Run one step of ``req_id`` up to ``num_tokens`` tokens, as execute_model does; return its prefix start."""
+    worker.req_states[req_id] = req_state
+    cache_size = worker._load_snapshot_if_needed(req_id, req_state, slot_id=req_state.cache_slot_id)
+    worker._start_request_step(req_id, req_state, cache_size, slot_id=req_state.cache_slot_id)
+    worker.request_caches.commit(req_state.kv_cache, num_tokens - cache_size)
+    req_state.num_computed_tokens = num_tokens
+    return cache_size
+
+
 class TestKvCacheSwapBehavior:
-    def test_dump_snapshot_stores_runtime_cache_snapshot(self) -> None:
+    def test_dump_snapshot_stores_a_copy_of_the_request_cache(self) -> None:
         worker = _make_worker(block_size=4)
-        req_state = _make_request_state(worker, block_ids=([7, 8],), num_computed_tokens=6)
+        req_state = _make_request_state(worker, block_ids=([7, 8],))
+        _run(worker, "req", req_state, 6)
 
         assert worker._dump_snapshot("req", req_state, next_num_tokens=6)
 
         snapshot = worker.runtime_cache.get_snapshot("req")
         assert snapshot is not None
-        assert snapshot.blobs == ["dump:1:None"]
+        assert snapshot.blobs is not req_state.kv_cache
+        assert snapshot.blobs.get_seq_length() == 6
         assert snapshot.block_ids == ([7, 8],)
         assert snapshot.first_seq_blocks == (7, 8)
         assert snapshot.num_tokens == 6
-        assert worker.cache_model.dumps == [{"cache_id": None}]
+        assert worker.cache_model.dumps == [0]
 
-    def test_load_snapshot_if_needed_loads_own_snapshot_and_marks_live_request(self) -> None:
+    def test_request_cache_is_reused_for_same_request_without_reload(self) -> None:
         worker = _make_worker(block_size=4)
-        req_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
-        worker.runtime_cache.store_snapshot(
-            req_id="req",
-            blobs=["own-cache"],
-            block_ids=req_state.block_ids,
-            first_seq_blocks=req_state.first_seq_blocks,
-            num_tokens=8,
-        )
+        req_state = _make_request_state(worker, block_ids=([1, 2],))
+        _run(worker, "req", req_state, 8)
 
-        matched_tokens = worker._load_snapshot_if_needed("req", req_state)
-
-        assert matched_tokens == 8
-        assert worker.cache_model.loads == [(["own-cache"], None)]
-        assert worker.runtime_cache.loaded_req_id == "req"
-
-    def test_live_cache_is_reused_for_same_request_without_reload(self) -> None:
-        worker = _make_worker(block_size=4)
-        req_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
-        worker.runtime_cache.mark_loaded_request("req")
-
-        matched_tokens = worker._load_snapshot_if_needed("req", req_state)
-
-        assert matched_tokens == 8
+        assert _run(worker, "req", req_state, 9) == 8
         assert worker.cache_model.loads == []
         assert worker.cache_model.dumps == []
-        assert worker.runtime_cache.loaded_req_id == "req"
 
-    def test_switching_requests_dumps_previous_live_request_before_zero_token_skip(self) -> None:
+    def test_switching_requests_saves_the_previous_request_and_restores_it_on_return(self) -> None:
         worker = _make_worker(block_size=4)
-        live_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
-        zero_state = _make_request_state(worker, block_ids=([9],), num_computed_tokens=0)
-        worker.req_states["live"] = live_state
-        worker.runtime_cache.mark_loaded_request("live")
+        live_state = _make_request_state(worker, block_ids=([1, 2],))
+        other_state = _make_request_state(worker, block_ids=([9],))
+        _run(worker, "live", live_state, 8)
 
-        matched_tokens = worker._load_snapshot_if_needed("zero", zero_state)
-
-        assert matched_tokens == 0
+        assert _run(worker, "other", other_state, 4) == 0
         snapshot = worker.runtime_cache.get_snapshot("live")
         assert snapshot is not None
         assert snapshot.num_tokens == 8
-        assert worker.runtime_cache.loaded_req_id is None
-        assert worker.cache_model.dumps == [{"cache_id": None}]
+        assert worker.cache_model.dumps == [0]
 
-    def test_cache_miss_clears_live_request_and_falls_back_to_recompute(self) -> None:
+        assert _run(worker, "live", live_state, 9) == 8
+        assert worker.cache_model.dumps == [0, 0]
+        assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]
+
+    def test_cache_miss_falls_back_to_recompute(self) -> None:
         worker = _make_worker(block_size=4)
         req_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
-        worker.runtime_cache.mark_loaded_request("other")
 
         matched_tokens = worker._load_snapshot_if_needed("req", req_state)
 
         assert matched_tokens == 0
-        assert worker.runtime_cache.loaded_req_id is None
         assert worker.cache_model.loads == []
 
-    def test_finished_request_keeps_snapshot_for_cross_request_prefix_reuse(self) -> None:
+    def test_finished_request_keeps_its_cache_as_snapshot_for_cross_request_prefix_reuse(self) -> None:
         worker = _make_worker(block_size=4)
-        req_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
-        worker.req_states["finished"] = req_state
-        worker.runtime_cache.mark_loaded_request("finished")
+        req_state = _make_request_state(worker, block_ids=([1, 2],))
+        _run(worker, "finished", req_state, 8)
 
         worker._finalize_finished_request("finished")
 
-        assert worker.runtime_cache.get_snapshot("finished") is not None
+        snapshot = worker.runtime_cache.get_snapshot("finished")
+        assert snapshot is not None and snapshot.blobs is req_state.kv_cache
         assert list(worker.runtime_cache.finished_snapshot_lru) == ["finished"]
-        assert worker.runtime_cache.loaded_req_id is None
+        assert worker.cache_model.dumps == []
         assert "finished" not in worker.req_states
 
     def test_finished_snapshot_pool_is_lru_capped_through_runtime_cache(self) -> None:
@@ -175,7 +151,7 @@ class TestKvCacheSwapBehavior:
         for req_id, block_id in (("a", 1), ("b", 2), ("c", 3)):
             worker.runtime_cache.store_snapshot(
                 req_id=req_id,
-                blobs=[req_id],
+                blobs=make_snapshot_cache(worker, 4),
                 block_ids=([block_id],),
                 first_seq_blocks=(block_id,),
                 num_tokens=4,
@@ -196,21 +172,60 @@ class TestKvCacheSwapBehavior:
         with pytest.raises(RuntimeError, match="KV block_ids layout mismatch"):
             worker._append_block_ids(([1],), ([2], [3]))
 
-    def test_batch_slot_dump_and_load_use_slot_scoped_runtime_cache(self) -> None:
+    def test_batch_requests_on_their_own_slots_never_swap(self) -> None:
         worker = _make_worker(max_batch_size=2, block_size=4)
-        req_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, cache_slot_id=1)
+        a_state = _make_request_state(worker, block_ids=([1, 2],), cache_slot_id=0)
+        b_state = _make_request_state(worker, block_ids=([3, 4],), cache_slot_id=1)
 
-        assert worker._dump_snapshot("req", req_state, next_num_tokens=8, slot_id=1)
-        matched_tokens = worker._load_snapshot_if_needed("req", req_state, slot_id=1)
+        _run(worker, "a", a_state, 8)
+        _run(worker, "b", b_state, 8)
+        assert _run(worker, "a", a_state, 9) == 8
+        assert _run(worker, "b", b_state, 9) == 8
 
-        assert matched_tokens == 8
-        assert worker.cache_model.dumps == [{"cache_id": 1}]
-        assert worker.cache_model.loads == [(["dump:1:1"], 1)]
-        assert worker.runtime_cache.live_slot_owner(1) == "req"
+        assert worker.cache_model.dumps == []
+        assert worker.cache_model.loads == []
+        assert a_state.kv_cache.slot_of(0) == (0, 0)
+        assert b_state.kv_cache.slot_of(0) == (0, 1)
+
+    def test_batch_shared_prefix_from_another_slot_is_loaded_into_the_request_slot(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4)
+        done_state = _make_request_state(worker, block_ids=([1, 2],), prompt_len=8, cache_slot_id=0)
+        _run(worker, "done", done_state, 8)
+        worker._finalize_finished_request("done")
+        new_state = _make_request_state(
+            worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8, cache_slot_id=1
+        )
+
+        assert _run(worker, "new", new_state, 9) == 8
+
+        # The snapshot was still on slot 0: copying it saved it, and slot 1 loaded the copy.
+        assert worker.cache_model.dumps == [0]
+        assert [cache_id for cache_id, _ in worker.cache_model.loads] == [1]
+        assert new_state.kv_cache.slot_of(0) == (0, 1)
+
+    def test_batch_shared_prefix_on_the_request_slot_is_taken_over_without_load(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4)
+        done_state = _make_request_state(worker, block_ids=([1, 2],), prompt_len=8, cache_slot_id=0)
+        _run(worker, "done", done_state, 8)
+        done_cache = done_state.kv_cache
+        worker._finalize_finished_request("done")
+        new_state = _make_request_state(
+            worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8, cache_slot_id=0
+        )
+
+        assert _run(worker, "new", new_state, 9) == 8
+
+        # The request continues on the finished cache's KV in place; the snapshot keeps a host copy.
+        assert new_state.kv_cache is done_cache
+        assert worker.cache_model.dumps == [0]
+        assert worker.cache_model.loads == []
+        snapshot = worker.runtime_cache.get_snapshot("done")
+        assert snapshot is not None and snapshot.blobs is not done_cache
+        assert snapshot.blobs.get_seq_length() == 8
 
 
 class TestKvCacheSwapWithoutPrefixCaching:
-    """--no-enable-prefix-caching keeps swap snapshots but drops prefix reuse (issue #28)."""
+    """--no-enable-prefix-caching keeps each request's own KV but drops prefix reuse (issue #28)."""
 
     @staticmethod
     def _store_foreign_snapshot(worker: MbltWorker) -> None:
@@ -219,7 +234,7 @@ class TestKvCacheSwapWithoutPrefixCaching:
         # hit; without it, physical block numbers prove nothing.
         worker.runtime_cache.store_snapshot(
             req_id="old",
-            blobs=["old-cache"],
+            blobs=make_snapshot_cache(worker, 8),
             block_ids=([1, 2],),
             first_seq_blocks=(1, 2),
             num_tokens=8,
@@ -233,95 +248,64 @@ class TestKvCacheSwapWithoutPrefixCaching:
         assert worker._prefix_caching_enabled()
         assert worker.runtime_cache.enable_prefix_caching
 
-    def test_finished_request_is_not_dumped_without_prefix_caching(self) -> None:
+    def test_finished_request_is_dropped_without_dumping_without_prefix_caching(self) -> None:
         worker = _make_worker(block_size=4, enable_prefix_caching=False)
-        worker.req_states["finished"] = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
-        worker.runtime_cache.mark_loaded_request("finished", 8)
+        _run(worker, "finished", _make_request_state(worker, block_ids=([1, 2],)), 8)
 
         worker._finalize_finished_request("finished")
+        _run(worker, "next", _make_request_state(worker, block_ids=([3],)), 4)
 
         assert worker.cache_model.dumps == []
         assert worker.runtime_cache.get_snapshot("finished") is None
         assert list(worker.runtime_cache.finished_snapshot_lru) == []
-        assert worker.runtime_cache.loaded_req_id is None
         assert "finished" not in worker.req_states
 
-    def test_finished_request_is_dumped_with_prefix_caching(self) -> None:
+    def test_finished_request_is_kept_with_prefix_caching(self) -> None:
         worker = _make_worker(block_size=4, enable_prefix_caching=True)
-        worker.req_states["finished"] = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
-        worker.runtime_cache.mark_loaded_request("finished", 8)
+        _run(worker, "finished", _make_request_state(worker, block_ids=([1, 2],)), 8)
 
         worker._finalize_finished_request("finished")
 
-        assert worker.cache_model.dumps == [{"cache_id": None}]
+        assert worker.cache_model.dumps == []
         assert worker.runtime_cache.get_snapshot("finished") is not None
         assert list(worker.runtime_cache.finished_snapshot_lru) == ["finished"]
 
-    def test_finished_batch_request_is_not_dumped_and_releases_slot_without_prefix_caching(self) -> None:
+    def test_finished_batch_request_is_dropped_and_releases_slot_without_prefix_caching(self) -> None:
         worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=False)
         slot_id = worker._assign_cache_slot("finished")
-        worker.req_states["finished"] = _make_request_state(
-            worker, block_ids=([1, 2],), num_computed_tokens=8, cache_slot_id=slot_id
-        )
-        worker.runtime_cache.mark_slot_owner(slot_id, "finished", 8)
+        _run(worker, "finished", _make_request_state(worker, block_ids=([1, 2],), cache_slot_id=slot_id), 8)
 
         worker._finalize_finished_request("finished")
 
         assert worker.cache_model.dumps == []
         assert worker.runtime_cache.get_snapshot("finished") is None
-        assert worker.runtime_cache.live_slot_owner(slot_id) is None
         assert worker.runtime_cache.free_cache_slots == [0, 1]
 
-    def test_finished_batch_request_is_dumped_with_prefix_caching(self) -> None:
+    def test_finished_batch_request_is_kept_with_prefix_caching(self) -> None:
         worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
         slot_id = worker._assign_cache_slot("finished")
-        worker.req_states["finished"] = _make_request_state(
-            worker, block_ids=([1, 2],), num_computed_tokens=8, cache_slot_id=slot_id
-        )
-        worker.runtime_cache.mark_slot_owner(slot_id, "finished", 8)
+        _run(worker, "finished", _make_request_state(worker, block_ids=([1, 2],), cache_slot_id=slot_id), 8)
 
         worker._finalize_finished_request("finished")
 
-        assert worker.cache_model.dumps == [{"cache_id": slot_id}]
+        assert worker.cache_model.dumps == []
         assert worker.runtime_cache.get_snapshot("finished") is not None
 
-    def test_non_batch_swap_still_dumps_and_loads_own_snapshot_without_prefix_caching(self) -> None:
+    def test_non_batch_swap_restores_each_request_without_snapshots_without_prefix_caching(self) -> None:
         worker = _make_worker(block_size=4, enable_prefix_caching=False)
-        a_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
-        b_state = _make_request_state(worker, block_ids=([3, 4],), num_computed_tokens=0, prompt_len=8)
-        worker.req_states = {"a": a_state, "b": b_state}
-        worker.runtime_cache.mark_loaded_request("a", 8)
+        a_state = _make_request_state(worker, block_ids=([1, 2],), prompt_len=8)
+        b_state = _make_request_state(worker, block_ids=([3, 4],), prompt_len=8)
+        _run(worker, "a", a_state, 8)
 
-        # Switching to b dumps a's live cache so a can resume later.
-        assert worker._load_snapshot_if_needed("b", b_state) == 0
-        assert worker.cache_model.dumps == [{"cache_id": None}]
-        assert worker.runtime_cache.get_snapshot("a") is not None
-        worker.runtime_cache.mark_loaded_request("b", 8)
-        b_state.num_computed_tokens = 8
+        # Switching to b saves a's KV in a's cache so a can resume later.
+        assert _run(worker, "b", b_state, 8) == 0
+        assert worker.cache_model.dumps == [0]
 
-        # Switching back to a dumps b, then loads a's own snapshot.
-        assert worker._load_snapshot_if_needed("a", a_state) == 8
-        assert worker.cache_model.dumps == [{"cache_id": None}, {"cache_id": None}]
-        assert worker.cache_model.loads == [(["dump:1:None"], None)]
-        assert worker.runtime_cache.loaded_req_id == "a"
-
-    def test_non_batch_swap_loads_partial_own_snapshot_without_prefix_caching(self) -> None:
-        worker = _make_worker(block_size=4, enable_prefix_caching=False)
-        # a decoded one more token inside the same block after its last dump,
-        # so its own snapshot holds a 6-token prefix of the 7 it needs.
-        a_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=7, prompt_len=8)
-        worker.req_states["a"] = a_state
-        worker.runtime_cache.store_snapshot(
-            req_id="a",
-            blobs=["a-cache"],
-            block_ids=a_state.block_ids,
-            first_seq_blocks=a_state.first_seq_blocks,
-            num_tokens=6,
-            cache_token_ids=tuple(range(6)),
-        )
-
-        assert worker._load_snapshot_if_needed("a", a_state) == 6
-        assert worker.cache_model.loads == [(["a-cache"], None)]
+        # Switching back to a saves b, then loads a's KV.
+        assert _run(worker, "a", a_state, 9) == 8
+        assert worker.cache_model.dumps == [0, 0]
+        assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]
+        assert worker.runtime_cache.snapshot_count() == 0
 
     def test_new_request_never_loads_another_requests_snapshot_without_prefix_caching(self) -> None:
         worker = _make_worker(block_size=4, enable_prefix_caching=False)
@@ -343,7 +327,6 @@ class TestKvCacheSwapWithoutPrefixCaching:
 
         assert worker._load_snapshot_if_needed("new", new_state, slot_id=slot_id) == 0
         assert worker.cache_model.loads == []
-        assert worker.runtime_cache.live_slot_owner(slot_id) == "new"
 
     def test_same_foreign_snapshot_is_loaded_shared_with_prefix_caching(self) -> None:
         worker = _make_worker(block_size=4, enable_prefix_caching=True)
@@ -352,17 +335,4 @@ class TestKvCacheSwapWithoutPrefixCaching:
         worker.req_states["new"] = new_state
 
         assert worker._load_snapshot_if_needed("new", new_state) == 8
-        assert worker.cache_model.loads == [(["old-cache"], None)]
-
-    def test_finished_swap_snapshot_is_dropped_without_prefix_caching(self) -> None:
-        worker = _make_worker(block_size=4, enable_prefix_caching=False)
-        worker.req_states["a"] = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
-        worker.runtime_cache.mark_loaded_request("a", 8)
-        worker._dump_loaded_request_before_switch(next_req_id="b")
-        assert worker.runtime_cache.get_snapshot("a") is not None
-
-        worker._finalize_finished_request("a")
-
-        assert worker.runtime_cache.snapshot_count() == 0
-        assert list(worker.runtime_cache.finished_snapshot_lru) == []
-        assert len(worker.cache_model.dumps) == 1
+        assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]

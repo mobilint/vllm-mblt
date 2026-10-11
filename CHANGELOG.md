@@ -2,12 +2,27 @@
 
 ## Unreleased
 
+### Changed
+
+- Every request now keeps its own transformers-mblt cache on the NPU slot it runs on, and the worker binds it
+  before each infer. transformers-mblt records which cache's KV each slot holds and saves or restores it when
+  another cache takes the slot, so the worker no longer calls `dump_cache_memory` / `load_cache_memory` itself
+  and no longer tracks which request the live slot belongs to.
+  - Switching requests on a non-batch model saves the outgoing request's KV exactly, not rounded to a KV block, so
+    the request resumes where it stopped instead of recomputing the tail.
+  - A finished request's cache becomes its prefix snapshot without a dump. Its KV is saved only when another
+    cache takes the slot, and not at all if the snapshot is dropped first.
+  - A new request whose prefix snapshot is still on its own slot takes that cache over, KV in place, instead of
+    loading a copy.
+  - Prefix snapshots are cache copies instead of raw dump blobs, for dense and Mixture-of-Experts models alike.
+- Requires `transformers-mblt>=0.3.0` and `mblt-model-zoo[transformers]>=2.11.0`.
+
 ### Added
 
 - Qwen3-MoE (`mobilint/Qwen3-30B-A3B`) can now be served through the new `qwen3-moe` optional extra, which
   requires `transformers-mblt>=0.2.0`. The worker hands each scheduled chunk to the transformers-mblt MoE
   forward (shared MXQs, top-k routing, parallel expert MXQs, `lm_head`) through a single-slot cache-model adapter.
-  Prefix-cache snapshots dump and restore the KV cache of every per-layer shared MXQ.
+  Each request keeps its own cache of every per-layer shared MXQ.
 - Only non-batch serving is supported: a `max_batch_size` above 1 is refused at startup, because MoE releases
   cannot be compiled as batch MXQs.
 - `max_model_len` is clamped to 4096 for MoE models, the KV capacity of the released shared MXQs, and the worker
@@ -22,7 +37,7 @@
   a snapshot can only be matched by physical block number (#28).
 - With prefix caching off, a request loads only its own snapshot, never another request's, and a finished
   request's snapshot is dropped instead of kept in the finished-snapshot LRU. Non-batch request swapping still
-  dumps the live request before switching and loads it back, including a partial snapshot.
+  saves the outgoing request's KV and restores it when the request resumes.
 
 ### Documentation
 
