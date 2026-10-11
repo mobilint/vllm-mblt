@@ -2175,13 +2175,10 @@ class MbltWorker(WorkerBase):
         logits = output.logits.reshape(rows, -1, output.logits.shape[-1]).to(torch.float32).numpy()
         results = []
         for row, length in enumerate(lengths):
-            row_logits = logits[row, :length] if keep_all else logits[row, -1:]
-            results.append(
-                InferenceLogits(
-                    last_token_logits=row_logits[-1],
-                    full_sequence_logits=row_logits if keep_all and keep_sequence_logits[row] else None,
-                )
-            )
+            # Copies, so what a row keeps does not hold the whole batched [rows, width, vocab] output alive.
+            sequence = logits[row, :length].copy() if keep_all and keep_sequence_logits[row] else None
+            last_token = sequence[-1] if sequence is not None else logits[row, length - 1 if keep_all else 0].copy()
+            results.append(InferenceLogits(last_token_logits=last_token, full_sequence_logits=sequence))
         return results
 
     def _infer_logits(

@@ -98,6 +98,8 @@ def test_per_position_logits_come_back_only_for_rows_that_ask_on_a_full_logits_m
     assert plain.last_token_logits[1] == 1.0  # the plain row's own last position, not the padded width's
     assert echo.full_sequence_logits.shape == (3, VOCAB)
     assert echo.last_token_logits[1] == 2.0
+    # Each row keeps its own copy, not a view of the whole batched output.
+    assert plain.last_token_logits.base is None and echo.full_sequence_logits.base is None
 
 
 def test_last_token_logits_only_on_a_last_logit_mxq_even_when_asked() -> None:
