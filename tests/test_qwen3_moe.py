@@ -1,3 +1,4 @@
+import gc
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +11,7 @@ from vllm_mblt import register_model
 from vllm_mblt.mblt_platform import MbltPlatform
 from vllm_mblt.mblt_worker import MbltWorker
 from vllm_mblt.moe_runtime import MbltMoECacheModel, is_mixture_of_experts_model
+from vllm_mblt.request_cache import RequestCacheSlots
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager
 
 
@@ -61,6 +63,7 @@ class _FakeMoEModel:
         self.calls.append(
             {
                 "inputs_embeds": inputs_embeds,
+                "cache": past_key_values,
                 "cache_size": past_key_values.get_seq_length(),
                 "use_cache": use_cache,
                 "logits_to_keep": logits_to_keep,
@@ -124,26 +127,35 @@ def test_moe_cache_model_reports_last_token_logits() -> None:
     assert MbltMoECacheModel(_FakeMoEModel(vocab_size=17)).get_model_output_shape() == [(1, 1, 17)]
 
 
-def test_moe_cache_model_snapshots_every_shared_mxq_in_layer_order() -> None:
-    model = _FakeMoEModel(num_layers=3)
+def test_moe_cache_model_runs_each_infer_on_the_request_cache_it_was_given() -> None:
+    model = _FakeMoEModel()
     cache_model = MbltMoECacheModel(model)
+    slots = RequestCacheSlots([], moe=cache_model)
+    first, second = slots.new_cache(None), slots.new_cache(None)
+    first.set_seq_length(3)
+    second.set_seq_length(5)
 
-    blobs = cache_model.dump_cache_memory()
-    assert blobs == [[b"layer0-slot0"], [b"layer1-slot0"], [b"layer2-slot0"]]
+    slots.prepare(first, None, 3)
+    cache_model.infer(np.ones((1, 1, 4), dtype=np.float32), cache_size=3)
+    slots.prepare(second, None, 5)
+    cache_model.infer(np.ones((1, 1, 4), dtype=np.float32), cache_size=5)
 
-    cache_model.load_cache_memory(blobs)
-    assert [shared.loaded for shared in model.shared] == [
-        [([b"layer0-slot0"], 0)],
-        [([b"layer1-slot0"], 0)],
-        [([b"layer2-slot0"], 0)],
-    ]
+    assert [(call["cache"], call["cache_size"]) for call in model.calls] == [(first, 3), (second, 5)]
 
 
-def test_moe_cache_model_rejects_snapshot_with_wrong_layer_count() -> None:
-    cache_model = MbltMoECacheModel(_FakeMoEModel(num_layers=3))
+def test_moe_cache_model_holds_the_request_cache_weakly() -> None:
+    model = _FakeMoEModel()
+    cache_model = MbltMoECacheModel(model)
+    request_cache = cache_model.new_cache()
+    cache_model.use_cache(request_cache)
+    assert cache_model.cache is request_cache
 
-    with pytest.raises(ValueError, match="2 layers"):
-        cache_model.load_cache_memory([[b"a"], [b"b"]])
+    # A finished request's cache that nothing else keeps must be freed, so its KV is never saved.
+    del request_cache
+    gc.collect()
+
+    assert isinstance(cache_model.cache, _FakeMoECache)
+    assert model.built_caches == [1, 1]
 
 
 def _make_loading_worker(max_batch_size: int, max_seq_len: int = 4096) -> MbltWorker:

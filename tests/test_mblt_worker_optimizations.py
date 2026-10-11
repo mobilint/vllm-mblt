@@ -25,6 +25,8 @@ from vllm_mblt.mblt_worker import (
 )
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest
 
+from .kv_slot_fakes import FakeKVSlotModel, attach_request_caches, make_snapshot_cache
+
 
 class TestMbltWorkerOptimizations:
     def test_multimodal_hf_config_detects_mobilint_qwen_vl_model_types(self) -> None:
@@ -347,6 +349,9 @@ class TestMbltWorkerOptimizations:
         worker.print_debug = False
         worker._warned_last_logit_prompt_logprobs = False
         worker._vlm_image_positions_by_session = {}
+        worker.req_states = {}
+        # Room for every batch slot a test switches to after building the worker.
+        worker.kv_slot_models = attach_request_caches(worker, k_per_model=64)
         return worker
 
     def _make_scheduler_output(self, num_scheduled_tokens: dict[str, int]) -> SimpleNamespace:
@@ -435,7 +440,7 @@ class TestMbltWorkerOptimizations:
         worker = self._make_worker()
         worker.runtime_cache.store_snapshot(
             req_id="short_shared",
-            blobs=[],
+            blobs=make_snapshot_cache(worker, 384),
             block_ids=([1, 2, 8],),
             first_seq_blocks=(1, 2, 8),
             num_tokens=384,
@@ -444,7 +449,7 @@ class TestMbltWorkerOptimizations:
         assert short_shared is not None
         worker.runtime_cache.store_snapshot(
             req_id="deep_but_short",
-            blobs=[],
+            blobs=make_snapshot_cache(worker, 100),
             block_ids=([1, 2, 3, 7],),
             first_seq_blocks=(1, 2, 3, 7),
             num_tokens=100,
@@ -466,16 +471,13 @@ class TestMbltWorkerOptimizations:
         worker = self._make_worker()
         worker.runtime_cache.store_snapshot(
             req_id="old-content",
-            blobs=["stale-runtime-cache"],
+            blobs=make_snapshot_cache(worker, 4),
             block_ids=([10],),
             first_seq_blocks=(10,),
             num_tokens=4,
             cache_token_ids=(101, 102, 103, 104),
         )
-        load_calls = []
-        worker.runtime_cache.set_io_adapters(
-            load_runtime_cache=lambda blobs, slot_id: load_calls.append((blobs, slot_id)) or True,
-        )
+        load_calls = worker.kv_slot_models[0].loads
         req_state = self._make_request_state(
             worker,
             SamplingParams.from_optional(),
@@ -489,21 +491,20 @@ class TestMbltWorkerOptimizations:
 
         assert cache_size == 0
         assert load_calls == []
-        assert worker.runtime_cache.loaded_req_id is None
+        assert req_state.kv_cache.get_seq_length() == 0
 
     def test_short_prefix_hit_skips_load_and_keeps_snapshot(self) -> None:
         worker = self._make_worker()
         worker.runtime_cache.store_snapshot(
             req_id="shared",
-            blobs=["runtime-cache"],
+            blobs=make_snapshot_cache(worker, 16),
             block_ids=([10],),
             first_seq_blocks=(10,),
             first_seq_block_hashes=("shared-block",),
             num_tokens=16,
             cache_token_ids=tuple(range(16)),
         )
-        load_calls = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        load_calls = worker.kv_slot_models[0].loads
         worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
         worker.prefix_cache_cost_model.observe_load(None, 5.0)
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
@@ -517,21 +518,20 @@ class TestMbltWorkerOptimizations:
         assert cache_size == 0
         assert load_calls == []
         assert worker.runtime_cache.get_snapshot("shared") is not None
-        assert worker.runtime_cache.loaded_req_id is None
+        assert req_state.kv_cache.get_seq_length() == 0
 
     def test_long_prefix_hit_loads_and_returns_suffix_start(self) -> None:
         worker = self._make_worker()
         worker.runtime_cache.store_snapshot(
             req_id="shared",
-            blobs=["runtime-cache"],
+            blobs=make_snapshot_cache(worker, 128),
             block_ids=([10],),
             first_seq_blocks=(10,),
             first_seq_block_hashes=("shared-block",),
             num_tokens=128,
             cache_token_ids=tuple(range(128)),
         )
-        load_calls = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        load_calls = worker.kv_slot_models[0].loads
         worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
         worker.prefix_cache_cost_model.observe_load(None, 5.0)
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(160)))
@@ -543,8 +543,8 @@ class TestMbltWorkerOptimizations:
         cache_size = worker._load_snapshot_if_needed("request", req_state)
 
         assert cache_size == 128
-        assert load_calls == [(["runtime-cache"], None)]
-        assert worker.runtime_cache.loaded_req_id == "request"
+        assert [cache_id for cache_id, _ in load_calls] == [0]
+        assert req_state.kv_cache.get_seq_length() == 128
 
     def test_explicit_prompt_embeds_with_same_tokens_but_different_content_do_not_load(self) -> None:
         worker = self._make_worker()
@@ -557,7 +557,7 @@ class TestMbltWorkerOptimizations:
         old_req_state.explicit_prompt_embeds = True
         worker.runtime_cache.store_snapshot(
             req_id="shared",
-            blobs=["runtime-cache"],
+            blobs=make_snapshot_cache(worker, 128),
             block_ids=([10],),
             first_seq_blocks=(10,),
             first_seq_block_hashes=("shared-block",),
@@ -565,8 +565,7 @@ class TestMbltWorkerOptimizations:
             cache_token_ids=tuple(range(128)),
             prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
         )
-        load_calls = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        load_calls = worker.kv_slot_models[0].loads
         worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
         worker.prefix_cache_cost_model.observe_load(None, 5.0)
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
@@ -582,7 +581,7 @@ class TestMbltWorkerOptimizations:
 
         assert cache_size == 0
         assert load_calls == []
-        assert worker.runtime_cache.loaded_req_id is None
+        assert req_state.kv_cache.get_seq_length() == 0
 
     def test_explicit_prompt_embeds_with_identical_content_load(self) -> None:
         worker = self._make_worker()
@@ -593,7 +592,7 @@ class TestMbltWorkerOptimizations:
         old_req_state.explicit_prompt_embeds = True
         worker.runtime_cache.store_snapshot(
             req_id="shared",
-            blobs=["runtime-cache"],
+            blobs=make_snapshot_cache(worker, 128),
             block_ids=([10],),
             first_seq_blocks=(10,),
             first_seq_block_hashes=("shared-block",),
@@ -601,8 +600,7 @@ class TestMbltWorkerOptimizations:
             cache_token_ids=tuple(range(128)),
             prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
         )
-        load_calls = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        load_calls = worker.kv_slot_models[0].loads
         worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
         worker.prefix_cache_cost_model.observe_load(None, 5.0)
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(128)))
@@ -617,7 +615,7 @@ class TestMbltWorkerOptimizations:
         cache_size = worker._load_snapshot_if_needed("request", req_state)
 
         assert cache_size == 128
-        assert load_calls == [(["runtime-cache"], None)]
+        assert [cache_id for cache_id, _ in load_calls] == [0]
 
     def test_short_explicit_prompt_embed_hit_skips_fingerprint_when_cost_policy_skips(
         self,
@@ -637,7 +635,7 @@ class TestMbltWorkerOptimizations:
         old_req_state.explicit_prompt_embeds = True
         worker.runtime_cache.store_snapshot(
             req_id="shared",
-            blobs=["runtime-cache"],
+            blobs=make_snapshot_cache(worker, 16),
             block_ids=([10],),
             first_seq_blocks=(10,),
             first_seq_block_hashes=("shared-block",),
@@ -645,8 +643,7 @@ class TestMbltWorkerOptimizations:
             cache_token_ids=tuple(range(16)),
             prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
         )
-        load_calls = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        load_calls = worker.kv_slot_models[0].loads
         worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
         worker.prefix_cache_cost_model.observe_load(None, 5.0)
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
@@ -678,7 +675,7 @@ class TestMbltWorkerOptimizations:
         old_req_state.explicit_prompt_embeds = True
         worker.runtime_cache.store_snapshot(
             req_id="shared",
-            blobs=["runtime-cache"],
+            blobs=make_snapshot_cache(worker, 6),
             block_ids=([10, 11],),
             first_seq_blocks=(10, 11),
             first_seq_block_hashes=("shared-a", "shared-b"),
@@ -686,8 +683,7 @@ class TestMbltWorkerOptimizations:
             cache_token_ids=worker._cache_token_ids(old_req_state, 6),
             prompt_embed_cache_identity=worker._make_prompt_embed_cache_identity(old_req_state),
         )
-        load_calls = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        load_calls = worker.kv_slot_models[0].loads
         worker.prefix_cache_cost_model = PrefixCacheCostModel(
             block_size=128,
             auto_threshold_enabled=False,
@@ -709,7 +705,7 @@ class TestMbltWorkerOptimizations:
         cache_size = worker._load_snapshot_if_needed("request", req_state)
 
         assert cache_size == 6
-        assert load_calls == [(["runtime-cache"], None)]
+        assert [cache_id for cache_id, _ in load_calls] == [0]
 
     def test_batch_prefix_cache_threshold_applies_per_cache_id(self) -> None:
         worker = self._make_worker()
@@ -718,14 +714,13 @@ class TestMbltWorkerOptimizations:
         worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
         worker.runtime_cache.store_snapshot(
             req_id="shared",
-            blobs=["runtime-cache"],
+            blobs=make_snapshot_cache(worker, 16),
             block_ids=([10],),
             first_seq_blocks=(10,),
             num_tokens=16,
             cache_token_ids=tuple(range(16)),
         )
-        load_calls = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
+        load_calls = worker.kv_slot_models[0].loads
         worker.prefix_cache_cost_model.observe_prefill(128, 20.0)
         worker.prefix_cache_cost_model.observe_load(1, 5.0)
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
@@ -739,7 +734,7 @@ class TestMbltWorkerOptimizations:
 
         assert cache_size == 0
         assert load_calls == []
-        assert worker.runtime_cache.live_slot_owner(1) == "request"
+        assert req_state.kv_cache.slot_of(0) == (0, 1)
         assert worker.runtime_cache.get_snapshot("shared") is not None
 
     def test_prefix_cache_manual_override_and_auto_disable(self, monkeypatch) -> None:
@@ -806,13 +801,13 @@ class TestMbltWorkerOptimizations:
 
     def test_llm_prefix_cache_dump_saves_prompt_and_generated_token_identity(self) -> None:
         worker = self._make_worker()
-        worker.runtime_cache.set_io_adapters(dump_runtime_cache=lambda slot_id: ["runtime-cache"])
         req_state = self._make_request_state(
             worker,
             SamplingParams.from_optional(),
             [101, 102],
             output_token_ids=[201, 202],
         )
+        req_state.kv_cache = make_snapshot_cache(worker, 4)
         req_state.block_ids = ([10],)
         req_state.first_seq_blocks = (10,)
 
@@ -2247,6 +2242,9 @@ class TestMbltWorkerOptimizations:
         req_state.cache_slot_id = slot_id
         if output_token_ids:
             req_state.num_computed_tokens = len(prompt_token_ids)
+            # The prompt already ran: its cache holds that many tokens (the fake slots keep no real KV).
+            req_state.kv_cache = worker.request_caches.new_cache(slot_id)
+            req_state.kv_cache.fake_prefill(len(prompt_token_ids))
         return req_state
 
     def _make_batch_worker(self, max_batch_size: int) -> MbltWorker:
@@ -3087,10 +3085,6 @@ class TestMbltWorkerOptimizations:
         worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", vocab_size=32000)
         worker.req_states = {}
         worker._infer_output_buffers = None
-        worker.runtime_cache.set_io_adapters(
-            dump_runtime_cache=lambda _slot_id: ["unused"],
-            load_runtime_cache=lambda blobs, _slot_id: blobs == ["lm-kv-prefix"],
-        )
         base_prompt_embeds = torch.arange(130 * 4, dtype=torch.float32).reshape(130, 4)
         feature = SimpleNamespace(
             modality="image",
@@ -3112,7 +3106,7 @@ class TestMbltWorkerOptimizations:
         assert cached_prompt_embed_identity is not None
         worker.runtime_cache.store_snapshot(
             req_id="shared-text-prefix",
-            blobs=["lm-kv-prefix"],
+            blobs=make_snapshot_cache(worker, 128),
             block_ids=([11],),
             first_seq_blocks=(11,),
             num_tokens=128,
@@ -3173,7 +3167,7 @@ class TestMbltWorkerOptimizations:
         assert snapshot.prompt_embed_cache_identity is not None
         assert request_prompt_embed_identity.fingerprint(128) == snapshot.prompt_embed_cache_identity.fingerprint(128)
         assert worker.req_states["vlm-hit"].num_computed_tokens == 130
-        assert worker.runtime_cache.loaded_req_id == "vlm-hit"
+        assert worker.req_states["vlm-hit"].kv_cache.get_seq_length() == 130
 
     def test_repeated_image_vlm_requests_still_rebuild_vision_embeddings(self) -> None:
         worker = self._make_worker()
@@ -3181,10 +3175,6 @@ class TestMbltWorkerOptimizations:
         worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", vocab_size=32000)
         worker.req_states = {}
         worker._infer_output_buffers = None
-        worker.runtime_cache.set_io_adapters(
-            dump_runtime_cache=lambda _slot_id: ["live-kv"],
-            load_runtime_cache=lambda _blobs, _slot_id: True,
-        )
 
         image_feature_call_count = 0
 
@@ -3542,27 +3532,26 @@ class TestMbltWorkerOptimizations:
         np.testing.assert_array_equal(logits[1], np.full(4, 10.0, dtype=np.float32))
         assert sorted(calls) == [(10, [(2, 5, 0)]), (20, [(1, 3, 0)])]
 
-    def test_runtime_cache_io_routes_global_slot_to_backend_model(self) -> None:
+    def test_request_caches_route_global_slot_to_backend_model(self) -> None:
         worker = self._make_worker()
-        calls: list[tuple[str, int, object]] = []
-
-        def make_model(marker: str):
-            return SimpleNamespace(
-                dump_cache_memory=lambda cache_id: calls.append((f"dump-{marker}", cache_id, None)) or [marker],
-                load_cache_memory=lambda blobs, cache_id: calls.append((f"load-{marker}", cache_id, blobs)),
-            )
-
-        model0 = make_model("zero")
-        model1 = make_model("one")
+        worker.max_batch_size = 4
+        model0 = FakeKVSlotModel("zero")
+        model1 = FakeKVSlotModel("one")
         worker.cache_model = model0
         worker.cache_backend = SimpleNamespace(mxq_models=[model0, model1], k_per_model=2)
+        worker._reset_cache_slots()
 
-        assert worker._dump_runtime_cache(slot_id=3) == ["one"]
-        assert worker._load_runtime_cache(["snapshot"], slot_id=2)
-        assert calls == [
-            ("dump-one", 1, None),
-            ("load-one", 0, ["snapshot"]),
-        ]
+        cache = worker.request_caches.new_cache(3)
+        worker.request_caches.prepare(cache, 3, 0)
+        worker.request_caches.commit(cache, 4)
+        moved = worker.request_caches.relocate(cache, 2, 4)
+        worker.request_caches.prepare(moved, 2, 4)
+
+        assert cache.slot_of(0) == (1, 1)
+        assert moved.slot_of(0) == (1, 0)
+        assert model1.dumps == [1]
+        assert [cache_id for cache_id, _ in model1.loads] == [0]
+        assert model0.dumps == [] and model0.loads == []
 
     @pytest.mark.parametrize("multimodal", [False, True])
     def test_resolve_cache_backend_finds_text_backend(self, multimodal: bool) -> None:
@@ -4013,64 +4002,63 @@ class TestMbltWorkerOptimizations:
 
         assert calls == ["sync"]
 
-    def test_batch_slot_live_cache_is_reused_when_token_count_matches(self) -> None:
+    def _run_request_cache(self, worker: MbltWorker, req_state: RequestState, num_tokens: int) -> None:
+        """Have ``num_tokens`` tokens of the request run on its slot, as an infer leaves its cache."""
+        slot_key = worker._slot_key(req_state.cache_slot_id)
+        cache = worker._request_cache(req_state, req_state.cache_slot_id)
+        worker.request_caches.prepare(cache, slot_key, 0)
+        worker.request_caches.commit(cache, num_tokens)
+
+    def _make_two_slot_worker(self) -> MbltWorker:
         worker = self._make_worker()
         worker.max_batch_size = 2
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
         worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
-        load_calls: list[object] = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
-        worker.runtime_cache.mark_slot_owner(1, "request", 16)
+        return worker
+
+    def test_batch_request_cache_is_reused_without_load(self) -> None:
+        worker = self._make_two_slot_worker()
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
-        req_state.num_computed_tokens = 16
         req_state.cache_slot_id = 1
+        self._run_request_cache(worker, req_state, 16)
+        req_state.num_computed_tokens = 16
 
         cache_size = worker._load_snapshot_if_needed("request", req_state, slot_id=1)
 
         assert cache_size == 16
-        assert load_calls == []
+        assert worker.kv_slot_models[0].loads == []
+        assert worker.kv_slot_models[0].dumps == []
 
-    def test_batch_slot_live_cache_mismatch_rebuilds_prefix_and_warns(self, caplog) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 2
-        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
-        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
-        load_calls: list[object] = []
-        worker._load_runtime_cache = lambda blobs, slot_id=None: load_calls.append((blobs, slot_id)) or True
-        # The slot holds 8 tokens while the scheduler believes 16 are computed.
-        worker.runtime_cache.mark_slot_owner(1, "request", 8)
+    def test_batch_request_cache_shorter_than_scheduler_continues_from_it_and_warns(self, caplog) -> None:
+        worker = self._make_two_slot_worker()
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
-        req_state.num_computed_tokens = 16
         req_state.cache_slot_id = 1
+        # The cache holds 8 tokens while the scheduler believes 16 are computed.
+        self._run_request_cache(worker, req_state, 8)
+        req_state.num_computed_tokens = 16
 
         with caplog.at_level("WARNING"):
             cache_size = worker._load_snapshot_if_needed("request", req_state, slot_id=1)
 
-        assert cache_size == 0
-        assert load_calls == []
-        assert worker.runtime_cache.live_slot_tokens(1) == 0
+        assert cache_size == 8
         assert worker._live_cache_prefix_incomplete_count == 1
         assert "holds fewer tokens than the scheduler expects" in caplog.text
 
-    def test_single_cache_live_reuse_mismatch_rebuilds_prefix_and_warns(self, caplog) -> None:
+    def test_single_request_cache_shorter_than_scheduler_continues_from_it_and_warns(self, caplog) -> None:
         worker = self._make_worker()
-        worker.runtime_cache.mark_loaded_request("request", 8)
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        self._run_request_cache(worker, req_state, 8)
         req_state.num_computed_tokens = 16
 
         with caplog.at_level("WARNING"):
             cache_size = worker._load_snapshot_if_needed("request", req_state)
 
-        assert cache_size == 0
-        assert worker.runtime_cache.loaded_req_id is None
+        assert cache_size == 8
         assert worker._live_cache_prefix_incomplete_count == 1
         assert "holds fewer tokens than the scheduler expects" in caplog.text
 
-    def test_execute_model_records_live_slot_token_count(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 2
-        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
-        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
+    def test_execute_model_runs_the_request_on_its_own_cache(self) -> None:
+        worker = self._make_two_slot_worker()
         worker.max_seq_len = 256
         req_state = self._make_request_state(worker, SamplingParams.from_optional(temperature=0.0), [1, 2, 3, 4])
         req_state.prompt_embeds = np.zeros((4, 8), dtype=np.float32)
@@ -4092,16 +4080,12 @@ class TestMbltWorkerOptimizations:
 
         assert output.req_ids == ["req"]
         assert req_state.num_computed_tokens == 4
-        assert worker.runtime_cache.live_slot_owner(0) == "req"
-        assert worker.runtime_cache.live_slot_tokens(0) == 4
+        assert req_state.kv_cache.slot_of(0) == (0, 0)
+        assert req_state.kv_cache.is_resident
+        assert worker._slot_caches[0] == ("req", req_state.kv_cache)
 
-    def test_finished_batch_request_without_live_slot_is_not_snapshotted(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 2
-        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
-        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
-        dump_calls: list[object] = []
-        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["stale-blob"]
+    def test_finished_batch_request_that_never_ran_is_not_snapshotted(self) -> None:
+        worker = self._make_two_slot_worker()
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
         req_state.num_computed_tokens = 16
         req_state.cache_slot_id = 0
@@ -4109,37 +4093,58 @@ class TestMbltWorkerOptimizations:
         worker.runtime_cache.req_to_slot = {"aborted": 0}
         worker.runtime_cache.slot_to_req = {0: "aborted"}
         worker.runtime_cache.free_slots = [1]
-        # Slot 0 is still live for a different request, so "aborted" never ran
-        # and its KV is not in the slot.
-        worker.runtime_cache.mark_slot_owner(0, "other", 32)
 
         worker._finalize_finished_request("aborted")
 
-        assert dump_calls == []
+        assert worker.kv_slot_models[0].dumps == []
         assert worker.runtime_cache.get_snapshot("aborted") is None
-        assert worker.runtime_cache.live_slot_owner(0) == "other"
+        assert worker.runtime_cache.free_slots == [0, 1]
 
-    def test_finished_batch_request_owning_its_slot_is_snapshotted(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 2
-        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
-        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
-        dump_calls: list[object] = []
-        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["blob"]
+    def test_finished_batch_request_keeps_its_cache_as_snapshot_without_dumping(self) -> None:
+        worker = self._make_two_slot_worker()
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
         req_state.num_computed_tokens = 16
         req_state.cache_slot_id = 0
+        self._run_request_cache(worker, req_state, 16)
         worker.req_states = {"done": req_state}
         worker.runtime_cache.req_to_slot = {"done": 0}
         worker.runtime_cache.slot_to_req = {0: "done"}
         worker.runtime_cache.free_slots = [1]
-        worker.runtime_cache.mark_slot_owner(0, "done", 16)
+        model = worker.kv_slot_models[0]
 
         worker._finalize_finished_request("done")
 
-        assert dump_calls == [0]
-        assert worker.runtime_cache.get_snapshot("done") is not None
-        assert worker.runtime_cache.live_slot_owner(0) is None
+        snapshot = worker.runtime_cache.get_snapshot("done")
+        assert snapshot is not None and snapshot.blobs is req_state.kv_cache
+        assert model.dumps == []
+        # The KV leaves the slot only when another request's cache takes it.
+        other = self._make_request_state(worker, SamplingParams.from_optional(), list(range(4)))
+        other.cache_slot_id = 0
+        self._run_request_cache(worker, other, 4)
+        assert model.dumps == [0]
+        assert snapshot.blobs.get_seq_length() == 16
+
+    def test_finished_request_without_prefix_caching_is_dropped_without_dumping(self) -> None:
+        worker = self._make_two_slot_worker()
+        worker.vllm_config.cache_config.enable_prefix_caching = False
+        worker.runtime_cache.enable_prefix_caching = False
+        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(16)))
+        req_state.num_computed_tokens = 16
+        req_state.cache_slot_id = 0
+        self._run_request_cache(worker, req_state, 16)
+        worker.req_states = {"done": req_state}
+        worker.runtime_cache.req_to_slot = {"done": 0}
+        worker.runtime_cache.slot_to_req = {0: "done"}
+        worker.runtime_cache.free_slots = [1]
+
+        worker._finalize_finished_request("done")
+        del req_state
+        other = self._make_request_state(worker, SamplingParams.from_optional(), list(range(4)))
+        other.cache_slot_id = 0
+        self._run_request_cache(worker, other, 4)
+
+        assert worker.runtime_cache.get_snapshot("done") is None
+        assert worker.kv_slot_models[0].dumps == []
 
     def test_sampling_penalties_are_enabled_by_default(self) -> None:
         assert _resolve_enable_sampling_penalties(None)
@@ -4177,87 +4182,101 @@ class TestMbltWorkerOptimizations:
         # penalised; the unpenalised token 2 must win instead of token 1.
         assert int(sampler_output.sampled_token_ids[0, 0].item()) == 2
 
-    def test_dump_before_switch_does_not_advertise_more_tokens_than_cached(self) -> None:
+    def test_switched_out_request_is_saved_once_and_snapshotted_for_prefix_reuse(self) -> None:
         worker = self._make_worker()
-        dump_calls: list[object] = []
-        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["short-blob"]
-        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
-        req_state.block_ids = ([10],)
-        req_state.first_seq_blocks = (10,)
-        # The scheduler view says 32 tokens, the live cache only holds 8.
-        req_state.num_computed_tokens = 32
-        worker.req_states = {"live": req_state}
-        worker.runtime_cache.mark_loaded_request("live", 8)
+        model = worker.kv_slot_models[0]
+        live = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        live.block_ids = ([10],)
+        live.first_seq_blocks = (10,)
+        live.num_computed_tokens = 8
+        other = self._make_request_state(worker, SamplingParams.from_optional(), list(range(100, 104)))
+        worker.req_states = {"live": live, "other": other}
+        worker._start_request_step("live", live, 0)
+        self._run_request_cache(worker, live, 8)
 
-        worker._dump_loaded_request_before_switch(next_req_id="other")
+        worker._start_request_step("other", other, worker._load_snapshot_if_needed("other", other))
 
-        assert dump_calls == [None]
+        # The slot's owner table saved "live" when "other" took the slot; the snapshot copies that save.
+        assert model.dumps == [0]
+        snapshot = worker.runtime_cache.get_snapshot("live")
+        assert snapshot is not None
+        assert snapshot.num_tokens == 8
+        assert snapshot.cache_token_ids == tuple(range(8))
+        assert snapshot.blobs is not live.kv_cache
+
+    def test_switched_out_snapshot_does_not_advertise_more_tokens_than_cached(self) -> None:
+        worker = self._make_worker()
+        live = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        live.block_ids = ([10],)
+        live.first_seq_blocks = (10,)
+        other = self._make_request_state(worker, SamplingParams.from_optional(), list(range(4)))
+        worker.req_states = {"live": live, "other": other}
+        worker._start_request_step("live", live, 0)
+        self._run_request_cache(worker, live, 8)
+        # The scheduler view says 32 tokens, the cache only holds 8.
+        live.num_computed_tokens = 32
+
+        worker._start_request_step("other", other, worker._load_snapshot_if_needed("other", other))
+
         snapshot = worker.runtime_cache.get_snapshot("live")
         assert snapshot is not None
         assert snapshot.num_tokens == 8
         assert snapshot.cache_token_ids == tuple(range(8))
 
-    def test_dump_before_switch_is_skipped_when_live_cache_is_empty(self) -> None:
+    def test_switched_out_request_with_empty_cache_is_not_snapshotted(self) -> None:
         worker = self._make_worker()
-        dump_calls: list[object] = []
-        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["blob"]
-        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
-        req_state.num_computed_tokens = 32
-        worker.req_states = {"live": req_state}
-        worker.runtime_cache.mark_loaded_request("live", 0)
+        live = self._make_request_state(worker, SamplingParams.from_optional(), list(range(32)))
+        live.num_computed_tokens = 32
+        other = self._make_request_state(worker, SamplingParams.from_optional(), list(range(4)))
+        worker.req_states = {"live": live, "other": other}
+        worker._start_request_step("live", live, 0)
 
-        worker._dump_loaded_request_before_switch(next_req_id="other")
+        worker._start_request_step("other", other, worker._load_snapshot_if_needed("other", other))
 
-        assert dump_calls == []
+        assert worker.kv_slot_models[0].dumps == []
         assert worker.runtime_cache.get_snapshot("live") is None
 
-    def test_finalize_clamps_snapshot_to_the_tokens_the_slot_holds(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 2
-        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=2, block_size=128)
-        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
-        dump_calls: list[object] = []
-        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["short-blob"]
+    def test_finalize_clamps_snapshot_to_the_tokens_the_cache_holds(self) -> None:
+        worker = self._make_two_slot_worker()
         req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(64)))
         req_state.block_ids = ([10],)
         req_state.first_seq_blocks = (10,)
-        req_state.num_computed_tokens = 64
         req_state.cache_slot_id = 0
+        self._run_request_cache(worker, req_state, 16)
+        req_state.num_computed_tokens = 64
         worker.req_states = {"done": req_state}
         worker.runtime_cache.req_to_slot = {"done": 0}
         worker.runtime_cache.slot_to_req = {0: "done"}
         worker.runtime_cache.free_slots = [1]
-        worker.runtime_cache.mark_slot_owner(0, "done", 16)
 
         worker._finalize_finished_request("done")
 
-        assert dump_calls == [0]
         snapshot = worker.runtime_cache.get_snapshot("done")
         assert snapshot is not None
         assert snapshot.num_tokens == 16
 
-    def test_clamped_snapshot_cannot_resume_past_missing_kv(self) -> None:
+    def test_switched_back_request_resumes_from_the_kv_its_cache_holds(self) -> None:
         worker = self._make_worker()
-        dump_calls: list[object] = []
-        worker._dump_runtime_cache = lambda slot_id=None: dump_calls.append(slot_id) or ["short-blob"]
-        worker._load_runtime_cache = lambda blobs, slot_id=None: True
-        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
-        req_state = self._make_request_state(worker, SamplingParams.from_optional(), list(range(256)))
-        req_state.block_ids = ([10, 11],)
-        req_state.first_seq_blocks = (10, 11)
-        req_state.num_computed_tokens = 256
-        worker.req_states = {"live": req_state}
-        worker.runtime_cache.mark_loaded_request("live", 128)
+        model = worker.kv_slot_models[0]
+        live = self._make_request_state(worker, SamplingParams.from_optional(), list(range(256)))
+        live.block_ids = ([10, 11],)
+        live.first_seq_blocks = (10, 11)
+        other = self._make_request_state(worker, SamplingParams.from_optional(), list(range(4)))
+        worker.req_states = {"live": live, "other": other}
+        worker._start_request_step("live", live, 0)
+        self._run_request_cache(worker, live, 128)
+        live.num_computed_tokens = 256
+        # Another request takes the slot, then "live" comes back.
+        worker._start_request_step("other", other, worker._load_snapshot_if_needed("other", other))
+        self._run_request_cache(worker, other, 4)
 
-        worker._dump_loaded_request_before_switch(next_req_id="other")
-        # Another request takes the single live cache, then "live" comes back.
-        worker.runtime_cache.mark_loaded_request("other", 8)
+        cache_size = worker._load_snapshot_if_needed("live", live)
+        worker._start_request_step("live", live, cache_size)
 
-        cache_size = worker._load_snapshot_if_needed("live", req_state)
-
-        # Without the clamp the snapshot would claim 256 tokens and decoding
-        # would resume at 256 over 128 tokens of real KV.
+        # Decoding resumes at the 128 tokens of real KV, not at the scheduler's 256.
         assert cache_size == 128
+        assert live.kv_cache.is_resident
+        assert [cache_id for cache_id, _ in model.loads] == [0]
 
     def test_sampling_penalties_do_not_require_pinned_memory(self, monkeypatch, request) -> None:
         # Reproduces the CPU-runner failure: vLLM's penalty path builds its

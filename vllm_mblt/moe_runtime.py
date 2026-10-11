@@ -7,12 +7,15 @@ between them runs on the host. transformers-mblt owns all of that
 top-k routing, parallel expert dispatch across devices, ``lm_head``).
 
 The worker drives a text model through a ``cache_model`` handle that exposes
-``infer`` / ``dump_cache_memory`` / ``load_cache_memory``. This module adapts a
-MoE model to that handle so the worker's scheduling, sampling, and prefix-cache
-code serves MoE unchanged, while every forward is delegated to transformers-mblt.
-Only the non-batch path exists: MoE releases cannot be compiled as batch MXQs.
+``infer``. This module adapts a MoE model to that handle so the worker's
+scheduling, sampling, and prefix-cache code serves MoE unchanged, while every
+forward is delegated to transformers-mblt. Each request keeps its own
+:class:`MobilintMixtureOfExpertsCache`; the forward binds it to the shared MXQs,
+saving whichever request's KV they held. Only the non-batch path exists: MoE
+releases cannot be compiled as batch MXQs.
 """
 
+import weakref
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -29,22 +32,37 @@ def is_mixture_of_experts_model(model: object) -> bool:
 class MbltMoECacheModel:
     """``cache_model`` handle that runs a transformers-mblt MoE model through its own ``forward``.
 
-    The worker passes the KV prefix length as ``cache_size`` on every call, so the
-    adapter keeps one :class:`MobilintMixtureOfExpertsCache` and rewinds its cursor
-    to ``cache_size`` before each forward. A KV snapshot is the list of every
-    shared MXQ's cache memory, in layer order.
+    The worker hands over the cache of the request about to run (:meth:`use_cache`)
+    and passes the KV prefix length as ``cache_size`` on every call; the adapter
+    rewinds that cache's cursor to ``cache_size`` before the forward.
     """
 
     def __init__(self, model: Any) -> None:
         if not is_mixture_of_experts_model(model):
             raise TypeError(f"{type(model).__name__} is not a Mobilint Mixture-of-Experts model.")
         self.model = model
-        self.cache = model.build_mobilint_cache(1)
+        self._cache_ref: Optional[weakref.ref] = None
         self.shared_mxq_models: list[Any] = list(model.get_shared_mxq_models())
         self.vocab_size = int(model.config.vocab_size)
         self.max_cache_size = min(
             int(shared.get_input_buffer_info()[0].max_cache_size) for shared in self.shared_mxq_models
         )
+
+    def new_cache(self) -> Any:
+        """Return an empty cache for one request."""
+        return self.model.build_mobilint_cache(1)
+
+    def use_cache(self, cache: Optional[Any]) -> None:
+        """Run the next infers on ``cache``; ``None`` (prefill-cost calibration) runs each on a fresh scratch cache.
+
+        Held weakly: a finished request's cache that nothing else keeps is freed, so its KV is never saved.
+        """
+        self._cache_ref = weakref.ref(cache) if cache is not None else None
+
+    @property
+    def cache(self) -> Any:
+        cache = self._cache_ref() if self._cache_ref is not None else None
+        return cache if cache is not None else self.new_cache()
 
     def get_model_output_shape(self) -> list[tuple[int, ...]]:
         """Report last-token logits, so prompt logprobs take the worker's 1-token microstep path."""
@@ -63,22 +81,12 @@ class MbltMoECacheModel:
         """
         del outputs
         embeds = inputs if isinstance(inputs, np.ndarray) else inputs[0]
-        self.cache.set_seq_length(int(cache_size))
+        cache = self.cache
+        cache.set_seq_length(int(cache_size))
         output = self.model(
             inputs_embeds=torch.from_numpy(np.ascontiguousarray(embeds, dtype=np.float32)),
-            past_key_values=self.cache,
+            past_key_values=cache,
             use_cache=True,
             logits_to_keep=1,
         )
         return [output.logits.numpy()]
-
-    def dump_cache_memory(self, cache_id: int = 0) -> list[Any]:
-        return [model.dump_cache_memory(cache_id) for model in self.shared_mxq_models]
-
-    def load_cache_memory(self, blobs: Sequence[Any], cache_id: int = 0) -> None:
-        if len(blobs) != len(self.shared_mxq_models):
-            raise ValueError(
-                f"MoE KV snapshot has {len(blobs)} layers, but the model has {len(self.shared_mxq_models)} shared MXQs."
-            )
-        for model, layer_blobs in zip(self.shared_mxq_models, blobs):
-            model.load_cache_memory(layer_blobs, cache_id)

@@ -24,7 +24,10 @@ keywords = [
 ]
 dependencies = [
     "vllm>=0.11.2,<=0.11.2",
-    "mblt-model-zoo[transformers]>=2.7.0",
+    # The worker keeps one transformers-mblt cache per request (portable caches, 0.3.0), and the Model Zoo release
+    # that forwards hf_transformers to transformers-mblt loads the same model classes.
+    "mblt-model-zoo[transformers]>=2.11.0",
+    "transformers-mblt>=0.3.0",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -51,10 +54,10 @@ Repository = "https://github.com/mobilint/vllm-mblt"
 qwen-asr = [
     "mblt-model-zoo[qwen-asr]>2.10.0",
 ]
-# Serving mobilint/Qwen3-30B-A3B (Mixture-of-Experts). transformers-mblt 0.2.0 runs the MoE engine; the Model
-# Zoo release that forwards hf_transformers to transformers-mblt keeps both from registering the same classes.
+# Serving mobilint/Qwen3-30B-A3B (Mixture-of-Experts). The base requirements now cover it; the extra is kept so
+# existing install commands keep working.
 qwen3-moe = [
-    "transformers-mblt>=0.2.0",
+    "transformers-mblt>=0.3.0",
     "mblt-model-zoo[transformers]>=2.11.0",
 ]
 
