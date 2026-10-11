@@ -4,6 +4,13 @@
 
 ### Changed
 
+- Text-only models now run every infer through the transformers-mblt forward instead of calling the MXQ directly:
+  the step's requests are joined with `MobilintCache.from_rows` and run in one batched forward, each on its own
+  cache from its own length. transformers-mblt binds the slots, splits inputs to the MXQ width, packs the batch,
+  spreads it across cards and reads the logits layout. Outputs are unchanged; offline throughput is the same on
+  Llama-3.2-1B-Batch16 (16 requests) and 3% higher on Llama-3.2-1B (4 requests). Image-text, audio-text and
+  Mixture-of-Experts models keep their current path for now. `VLLM_MBLT_DIRECT_INFER=1` keeps text models on the
+  direct MXQ path.
 - Every request now keeps its own transformers-mblt cache on the NPU slot it runs on, and the worker binds it
   before each infer. transformers-mblt records which cache's KV each slot holds and saves or restores it when
   another cache takes the slot, so the worker no longer calls `dump_cache_memory` / `load_cache_memory` itself
@@ -15,7 +22,7 @@
   - A new request whose prefix snapshot is still on its own slot takes that cache over, KV in place, instead of
     loading a copy.
   - Prefix snapshots are cache copies instead of raw dump blobs, for dense and Mixture-of-Experts models alike.
-- Requires `transformers-mblt>=0.3.0` and `mblt-model-zoo[transformers]>=2.11.0`.
+- Requires `transformers-mblt>=0.4.0` and `mblt-model-zoo[transformers]>=2.11.0`.
 - Finished-request prefix snapshots are also capped by host memory: at most
   `VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB` / `prefix_cache_max_host_mib` MiB (4096 by default), each counted as one
   slot's compiled KV buffers (256 MiB for a 4K-token Llama-3 slot, 192 MiB for Qwen3-30B-A3B). The count cap of 16
