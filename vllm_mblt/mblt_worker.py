@@ -2157,25 +2157,34 @@ class MbltWorker(WorkerBase):
     def _can_forward_through_model(self) -> bool:
         """Whether infers go through the transformers-mblt forward instead of the MXQ directly.
 
-        Text models, Mixture-of-Experts models and Qwen2-VL with a plain text MXQ do, and so does Qwen3-VL:
-        non-batch with any text MXQ layout, batch with a RoPE-input text MXQ (the only layout the batched deepstack
-        forward takes). Audio-text models still feed the MXQ themselves. ``VLLM_MBLT_DIRECT_INFER=1`` keeps every
-        model on the direct MXQ path.
+        Text models, Mixture-of-Experts models, and Qwen2-VL and Qwen3-ASR with a plain text MXQ do, and so does
+        Qwen3-VL: non-batch with any text MXQ layout, batch with a RoPE-input text MXQ (the only layout the batched
+        deepstack forward takes). ``VLLM_MBLT_DIRECT_INFER=1`` keeps every model on the direct MXQ path.
         """
         if os.getenv("VLLM_MBLT_DIRECT_INFER", "0") in _TRUE_ENV_VALUES:
             return False
         if isinstance(self.cache_model, MbltMoECacheModel):
             return True
-        model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)
-        if model_type == "mobilint-qwen3_asr":
-            return False
         if self._supports_deepstack_input():
             return not self._is_batch_model() or self._text_mxq_uses_rope_input()
         return len(self._cache_model_input_shapes(self._get_cache_model())) == 1
 
+    def _is_audio_text_model(self) -> bool:
+        model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)
+        return model_type == "mobilint-qwen3_asr"
+
     def _forward_model(self) -> Any:
-        """What ``_forward_rows`` calls: an image-text model's text decoder, which takes the merged embeddings."""
-        return self._language_model() if self._is_multimodal_model() else self.model
+        """What ``_forward_rows`` calls: the text decoder of an image-text or audio-text model, which takes the merged
+        embeddings, else the causal LM itself.
+
+        Qwen3-ASR's decoder sits under its thinker; given a plain request cache rather than a beam cache, it decodes
+        one sequence like a text model.
+        """
+        if self._is_multimodal_model():
+            return self._language_model()
+        if self._is_audio_text_model():
+            return self.model.thinker.model
+        return self.model
 
     def _vl_forward_inputs(
         self,

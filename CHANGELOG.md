@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Qwen3-ASR now runs through the transformers-mblt forward too: each step calls the thinker's text decoder with the
+  merged audio-text embeddings on the request's plain cache, which it decodes as one sequence. Transcriptions and
+  their speed are unchanged.
 - Mixture-of-Experts models (Qwen3-30B-A3B) now run through the same `_forward_rows` route as the other models:
   the request's own `MobilintMixtureOfExpertsCache` goes to the model forward directly (it cannot be joined), and the
   forward keeps its own prefill split, which the shared MXQs' width requires. Outputs stay within the model's

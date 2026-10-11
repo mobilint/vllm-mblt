@@ -148,7 +148,8 @@ def test_calibration_before_any_request_runs_on_a_scratch_cache() -> None:
     [
         ({}, True),
         ({"env": "1"}, False),
-        ({"model_type": "mobilint-qwen3_asr"}, False),
+        ({"model_type": "mobilint-qwen3_asr"}, True),
+        ({"model_type": "mobilint-qwen3_asr", "inputs": 2}, False),
         ({"inputs": 2}, False),
         ({"moe": True}, True),
         ({"qwen3_vl": True}, True),
@@ -159,6 +160,7 @@ def test_calibration_before_any_request_runs_on_a_scratch_cache() -> None:
         "text",
         "env-direct",
         "audio-text",
+        "audio-text-extra-mxq-inputs",
         "extra-mxq-inputs",
         "moe",
         "qwen3-vl-non-batch",
@@ -253,3 +255,19 @@ def test_a_mixture_of_experts_step_runs_on_the_request_cache_with_the_model_s_ow
     assert call["past_key_values"] is worker.req_states["moe"].kv_cache  # not a joined view
     assert "npu_prefill_chunk_size" not in call
     assert call["starts"] == [7]
+
+
+def test_an_audio_text_step_runs_on_the_thinker_s_text_decoder() -> None:
+    worker = _make_worker(max_batch_size=1)
+    decoder = _RecordingTextDecoder()
+    worker.model = SimpleNamespace(thinker=SimpleNamespace(model=decoder))
+    worker.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="mobilint-qwen3_asr"))
+    worker._is_multimodal_model = lambda: False
+    _activate(worker, "asr", None, 9)
+
+    logits = worker._infer_logits(np.ones((4, 3), dtype=np.float32), None, cache_size=9)
+
+    (call,) = decoder.calls
+    assert call["past_key_values"] is worker.req_states["asr"].kv_cache  # a plain cache: one sequence, no beams
+    assert call["starts"] == [9] and "position_ids" not in call
+    assert logits.shape == (VOCAB,)
