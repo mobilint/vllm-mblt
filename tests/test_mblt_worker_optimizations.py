@@ -1659,7 +1659,7 @@ class TestMbltWorkerOptimizations:
 
         calls: list[tuple[tuple[int, int, int], ...]] = []
 
-        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids):
+        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids, keep_sequence_logits=None):
             calls.append(
                 tuple(
                     (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
@@ -1710,7 +1710,7 @@ class TestMbltWorkerOptimizations:
 
         calls: list[tuple[tuple[int, int, int], ...]] = []
 
-        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids):
+        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids, keep_sequence_logits=None):
             calls.append(
                 tuple(
                     (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
@@ -1773,7 +1773,7 @@ class TestMbltWorkerOptimizations:
         def load_snapshot(_req_id, req_state, **_kwargs):
             return int(req_state.num_computed_tokens)
 
-        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids):
+        def infer_chunk(input_embeds_batch, cache_sizes, cache_ids, keep_sequence_logits=None):
             chunk_calls.extend(
                 (int(input_embeds.shape[0]), int(cache_size), int(cache_id))
                 for input_embeds, cache_size, cache_id in zip(input_embeds_batch, cache_sizes, cache_ids)
@@ -1850,7 +1850,7 @@ class TestMbltWorkerOptimizations:
         }
 
         worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
-        worker._infer_logits_batch_with_sequence = lambda input_embeds_batch, cache_sizes, cache_ids: [
+        worker._infer_logits_batch_with_sequence = lambda input_embeds_batch, cache_sizes, cache_ids, **_kwargs: [
             InferenceLogits(last_token_logits=np.zeros(16, dtype=np.float32), full_sequence_logits=None)
             for _ in input_embeds_batch
         ]

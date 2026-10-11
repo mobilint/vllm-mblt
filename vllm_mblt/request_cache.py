@@ -16,6 +16,11 @@ from transformers_mblt.utils.cache_residency import bind_cacheless
 from transformers_mblt.utils.cache_utils import MobilintCache
 
 
+def join_request_caches(caches: Sequence[Any]) -> Any:
+    """The batch cache a forward over these requests runs on: their own rows, joined without copying."""
+    return MobilintCache.from_rows(caches)
+
+
 class RequestCacheSlots:
     """Builds request caches on the worker's NPU slots and binds them around each infer.
 

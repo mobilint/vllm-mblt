@@ -32,7 +32,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
 from vllm_mblt.moe_runtime import MbltMoECacheModel, is_mixture_of_experts_model
-from vllm_mblt.request_cache import RequestCacheSlots
+from vllm_mblt.request_cache import RequestCacheSlots, join_request_caches
 from vllm_mblt.runtime_cache import (
     KVBlockIds,
     MbltRuntimeCacheManager,
@@ -2114,6 +2114,76 @@ class MbltWorker(WorkerBase):
         expected_shape = tuple(input_seq_len if dim == -1 else dim for dim in output_shape)
         return output_buffers[0].shape == expected_shape
 
+    def _can_forward_through_model(self) -> bool:
+        """Whether a text model's infers go through the transformers-mblt forward instead of the MXQ directly.
+
+        So far only text-only models do: image-text and audio-text models feed extra MXQ inputs (deepstack, RoPE)
+        the worker still builds itself, and a Mixture-of-Experts adapter already runs the forward.
+        ``VLLM_MBLT_DIRECT_INFER=1`` keeps every model on the direct MXQ path.
+        """
+        if os.getenv("VLLM_MBLT_DIRECT_INFER", "0") in _TRUE_ENV_VALUES:
+            return False
+        if isinstance(self.cache_model, MbltMoECacheModel) or self._is_multimodal_model():
+            return False
+        model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)
+        return model_type != "mobilint-qwen3_asr" and len(self._cache_model_input_shapes(self._get_cache_model())) == 1
+
+    def _forward_rows(
+        self,
+        slot_ids: Sequence[Optional[int]],
+        cache_sizes: Sequence[int],
+        input_embeds_batch: Sequence[np.ndarray],
+        keep_sequence_logits: Sequence[bool],
+    ) -> list[InferenceLogits]:
+        """Run one step of several requests through the model's forward, each on its own cache.
+
+        Row ``i`` continues ``slot_ids[i]``'s request cache from ``cache_sizes[i]`` tokens (rewinding it if needed).
+        transformers-mblt binds the caches to their NPU slots, splits long inputs to the MXQ width, packs the batch
+        and advances every cache. Per-position logits come back only for rows that ask for them and only from a
+        full-logits MXQ; the others get their last-token logits.
+        """
+        caches = []
+        for slot_id, cache_size in zip(slot_ids, cache_sizes):
+            cache = self._slot_cache(slot_id)
+            if cache is None:  # prefill-cost calibration, before any request
+                cache = self.request_caches.new_cache(self._slot_key(slot_id))
+            if int(cache_size) > cache.get_seq_length():
+                raise RuntimeError(
+                    f"Cannot infer from position {cache_size}: the request's cache holds "
+                    f"{cache.get_seq_length()} tokens."
+                )
+            cache.set_seq_length(int(cache_size))
+            caches.append(cache)
+
+        lengths = [int(embeds.shape[0]) for embeds in input_embeds_batch]
+        keep_all = any(keep_sequence_logits) and self._runtime_output_logits_mode(max(lengths)) == "full_sequence"
+        rows, width = len(lengths), max(lengths)
+        inputs_embeds = torch.zeros((rows, width, int(input_embeds_batch[0].shape[-1])), dtype=torch.float32)
+        attention_mask = torch.zeros((rows, width), dtype=torch.long)
+        for row, embeds in enumerate(input_embeds_batch):
+            inputs_embeds[row, : lengths[row]] = torch.from_numpy(np.ascontiguousarray(embeds, dtype=np.float32))
+            attention_mask[row, : lengths[row]] = 1
+        with torch.no_grad():
+            output = self.model(
+                inputs_embeds=inputs_embeds,
+                # A single row needs no mask: a batch MXQ makes one up, a non-batch MXQ takes the single-row path.
+                attention_mask=attention_mask if rows > 1 else None,
+                past_key_values=join_request_caches(caches),
+                use_cache=True,
+                logits_to_keep=0 if keep_all else 1,
+            )
+        logits = output.logits.reshape(rows, -1, output.logits.shape[-1]).to(torch.float32).numpy()
+        results = []
+        for row, length in enumerate(lengths):
+            row_logits = logits[row, :length] if keep_all else logits[row, -1:]
+            results.append(
+                InferenceLogits(
+                    last_token_logits=row_logits[-1],
+                    full_sequence_logits=row_logits if keep_all and keep_sequence_logits[row] else None,
+                )
+            )
+        return results
+
     def _infer_logits(
         self,
         input_embeds: np.ndarray,
@@ -2121,6 +2191,8 @@ class MbltWorker(WorkerBase):
         cache_size: int,
         rope_embeds: Optional[np.ndarray] = None,
     ) -> np.ndarray:
+        if getattr(self, "_forward_through_model", False):
+            return self._forward_rows([None], [cache_size], [input_embeds], [False])[0].last_token_logits
         cache_model = self._get_cache_model()
         infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
         output_buffers = self._infer_output_buffers
@@ -2156,7 +2228,10 @@ class MbltWorker(WorkerBase):
         deepstack_embeds: Optional[np.ndarray],
         cache_size: int,
         rope_embeds: Optional[np.ndarray] = None,
+        keep_sequence_logits: bool = True,
     ) -> InferenceLogits:
+        if getattr(self, "_forward_through_model", False):
+            return self._forward_rows([None], [cache_size], [input_embeds], [keep_sequence_logits])[0]
         cache_model = self._get_cache_model()
         infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
         output_buffers = self._infer_output_buffers
@@ -2280,11 +2355,15 @@ class MbltWorker(WorkerBase):
         cache_ids: list[int],
         deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
         rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
+        keep_sequence_logits: Optional[list[bool]] = None,
     ) -> list[InferenceLogits]:
         if not input_embeds_batch:
             return []
         if not (len(input_embeds_batch) == len(cache_sizes) == len(cache_ids)):
             raise RuntimeError("Batched infer inputs, cache sizes, and cache IDs must have identical lengths.")
+        if getattr(self, "_forward_through_model", False):
+            keep = [True] * len(input_embeds_batch) if keep_sequence_logits is None else keep_sequence_logits
+            return self._forward_rows(cache_ids, cache_sizes, input_embeds_batch, keep)
 
         groups: dict[int, list[tuple[int, int]]] = {}
         models: dict[int, Any] = {}
@@ -2438,6 +2517,7 @@ class MbltWorker(WorkerBase):
                     input_embeds_batch=chunk_embeds_batch,
                     cache_sizes=chunk_cache_sizes,
                     cache_ids=chunk_cache_ids,
+                    keep_sequence_logits=[state.full_sequence_logits is not None for state in batch_states],
                     **infer_kwargs,
                 )
                 for state, chunk_embeds, inference_logits in zip(batch_states, chunk_embeds_batch, logits_batch):
@@ -3574,6 +3654,8 @@ class MbltWorker(WorkerBase):
             cache_model_slots=len(cache_models),
             cache_slots_per_model=getattr(self.cache_backend, "k_per_model", self.max_batch_size),
         )
+        self._forward_through_model = self._can_forward_through_model()
+        self._log_init_stage("load_model:infer_route", route="model forward" if self._forward_through_model else "MXQ")
         self._reset_cache_slots()
         self._infer_output_buffers = None
         self._calibrate_prefix_cache_prefill_costs()
@@ -4117,6 +4199,7 @@ class MbltWorker(WorkerBase):
                         deepstack_embeds,
                         cache_size=cache_size,
                         rope_embeds=rope_embeds,
+                        keep_sequence_logits=self._num_prompt_logprobs(req_state.sampling_params) is not None,
                     )
                 prompt_logprob_pos_before = req_state.next_prompt_logprob_pos
                 self._get_completed_prompt_logprobs_tensors_for_scheduler(
