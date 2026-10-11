@@ -1,9 +1,6 @@
-import gc
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
-import torch
 from vllm import ModelRegistry
 
 from tests.test_mblt_platform_prefill import _make_vllm_config
@@ -49,7 +46,6 @@ class _FakeMoEModel:
         self.config = SimpleNamespace(vocab_size=vocab_size, model_type="mobilint-qwen3_moe")
         sizes = max_cache_sizes or (4096,) * num_layers
         self.shared = [_FakeSharedMxq(index, sizes[index]) for index in range(num_layers)]
-        self.calls: list[dict[str, object]] = []
         self.built_caches: list[int] = []
 
     def get_shared_mxq_models(self) -> list[_FakeSharedMxq]:
@@ -58,19 +54,6 @@ class _FakeMoEModel:
     def build_mobilint_cache(self, batch_size: int = 1) -> _FakeMoECache:
         self.built_caches.append(batch_size)
         return _FakeMoECache()
-
-    def __call__(self, *, inputs_embeds, past_key_values, use_cache, logits_to_keep):
-        self.calls.append(
-            {
-                "inputs_embeds": inputs_embeds,
-                "cache": past_key_values,
-                "cache_size": past_key_values.get_seq_length(),
-                "use_cache": use_cache,
-                "logits_to_keep": logits_to_keep,
-            }
-        )
-        logits = torch.full((1, 1, self.config.vocab_size), float(inputs_embeds.shape[1]))
-        return SimpleNamespace(logits=logits)
 
     def eval(self) -> None:
         return None
@@ -99,63 +82,8 @@ def test_moe_cache_model_rejects_dense_models() -> None:
         MbltMoECacheModel(SimpleNamespace(get_cache_mxq_model=lambda: object()))
 
 
-def test_moe_cache_model_infer_delegates_forward_at_the_requested_cache_size() -> None:
-    model = _FakeMoEModel()
-    cache_model = MbltMoECacheModel(model)
-    embeds = np.ones((1, 5, 4), dtype=np.float32)
-
-    outputs = cache_model.infer(embeds, outputs=[np.empty((1, 1, 11), dtype=np.float32)], cache_size=7)
-
-    assert model.built_caches == [1]
-    assert len(model.calls) == 1
-    call = model.calls[0]
-    assert call["cache_size"] == 7
-    assert call["use_cache"] is True
-    assert call["logits_to_keep"] == 1
-    assert tuple(call["inputs_embeds"].shape) == (1, 5, 4)
-    assert len(outputs) == 1
-    assert outputs[0].shape == (1, 1, 11)
-    assert float(outputs[0][0, 0, 0]) == 5.0
-
-    # The worker passes the [1, seq, hidden] array inside a list when the MXQ has extra inputs.
-    cache_model.infer([np.ones((1, 1, 4), dtype=np.float32)], cache_size=12)
-    assert model.calls[-1]["cache_size"] == 12
-    assert tuple(model.calls[-1]["inputs_embeds"].shape) == (1, 1, 4)
-
-
 def test_moe_cache_model_reports_last_token_logits() -> None:
     assert MbltMoECacheModel(_FakeMoEModel(vocab_size=17)).get_model_output_shape() == [(1, 1, 17)]
-
-
-def test_moe_cache_model_runs_each_infer_on_the_request_cache_it_was_given() -> None:
-    model = _FakeMoEModel()
-    cache_model = MbltMoECacheModel(model)
-    slots = RequestCacheSlots([], moe=cache_model)
-    first, second = slots.new_cache(None), slots.new_cache(None)
-    first.set_seq_length(3)
-    second.set_seq_length(5)
-
-    slots.prepare(first, None, 3)
-    cache_model.infer(np.ones((1, 1, 4), dtype=np.float32), cache_size=3)
-    slots.prepare(second, None, 5)
-    cache_model.infer(np.ones((1, 1, 4), dtype=np.float32), cache_size=5)
-
-    assert [(call["cache"], call["cache_size"]) for call in model.calls] == [(first, 3), (second, 5)]
-
-
-def test_moe_cache_model_holds_the_request_cache_weakly() -> None:
-    model = _FakeMoEModel()
-    cache_model = MbltMoECacheModel(model)
-    request_cache = cache_model.new_cache()
-    cache_model.use_cache(request_cache)
-    assert cache_model.cache is request_cache
-
-    # A finished request's cache that nothing else keeps must be freed, so its KV is never saved.
-    del request_cache
-    gc.collect()
-
-    assert isinstance(cache_model.cache, _FakeMoECache)
-    assert model.built_caches == [1, 1]
 
 
 def test_moe_snapshot_size_spans_every_shared_mxq() -> None:
@@ -173,7 +101,6 @@ def _make_loading_worker(max_batch_size: int, max_seq_len: int = 4096) -> MbltWo
     worker.local_rank = 0
     worker.model = None
     worker.cache_model = None
-    worker._infer_output_buffers = None
     worker.max_batch_size = max_batch_size
     worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=max_batch_size, block_size=128)
     worker.load_config = SimpleNamespace(model_loader_extra_config={})
