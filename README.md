@@ -444,13 +444,23 @@ Model artifacts are available through Mobilint model repositories such as the
 
 ## Cache Behavior
 
-`MbltWorker` uses snapshot-based KV cache reuse with these policies:
+Every request keeps its own transformers-mblt cache on the NPU slot it runs on,
+and the worker binds it before each infer. transformers-mblt records which
+cache's KV each slot holds and saves it to host memory when another cache takes
+the slot, so a request that loses its slot resumes from its own KV. On top of
+that, `MbltWorker` reuses KV prefixes across requests with these policies:
 
-- Event-driven dump, not every step.
-- Reuse live cache for same-request continuous decode.
-- Keep finished-session snapshots for prefix reuse.
-- Evict finished snapshots with an LRU cap of 16 sessions.
-- Load matched snapshots only when the worker-side cost model expects the
+- A finished request's cache becomes its prefix snapshot, without a dump. Its KV
+  is saved only when another cache takes the slot.
+- On a non-batch model, a request that loses the slot to another one is also
+  kept as a snapshot, so the next request can start from its prefix.
+- Finished snapshots are evicted LRU-first beyond 16, or beyond what fits the
+  host memory budget, whichever is fewer. Each snapshot holds one slot's
+  compiled KV buffers in host memory once saved (256 MiB for a 4K-token
+  Llama-3 slot); the budget is `VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB` /
+  `prefix_cache_max_host_mib`, 4096 MiB by default. The startup log reports
+  the resulting cap.
+- Matched snapshots are loaded only when the worker-side cost model expects the
   one-cache-id load to beat recomputing the matched prefix.
 
 The prefix-cache load threshold is enabled by default. During model warmup the
@@ -470,14 +480,11 @@ variables or equivalent model loader extra config keys:
 - `VLLM_MBLT_PREFIX_CACHE_CALIBRATE` defaults to enabled. Set `0` to skip
   startup prefill calibration.
 
-The worker also tracks how many tokens each live runtime cache (or batch
-`cache_id` slot) actually holds. A request may continue from a live cache
-without reloading only when that count matches the scheduler's
-`num_computed_tokens`. On a mismatch the worker logs a warning naming the
-request and `cache_id`, drops the ownership claim, and rebuilds the prefix
-instead of decoding against another sequence's KV. Seeing
-`MBLT runtime cache token count holds fewer tokens than the scheduler expects` in the log
-means measurements taken from that server should be re-checked.
+A request's cache holds exactly the tokens the worker computed for it. If it
+holds fewer than the scheduler's `num_computed_tokens`, the worker logs
+`MBLT request cache holds fewer tokens than the scheduler expects`, naming the
+request and `cache_id`, and recomputes the rest of the prefix. Seeing it in the
+log means measurements taken from that server should be re-checked.
 
 ### Sampling Penalties
 

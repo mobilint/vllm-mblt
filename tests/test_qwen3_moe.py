@@ -158,6 +158,14 @@ def test_moe_cache_model_holds_the_request_cache_weakly() -> None:
     assert model.built_caches == [1, 1]
 
 
+def test_moe_snapshot_size_spans_every_shared_mxq() -> None:
+    model = _FakeMoEModel(num_layers=3)
+    for shared in model.shared:
+        shared.get_cache_infos = lambda: [SimpleNamespace(size=4 * 2**20)]
+
+    assert RequestCacheSlots([], moe=MbltMoECacheModel(model)).kv_nbytes_per_cache() == 3 * 4 * 2**20
+
+
 def _make_loading_worker(max_batch_size: int, max_seq_len: int = 4096) -> MbltWorker:
     worker = MbltWorker.__new__(MbltWorker)
     worker.max_seq_len = max_seq_len
