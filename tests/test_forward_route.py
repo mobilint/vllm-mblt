@@ -15,7 +15,11 @@ VOCAB = 5
 
 
 class _RecordingModel:
-    """A transformers-mblt causal LM double: logits encode (row, position) so tests can tell them apart."""
+    """A transformers-mblt causal LM double: logits encode (row, position) so tests can tell them apart.
+
+    Like the transformers-mblt batched forward, ``logits_to_keep=1`` returns each row's last *valid* position
+    (padding excluded by ``attention_mask``), not the padded width's last column.
+    """
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -24,12 +28,15 @@ class _RecordingModel:
         cache = kwargs["past_key_values"]
         self.calls.append({**kwargs, "starts": [cache.get_seq_length(row) for row in range(len(cache.layers))]})
         rows, width = kwargs["inputs_embeds"].shape[:2]
+        mask = kwargs["attention_mask"]
+        lengths = [width] * rows if mask is None else mask.sum(dim=1).tolist()
         keep = width if kwargs["logits_to_keep"] == 0 else 1
-        logits = torch.zeros(rows, keep, VOCAB)
+        logits = torch.full((rows, keep, VOCAB), float("-inf"))
         for row in range(rows):
-            for position in range(keep):
-                logits[row, position, 0] = row
-                logits[row, position, 1] = position if keep > 1 else width - 1
+            positions = range(lengths[row]) if keep > 1 else [lengths[row] - 1]
+            for column, position in enumerate(positions):
+                logits[row, column, 0] = row
+                logits[row, column, 1] = position
         return SimpleNamespace(logits=logits)
 
 
@@ -68,6 +75,8 @@ def test_a_batch_step_runs_every_request_on_its_own_cache_in_one_forward() -> No
     assert call["inputs_embeds"][1].tolist() == [[2.0] * 3] * 3
     assert call["logits_to_keep"] == 1
     assert [output.last_token_logits[0] for output in outputs] == [0.0, 1.0]
+    # The 1-token row samples from its own token, not from the 3-wide batch's padding.
+    assert [output.last_token_logits[1] for output in outputs] == [0.0, 2.0]
     assert all(output.full_sequence_logits is None for output in outputs)
 
 
