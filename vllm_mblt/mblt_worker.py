@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from mblt_model_zoo.hf_transformers.utils.generation_utils import MobilintGenerationMixin
 from qbruntime import BatchParam
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+from transformers_mblt.utils.cache_utils import MobilintCache, MobilintDeepStackCache
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import SamplingParams
@@ -185,6 +186,9 @@ class RequestState:
     in_progress_prompt_logprobs: Optional[LogprobsTensors] = None
     # This request's KV: a transformers-mblt cache on the request's NPU slot (see vllm_mblt.request_cache).
     kv_cache: Optional[Any] = None
+    # Qwen3-VL with a RoPE-input text MXQ: the prompt's M-RoPE positions ``(3, prompt_len)``; generated tokens
+    # continue at ``index + mrope_position_delta``.
+    prompt_position_ids: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -466,13 +470,18 @@ class MbltWorker(WorkerBase):
     def _reset_cache_slots(self) -> None:
         if isinstance(self.cache_model, MbltMoECacheModel):
             self.request_caches = RequestCacheSlots([], moe=self.cache_model)
-        elif self._is_batch_model():
-            self.request_caches = RequestCacheSlots(
-                self._get_cache_models(),
-                max(1, int(getattr(self.cache_backend, "k_per_model", self.max_batch_size) or 1)),
-            )
         else:
-            self.request_caches = RequestCacheSlots([self._get_cache_model()])
+            cache_cls, cache_kwargs = MobilintCache, {}
+            deepstack_cache_kwargs = getattr(self._language_model(), "get_mobilint_cache_kwargs", None)
+            if self._supports_deepstack_input() and callable(deepstack_cache_kwargs):
+                # Qwen3-VL decodes on a deepstack cache, sized by its text decoder.
+                cache_cls, cache_kwargs = MobilintDeepStackCache, deepstack_cache_kwargs()
+            if self._is_batch_model():
+                models = self._get_cache_models()
+                k_per_model = max(1, int(getattr(self.cache_backend, "k_per_model", self.max_batch_size) or 1))
+            else:
+                models, k_per_model = [self._get_cache_model()], 1
+            self.request_caches = RequestCacheSlots(models, k_per_model, cache_cls=cache_cls, cache_kwargs=cache_kwargs)
         self._slot_caches = {}
         self.runtime_cache.enable_prefix_caching = self._prefix_caching_enabled()
         self.runtime_cache.reset_slots(max_batch_size=self.max_batch_size)
@@ -1355,17 +1364,19 @@ class MbltWorker(WorkerBase):
             return pieces[0]
         return np.concatenate(pieces, axis=1)
 
+    def _language_model(self) -> Any | None:
+        """The text decoder of an image-text model (its forward takes the merged embeddings), else None."""
+        get_language_model = getattr(self.model, "get_language_model", None)
+        language_model = get_language_model() if callable(get_language_model) else None
+        if language_model is None:
+            language_model = getattr(getattr(self.model, "model", None), "language_model", None)
+        return language_model
+
     def _get_qwen3_vl_rotary_embedding(self) -> Any | None:
         if not self._supports_deepstack_input():
             return None
 
-        language_model = None
-        get_language_model = getattr(self.model, "get_language_model", None)
-        if callable(get_language_model):
-            language_model = get_language_model()
-        if language_model is None:
-            language_model = getattr(getattr(self.model, "model", None), "language_model", None)
-
+        language_model = self._language_model()
         for attribute in ("_mobilint_rotary_emb", "rotary_emb"):
             rotary_emb = getattr(language_model, attribute, None)
             if callable(rotary_emb):
@@ -1388,6 +1399,18 @@ class MbltWorker(WorkerBase):
         mm_features: Optional[list[MultiModalFeatureSpec]],
         prompt_len: int,
     ) -> tuple[Optional[np.ndarray], int]:
+        position_ids, delta = self._build_prompt_position_ids(prompt_token_ids, mm_features, prompt_len)
+        if position_ids is None:
+            return None, 0
+        return self._build_rope_embeddings_from_position_ids(position_ids), delta
+
+    def _build_prompt_position_ids(
+        self,
+        prompt_token_ids: Optional[list[int]],
+        mm_features: Optional[list[MultiModalFeatureSpec]],
+        prompt_len: int,
+    ) -> tuple[Optional[torch.Tensor], int]:
+        """The prompt's M-RoPE positions ``(3, 1, prompt_len)`` and offset, for a RoPE-input Qwen3-VL text MXQ."""
         if not self._text_mxq_uses_rope_input():
             return None, 0
 
@@ -1396,8 +1419,7 @@ class MbltWorker(WorkerBase):
                 raise RuntimeError(
                     "Qwen3-VL 3-input text MXQ requires prompt_token_ids to build multimodal MRoPE positions."
                 )
-            position_ids = torch.arange(prompt_len, dtype=torch.long).view(1, 1, -1).expand(3, 1, -1)
-            return self._build_rope_embeddings_from_position_ids(position_ids), 0
+            return torch.arange(prompt_len, dtype=torch.long).view(1, 1, -1).expand(3, 1, -1), 0
 
         get_mrope_input_positions = getattr(self.model, "get_mrope_input_positions", None)
         if callable(get_mrope_input_positions) and mm_features:
@@ -1406,7 +1428,7 @@ class MbltWorker(WorkerBase):
             if position_ids.ndim == 2:
                 position_ids = position_ids.unsqueeze(1)
             delta = int(torch.as_tensor(mrope_delta).reshape(-1)[0].item())
-            return self._build_rope_embeddings_from_position_ids(position_ids), delta
+            return position_ids, delta
 
         input_ids = torch.as_tensor(prompt_token_ids, dtype=torch.long).view(1, -1)
         image_grids = []
@@ -1434,7 +1456,7 @@ class MbltWorker(WorkerBase):
                 video_grid_thw=torch.cat(video_grids, dim=0) if video_grids else None,
             )
             delta = int(torch.as_tensor(mrope_delta).reshape(-1)[0].item())
-            return self._build_rope_embeddings_from_position_ids(position_ids), delta
+            return position_ids, delta
 
         if mm_features:
             raise RuntimeError(
@@ -1442,8 +1464,26 @@ class MbltWorker(WorkerBase):
                 "model.get_rope_index() to build multimodal MRoPE positions."
             )
 
-        position_ids = torch.arange(input_ids.shape[1], dtype=torch.long).view(1, 1, -1).expand(3, 1, -1)
-        return self._build_rope_embeddings_from_position_ids(position_ids), 0
+        return torch.arange(input_ids.shape[1], dtype=torch.long).view(1, 1, -1).expand(3, 1, -1), 0
+
+    @staticmethod
+    def _row_position_ids(req_state: Optional[RequestState], start: int, end: int) -> torch.Tensor:
+        """M-RoPE positions ``(3, end - start)`` of a request's tokens ``[start, end)``.
+
+        Prompt tokens take the prompt's positions; generated tokens continue at ``index + mrope_position_delta``.
+        Without a request (prefill-cost calibration) the tokens are plain text at ``[start, end)``.
+        """
+        prompt_positions = None if req_state is None else req_state.prompt_position_ids
+        if prompt_positions is None:
+            return torch.arange(start, end, dtype=torch.long).expand(3, -1)
+        prompt_len = int(prompt_positions.shape[-1])
+        pieces = []
+        if start < prompt_len:
+            pieces.append(prompt_positions.reshape(3, prompt_len)[:, start : min(end, prompt_len)])
+        if end > prompt_len:
+            delta = int(req_state.mrope_position_delta)
+            pieces.append(torch.arange(max(start, prompt_len) + delta, end + delta, dtype=torch.long).expand(3, -1))
+        return torch.cat(pieces, dim=1) if len(pieces) > 1 else pieces[0]
 
     def _build_rope_input_embeds(
         self,
@@ -2115,18 +2155,65 @@ class MbltWorker(WorkerBase):
         return output_buffers[0].shape == expected_shape
 
     def _can_forward_through_model(self) -> bool:
-        """Whether a text model's infers go through the transformers-mblt forward instead of the MXQ directly.
+        """Whether infers go through the transformers-mblt forward instead of the MXQ directly.
 
-        So far only text-only models do: image-text and audio-text models feed extra MXQ inputs (deepstack, RoPE)
-        the worker still builds itself, and a Mixture-of-Experts adapter already runs the forward.
+        Text models and Qwen2-VL with a plain text MXQ do, and so does Qwen3-VL: non-batch with any text MXQ
+        layout, batch with a RoPE-input text MXQ (the only layout the batched deepstack forward takes). Audio-text
+        models still feed the MXQ themselves, and a Mixture-of-Experts adapter already runs the forward.
         ``VLLM_MBLT_DIRECT_INFER=1`` keeps every model on the direct MXQ path.
         """
         if os.getenv("VLLM_MBLT_DIRECT_INFER", "0") in _TRUE_ENV_VALUES:
             return False
-        if isinstance(self.cache_model, MbltMoECacheModel) or self._is_multimodal_model():
+        if isinstance(self.cache_model, MbltMoECacheModel):
             return False
         model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)
-        return model_type != "mobilint-qwen3_asr" and len(self._cache_model_input_shapes(self._get_cache_model())) == 1
+        if model_type == "mobilint-qwen3_asr":
+            return False
+        if self._supports_deepstack_input():
+            return not self._is_batch_model() or self._text_mxq_uses_rope_input()
+        return len(self._cache_model_input_shapes(self._get_cache_model())) == 1
+
+    def _forward_model(self) -> Any:
+        """What ``_forward_rows`` calls: an image-text model's text decoder, which takes the merged embeddings."""
+        return self._language_model() if self._is_multimodal_model() else self.model
+
+    def _vl_forward_inputs(
+        self,
+        slot_ids: Sequence[Optional[int]],
+        cache_sizes: Sequence[int],
+        lengths: Sequence[int],
+        attention_mask: torch.Tensor,
+        deepstack_batch: Optional[Sequence[Optional[np.ndarray]]],
+    ) -> dict[str, Any]:
+        """Qwen3-VL's extra forward inputs for left-padded rows: M-RoPE positions and deepstack features.
+
+        Positions come from each row's request (its prompt's M-RoPE positions, then ``index + delta``). The
+        deepstack features are the worker's dense ``(layers, tokens, hidden)`` rows, zero at text tokens; passing
+        every real token as "visual" rebuilds exactly that dense input inside the forward.
+        """
+        kwargs: dict[str, Any] = {}
+        rows, width = attention_mask.shape
+        if self._text_mxq_uses_rope_input():
+            position_ids = torch.zeros((3, rows, width), dtype=torch.long)
+            for row, (slot_id, start, length) in enumerate(zip(slot_ids, cache_sizes, lengths)):
+                entry = self._slot_caches.get(self._slot_key(slot_id))
+                req_state = None if entry is None else self.req_states.get(entry[0])
+                row_positions = self._row_position_ids(req_state, int(start), int(start) + length)
+                position_ids[:, row, width - length :] = row_positions
+            kwargs["position_ids"] = position_ids
+        if deepstack_batch is not None and any(deepstack is not None for deepstack in deepstack_batch):
+            layers, hidden = next(deepstack.shape for deepstack in deepstack_batch if deepstack is not None)[::2]
+            per_row = [
+                torch.zeros((layers, length, hidden), dtype=torch.float32)
+                if deepstack is None
+                else torch.from_numpy(np.ascontiguousarray(deepstack, dtype=np.float32))
+                for deepstack, length in zip(deepstack_batch, lengths)
+            ]
+            kwargs["visual_pos_masks"] = attention_mask.bool()
+            kwargs["deepstack_visual_embeds"] = [
+                torch.cat([row[layer] for row in per_row], dim=0) for layer in range(layers)
+            ]
+        return kwargs
 
     def _forward_rows(
         self,
@@ -2134,6 +2221,7 @@ class MbltWorker(WorkerBase):
         cache_sizes: Sequence[int],
         input_embeds_batch: Sequence[np.ndarray],
         keep_sequence_logits: Sequence[bool],
+        deepstack_batch: Optional[Sequence[Optional[np.ndarray]]] = None,
     ) -> list[InferenceLogits]:
         """Run one step of several requests through the model's forward, each on its own cache.
 
@@ -2166,16 +2254,26 @@ class MbltWorker(WorkerBase):
             start = width - lengths[row]
             inputs_embeds[row, start:] = torch.from_numpy(np.ascontiguousarray(embeds, dtype=np.float32))
             attention_mask[row, start:] = 1
+        extra = {}
+        if self._is_multimodal_model():
+            extra = self._vl_forward_inputs(slot_ids, cache_sizes, lengths, attention_mask, deepstack_batch)
         with torch.no_grad():
-            output = self.model(
+            output = self._forward_model()(
                 inputs_embeds=inputs_embeds,
                 # A single row needs no mask: a batch MXQ makes one up, a non-batch MXQ takes the single-row path.
                 attention_mask=attention_mask if rows > 1 else None,
                 past_key_values=join_request_caches(caches),
                 use_cache=True,
                 logits_to_keep=0 if keep_all else 1,
+                # vLLM already sized the step for the MXQ (chunked prefill): feed it in one infer, as the direct
+                # path did, rather than re-splitting it at the model's own prefill chunk size. The split changes
+                # the NPU's numerics as well as the number of infers.
+                npu_prefill_chunk_size=width,
+                **extra,
             )
-        logits = output.logits.reshape(rows, -1, output.logits.shape[-1]).to(torch.float32).numpy()
+        # A causal LM returns ``logits``; an image-text model's text decoder returns them as ``last_hidden_state``.
+        raw = output.logits if getattr(output, "logits", None) is not None else output.last_hidden_state
+        logits = raw.reshape(rows, -1, raw.shape[-1]).to(torch.float32).numpy()
         results = []
         for row, length in enumerate(lengths):
             # With ``logits_to_keep=0`` the forward returns each row's own positions from column 0 (padding dropped by
@@ -2193,7 +2291,8 @@ class MbltWorker(WorkerBase):
         rope_embeds: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if getattr(self, "_forward_through_model", False):
-            return self._forward_rows([None], [cache_size], [input_embeds], [False])[0].last_token_logits
+            deepstack = None if deepstack_embeds is None else [deepstack_embeds]
+            return self._forward_rows([None], [cache_size], [input_embeds], [False], deepstack)[0].last_token_logits
         cache_model = self._get_cache_model()
         infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
         output_buffers = self._infer_output_buffers
@@ -2232,7 +2331,8 @@ class MbltWorker(WorkerBase):
         keep_sequence_logits: bool = True,
     ) -> InferenceLogits:
         if getattr(self, "_forward_through_model", False):
-            return self._forward_rows([None], [cache_size], [input_embeds], [keep_sequence_logits])[0]
+            deepstack = None if deepstack_embeds is None else [deepstack_embeds]
+            return self._forward_rows([None], [cache_size], [input_embeds], [keep_sequence_logits], deepstack)[0]
         cache_model = self._get_cache_model()
         infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
         output_buffers = self._infer_output_buffers
@@ -2364,7 +2464,7 @@ class MbltWorker(WorkerBase):
             raise RuntimeError("Batched infer inputs, cache sizes, and cache IDs must have identical lengths.")
         if getattr(self, "_forward_through_model", False):
             keep = [True] * len(input_embeds_batch) if keep_sequence_logits is None else keep_sequence_logits
-            return self._forward_rows(cache_ids, cache_sizes, input_embeds_batch, keep)
+            return self._forward_rows(cache_ids, cache_sizes, input_embeds_batch, keep, deepstack_embeds_batch)
 
         groups: dict[int, list[tuple[int, int]]] = {}
         models: dict[int, Any] = {}
@@ -3903,10 +4003,16 @@ class MbltWorker(WorkerBase):
             prompt_deepstack_embeds_np = (
                 self._to_cpu_float32_numpy(prompt_deepstack_embeds) if prompt_deepstack_embeds is not None else None
             )
-            prompt_rope_embeds_np, mrope_position_delta = self._build_prompt_rope_embeds(
+            prompt_position_ids, mrope_position_delta = self._build_prompt_position_ids(
                 new_req.prompt_token_ids,
                 new_req.mm_features,
                 int(prompt_embeds_np.shape[0]),
+            )
+            # The forward builds RoPE from positions itself; only the direct MXQ path takes the embeddings.
+            prompt_rope_embeds_np = (
+                None
+                if prompt_position_ids is None or getattr(self, "_forward_through_model", False)
+                else self._build_rope_embeddings_from_position_ids(prompt_position_ids)
             )
             cache_slot_id = self._assign_cache_slot(new_req.req_id) if self._is_batch_model() else None
 
@@ -3926,6 +4032,9 @@ class MbltWorker(WorkerBase):
                 prompt_embeds=prompt_embeds_np,
                 prompt_deepstack_embeds=prompt_deepstack_embeds_np,
                 prompt_rope_embeds=prompt_rope_embeds_np,
+                prompt_position_ids=(
+                    None if prompt_position_ids is None else prompt_position_ids.reshape(3, -1).contiguous()
+                ),
                 mrope_position_delta=mrope_position_delta,
                 is_multimodal=bool(new_req.mm_features),
                 prompt_len=int(prompt_embeds_np.shape[0]),

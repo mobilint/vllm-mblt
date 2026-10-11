@@ -4,6 +4,13 @@
 
 ### Changed
 
+- Qwen2-VL and Qwen3-VL now run through the transformers-mblt forward as well, calling the text decoder with the
+  merged embeddings. Each request keeps its prompt's M-RoPE positions and passes them as `position_ids`
+  (transformers-mblt builds the RoPE input), and Qwen3-VL passes its deepstack features with them; Qwen3-VL request
+  caches are `MobilintDeepStackCache`. Covered: Qwen3-VL non-batch MXQs, Qwen3-VL batch MXQs with a RoPE input, and
+  Qwen2-VL with a plain text MXQ; other layouts keep the direct path. Every forward takes the step as vLLM sized it
+  (`npu_prefill_chunk_size` = the step's width), as the direct path did, instead of re-splitting it at the model's
+  prefill chunk size, which also changes the NPU's numerics.
 - Text-only models now run every infer through the transformers-mblt forward instead of calling the MXQ directly:
   the step's requests are joined with `MobilintCache.from_rows` and run in one batched forward, each on its own
   cache from its own length. transformers-mblt binds the slots, splits inputs to the MXQ width, packs the batch,

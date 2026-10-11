@@ -444,10 +444,13 @@ Model artifacts are available through Mobilint model repositories such as the
 
 ## Cache Behavior
 
-Text-only models run each scheduled step through the transformers-mblt forward:
-the step's request caches are joined with `MobilintCache.from_rows` and run in
-one batched forward. Set `VLLM_MBLT_DIRECT_INFER=1` to call the MXQ directly
-instead, as image-text, audio-text and Mixture-of-Experts models still do.
+Text models, Qwen2-VL and Qwen3-VL run each scheduled step through the
+transformers-mblt forward: the step's request caches are joined with
+`MobilintCache.from_rows` and run in one batched forward (image-text models
+call their text decoder with the merged embeddings, M-RoPE `position_ids` and
+deepstack features). Set `VLLM_MBLT_DIRECT_INFER=1` to call the MXQ directly
+instead, as Qwen3-ASR, Mixture-of-Experts models and Qwen3-VL batch MXQs
+without a RoPE input still do.
 
 Every request keeps its own transformers-mblt cache on the NPU slot it runs on,
 and the worker binds it before each infer. transformers-mblt records which
