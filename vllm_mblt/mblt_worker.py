@@ -3107,6 +3107,10 @@ class MbltWorker(WorkerBase):
             raise RuntimeError(f"Batch execution requires a cache slot for req_id={req_id}.")
         slot_label = f" slot={slot_id}" if slot_id is not None else ""
         target_tokens = req_state.num_computed_tokens
+        previous = self._slot_caches.get(self._slot_key(slot_id))
+        if previous is not None and previous[0] != req_id:
+            # Publish the outgoing request's prefix first, so this request can start from it.
+            self._snapshot_switched_out_request(previous[0], next_req_id=req_id, print_debug=print_debug)
 
         if self._should_recompute_prompt_logprobs_from_start(req_state):
             if print_debug:
@@ -3152,16 +3156,10 @@ class MbltWorker(WorkerBase):
         req_state: RequestState,
         cache_size: int,
         slot_id: Optional[int] = None,
-        print_debug: bool = False,
     ) -> None:
         """Make this step's infers on the request's slot run on its cache, from ``cache_size`` tokens."""
-        previous = self._slot_caches.get(self._slot_key(slot_id))
         self._activate_request_cache(req_id, req_state, slot_id)
-        # Bind now rather than at the first infer: the request that held the slot is saved to host memory here,
-        # so the snapshot below copies it without another dump.
         self._prepare_slot(slot_id, cache_size)
-        if previous is not None and previous[0] != req_id:
-            self._snapshot_switched_out_request(previous[0], next_req_id=req_id, print_debug=print_debug)
 
     def _load_request_prefix(self, request: RuntimeCacheRequest, req_state: RequestState) -> RuntimeCacheLoadResult:
         """Choose where the request's KV prefix comes from: its own cache, a prefix snapshot, or a recompute."""
@@ -3259,17 +3257,23 @@ class MbltWorker(WorkerBase):
         self._ensure_prefix_cache_cost_model().observe_load(slot_id, (time.perf_counter() - start) * 1000.0)
 
     def _snapshot_switched_out_request(self, req_id: str, *, next_req_id: str, print_debug: bool = False) -> None:
-        """Keep the prefix of a request that just lost the non-batch slot, so other requests can start from it.
+        """Keep the prefix of a request that is about to lose the non-batch slot, so other requests can start from it.
 
-        Its own KV is safe either way: the slot's owner table saved it to the request's cache.
+        Its own KV is safe either way: the slot's owner table saves it to the request's cache when the next request
+        binds the slot.
         """
         if not self.runtime_cache.enable_prefix_caching:
             return
         req_state = self.req_states.get(req_id)
-        if req_state is None:
+        if req_state is None or req_state.kv_cache is None or req_state.kv_cache.get_seq_length() <= 0:
             return
         if not self.runtime_cache.should_dump_snapshot_after_step(req_id, req_state.num_computed_tokens):
             return
+        if req_state.kv_cache.is_resident:
+            # Save it from the slot now, which the next request's bind would do anyway; the copy then shares it.
+            start = time.perf_counter()
+            req_state.kv_cache.offload()
+            self._ensure_prefix_cache_cost_model().observe_dump(None, (time.perf_counter() - start) * 1000.0)
         dumped = self._dump_snapshot(
             req_id=req_id,
             req_state=req_state,
@@ -3911,7 +3915,7 @@ class MbltWorker(WorkerBase):
                     slot_id=slot_id,
                     print_debug=print_debug,
                 )
-                self._start_request_step(req_id, req_state, cache_size, slot_id=slot_id, print_debug=print_debug)
+                self._start_request_step(req_id, req_state, cache_size, slot_id=slot_id)
                 input_embeds = self._build_input_embeds(req_state, cache_size, scheduled_end)
                 deepstack_embeds = self._build_deepstack_input_embeds(req_state, cache_size, scheduled_end)
                 rope_embeds = self._build_rope_input_embeds(req_state, cache_size, scheduled_end)
@@ -4038,7 +4042,7 @@ class MbltWorker(WorkerBase):
                     req_state,
                     print_debug=print_debug,
                 )
-                self._start_request_step(req_id, req_state, cache_size, print_debug=print_debug)
+                self._start_request_step(req_id, req_state, cache_size)
                 scheduled_end = scheduled_end_positions[i]
                 input_embeds = self._build_input_embeds(req_state, cache_size, scheduled_end)
                 deepstack_embeds = self._build_deepstack_input_embeds(

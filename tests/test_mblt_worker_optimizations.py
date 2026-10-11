@@ -4194,7 +4194,7 @@ class TestMbltWorkerOptimizations:
         worker._start_request_step("live", live, 0)
         self._run_request_cache(worker, live, 8)
 
-        worker._start_request_step("other", other, 0)
+        worker._start_request_step("other", other, worker._load_snapshot_if_needed("other", other))
 
         # The slot's owner table saved "live" when "other" took the slot; the snapshot copies that save.
         assert model.dumps == [0]
@@ -4216,7 +4216,7 @@ class TestMbltWorkerOptimizations:
         # The scheduler view says 32 tokens, the cache only holds 8.
         live.num_computed_tokens = 32
 
-        worker._start_request_step("other", other, 0)
+        worker._start_request_step("other", other, worker._load_snapshot_if_needed("other", other))
 
         snapshot = worker.runtime_cache.get_snapshot("live")
         assert snapshot is not None
@@ -4231,7 +4231,7 @@ class TestMbltWorkerOptimizations:
         worker.req_states = {"live": live, "other": other}
         worker._start_request_step("live", live, 0)
 
-        worker._start_request_step("other", other, 0)
+        worker._start_request_step("other", other, worker._load_snapshot_if_needed("other", other))
 
         assert worker.kv_slot_models[0].dumps == []
         assert worker.runtime_cache.get_snapshot("live") is None
@@ -4267,7 +4267,7 @@ class TestMbltWorkerOptimizations:
         self._run_request_cache(worker, live, 128)
         live.num_computed_tokens = 256
         # Another request takes the slot, then "live" comes back.
-        worker._start_request_step("other", other, 0)
+        worker._start_request_step("other", other, worker._load_snapshot_if_needed("other", other))
         self._run_request_cache(worker, other, 4)
 
         cache_size = worker._load_snapshot_if_needed("live", live)

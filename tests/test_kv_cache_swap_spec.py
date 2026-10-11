@@ -123,6 +123,20 @@ class TestKvCacheSwapBehavior:
         assert worker.cache_model.dumps == [0, 0]
         assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]
 
+    def test_next_request_starts_from_the_prefix_the_switched_out_request_just_computed(self) -> None:
+        worker = _make_worker(block_size=4)
+        a_state = _make_request_state(worker, block_ids=([1, 2],), prompt_len=8)
+        _run(worker, "a", a_state, 8)
+        # b shares a's 8-token prompt, so the scheduler reports it as computed.
+        b_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+
+        assert _run(worker, "b", b_state, 9) == 8
+
+        # a was saved once when b took the slot, and b loaded that copy.
+        assert worker.cache_model.dumps == [0]
+        assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]
+        assert worker.runtime_cache.get_snapshot("a").num_tokens == 8
+
     def test_cache_miss_falls_back_to_recompute(self) -> None:
         worker = _make_worker(block_size=4)
         req_state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8)
