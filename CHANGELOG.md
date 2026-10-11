@@ -16,6 +16,10 @@
     loading a copy.
   - Prefix snapshots are cache copies instead of raw dump blobs, for dense and Mixture-of-Experts models alike.
 - Requires `transformers-mblt>=0.3.0` and `mblt-model-zoo[transformers]>=2.11.0`.
+- Finished-request prefix snapshots are also capped by host memory: at most
+  `VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB` / `prefix_cache_max_host_mib` MiB (4096 by default), each counted as one
+  slot's compiled KV buffers (256 MiB for a 4K-token Llama-3 slot, 192 MiB for Qwen3-30B-A3B). The count cap of 16
+  still applies; the startup log reports the resulting cap.
 
 ### Added
 

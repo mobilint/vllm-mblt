@@ -1,5 +1,6 @@
 """Fake NPU KV slots for worker tests: real transformers-mblt caches and owner table, fake MXQ dump/load."""
 
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from vllm_mblt.request_cache import RequestCacheSlots
@@ -8,11 +9,18 @@ from vllm_mblt.request_cache import RequestCacheSlots
 class FakeKVSlotModel:
     """An MXQ whose KV slots hold a label of what was written there, recording every dump and load."""
 
-    def __init__(self, name: str = "mxq") -> None:
+    def __init__(self, name: str = "mxq", kv_nbytes: int = 0) -> None:
         self.name = name
+        self.kv_nbytes = kv_nbytes
         self.slots: dict[int, Any] = {}
         self.dumps: list[int] = []
         self.loads: list[tuple[int, Any]] = []
+
+    def get_cache_infos(self) -> list[Any]:
+        """Two KV buffers splitting ``kv_nbytes``, as qbruntime reports one slot's compiled KV buffers."""
+        if not self.kv_nbytes:
+            raise AttributeError("get_cache_infos")
+        return [SimpleNamespace(size=self.kv_nbytes // 2), SimpleNamespace(size=self.kv_nbytes - self.kv_nbytes // 2)]
 
     def dump_cache_memory(self, cache_id: int = 0) -> list[Any]:
         self.dumps.append(int(cache_id))

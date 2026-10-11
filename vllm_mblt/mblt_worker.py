@@ -247,6 +247,38 @@ class NormalBatchChunkState:
     last_token_logits: Optional[np.ndarray] = None
 
 
+def _prefix_cache_config_value(config: object, name: str) -> object:
+    """Read a prefix-cache setting from the model loader extra config or the model kwargs/overrides."""
+    for root in (
+        getattr(getattr(config, "load_config", None), "model_loader_extra_config", None),
+        getattr(config, "model_loader_extra_config", None),
+        getattr(getattr(config, "model_config", None), "model_kwargs", None),
+        getattr(getattr(config, "model_config", None), "hf_overrides", None),
+    ):
+        if isinstance(root, dict) and name in root:
+            return root[name]
+    return None
+
+
+DEFAULT_PREFIX_CACHE_MAX_HOST_MIB = 4096
+
+
+def _resolve_prefix_cache_max_host_mib(config: object) -> int:
+    """Host memory (MiB) finished-request prefix snapshots may take: ``VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB``."""
+    value = os.getenv("VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB")
+    if value is None:
+        value = _prefix_cache_config_value(config, "prefix_cache_max_host_mib")
+    try:
+        return DEFAULT_PREFIX_CACHE_MAX_HOST_MIB if value in (None, "") else max(0, int(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring prefix_cache_max_host_mib=%r: not an integer number of MiB. Using %d MiB.",
+            value,
+            DEFAULT_PREFIX_CACHE_MAX_HOST_MIB,
+        )
+        return DEFAULT_PREFIX_CACHE_MAX_HOST_MIB
+
+
 class PrefixCacheCostModel:
     """Worker-side policy for deciding if a matched runtime snapshot is worth loading."""
 
@@ -275,25 +307,14 @@ class PrefixCacheCostModel:
 
     @classmethod
     def from_config(cls, config: object, *, block_size: int) -> "PrefixCacheCostModel":
-        def _config_value(name: str) -> object:
-            for root in (
-                getattr(getattr(config, "load_config", None), "model_loader_extra_config", None),
-                getattr(config, "model_loader_extra_config", None),
-                getattr(getattr(config, "model_config", None), "model_kwargs", None),
-                getattr(getattr(config, "model_config", None), "hf_overrides", None),
-            ):
-                if isinstance(root, dict) and name in root:
-                    return root[name]
-            return None
-
         auto_value = os.getenv("VLLM_MBLT_PREFIX_CACHE_AUTO_THRESHOLD")
         if auto_value is None:
-            auto_value = _config_value("prefix_cache_auto_threshold")
+            auto_value = _prefix_cache_config_value(config, "prefix_cache_auto_threshold")
         auto_enabled = True if auto_value is None else str(auto_value) not in {"0", "false", "FALSE", "False"}
 
         manual_value = os.getenv("VLLM_MBLT_PREFIX_CACHE_MIN_HIT_TOKENS")
         if manual_value is None:
-            manual_value = _config_value("prefix_cache_min_hit_tokens")
+            manual_value = _prefix_cache_config_value(config, "prefix_cache_min_hit_tokens")
         try:
             manual_min_hit_tokens = None if manual_value in (None, "") else int(manual_value)
         except (TypeError, ValueError):
@@ -301,7 +322,7 @@ class PrefixCacheCostModel:
 
         margin_value = os.getenv("VLLM_MBLT_PREFIX_CACHE_LOAD_MARGIN")
         if margin_value is None:
-            margin_value = _config_value("prefix_cache_load_margin")
+            margin_value = _prefix_cache_config_value(config, "prefix_cache_load_margin")
         try:
             margin = cls.DEFAULT_MARGIN if margin_value in (None, "") else float(margin_value)
         except (TypeError, ValueError):
@@ -455,6 +476,26 @@ class MbltWorker(WorkerBase):
         self._slot_caches = {}
         self.runtime_cache.enable_prefix_caching = self._prefix_caching_enabled()
         self.runtime_cache.reset_slots(max_batch_size=self.max_batch_size)
+        self.runtime_cache.max_finished_snapshots = self._finished_snapshot_cap()
+
+    def _finished_snapshot_cap(self) -> int:
+        """How many finished-request prefix snapshots fit the host memory budget, up to the count cap.
+
+        Every snapshot ends up holding one slot's KV in host memory (256 MiB for a 4K-token Llama-3 slot,
+        48 x 4 MiB for Qwen3-30B-A3B), so the budget divided by that size bounds how many can be kept.
+        """
+        cap = self.MAX_FINISHED_CACHE_SNAPSHOTS
+        budget_mib = _resolve_prefix_cache_max_host_mib(self.vllm_config)
+        per_snapshot = self.request_caches.kv_nbytes_per_cache()
+        if per_snapshot:
+            cap = min(cap, budget_mib * 2**20 // per_snapshot)
+        logger.info(
+            "MBLT keeps up to %d finished prefix snapshots (%s MiB each, budget %d MiB).",
+            cap,
+            "unknown" if not per_snapshot else f"{per_snapshot / 2**20:.0f}",
+            budget_mib,
+        )
+        return cap
 
     def _prefix_caching_enabled(self) -> bool:
         # MbltPlatform.check_and_update_config turns an unset (None) value

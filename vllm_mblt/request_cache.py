@@ -55,6 +55,18 @@ class RequestCacheSlots:
             return self.moe.new_cache()
         return MobilintCache(self.models, per_model_batch=self.k_per_model, slots=[self._row_slot(slot_id)])
 
+    def kv_nbytes_per_cache(self) -> Optional[int]:
+        """Host bytes one request's KV takes once saved: the compiled KV buffers of one slot.
+
+        A Mixture-of-Experts cache spans every shared MXQ. ``None`` when the MXQs do not report their buffers.
+        """
+        models = self.moe.shared_mxq_models if self.moe is not None else self.models[:1]
+        try:
+            total = sum(int(info.size) for model in models for info in model.get_cache_infos())
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return total or None
+
     def holds_slot(self, cache: Any, slot_id: Optional[int]) -> bool:
         """Whether ``cache`` sits on ``slot_id`` and the slot holds its KV right now."""
         if self.moe is not None:

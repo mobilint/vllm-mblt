@@ -8,7 +8,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm_mblt.mblt_worker import MbltWorker, RequestState
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager
 
-from .kv_slot_fakes import attach_request_caches, make_snapshot_cache
+from .kv_slot_fakes import FakeKVSlotModel, attach_request_caches, make_snapshot_cache
 
 
 def _make_worker(
@@ -350,3 +350,48 @@ class TestKvCacheSwapWithoutPrefixCaching:
 
         assert worker._load_snapshot_if_needed("new", new_state) == 8
         assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]
+
+
+class TestFinishedSnapshotHostBudget:
+    """Finished snapshots are capped by host memory as well as by count."""
+
+    MIB = 2**20
+
+    def _cap(self, monkeypatch, *, kv_mib: int, env: str | None = None, extra: dict | None = None) -> int:
+        worker = _make_worker()
+        attach_request_caches(worker, models=[FakeKVSlotModel(kv_nbytes=kv_mib * self.MIB)])
+        worker.vllm_config.load_config = SimpleNamespace(model_loader_extra_config=extra or {})
+        if env is None:
+            monkeypatch.delenv("VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB", env)
+        return worker._finished_snapshot_cap()
+
+    def test_default_budget_keeps_sixteen_256_mib_snapshots(self, monkeypatch) -> None:
+        assert self._cap(monkeypatch, kv_mib=256) == 16
+
+    def test_larger_snapshots_are_capped_by_the_default_budget(self, monkeypatch) -> None:
+        assert self._cap(monkeypatch, kv_mib=1024) == 4
+
+    def test_budget_comes_from_the_environment_or_extra_config(self, monkeypatch) -> None:
+        assert self._cap(monkeypatch, kv_mib=256, env="1024") == 4
+        assert self._cap(monkeypatch, kv_mib=256, extra={"prefix_cache_max_host_mib": 512}) == 2
+
+    def test_zero_budget_keeps_no_finished_snapshots(self, monkeypatch) -> None:
+        assert self._cap(monkeypatch, kv_mib=256, env="0") == 0
+
+    def test_unknown_snapshot_size_keeps_the_count_cap(self, monkeypatch) -> None:
+        assert self._cap(monkeypatch, kv_mib=0, env="1") == MbltWorker.MAX_FINISHED_CACHE_SNAPSHOTS
+
+    def test_invalid_budget_falls_back_to_the_default(self, monkeypatch) -> None:
+        assert self._cap(monkeypatch, kv_mib=1024, env="lots") == 4
+
+    def test_finished_snapshots_beyond_the_cap_are_dropped(self) -> None:
+        worker = _make_worker(block_size=4)
+        worker.runtime_cache.max_finished_snapshots = 1
+        for req_id, block in (("a", 1), ("b", 2)):
+            _run(worker, req_id, _make_request_state(worker, block_ids=([block],)), 4)
+            worker._finalize_finished_request(req_id)
+
+        assert worker.runtime_cache.get_snapshot("a") is None
+        assert worker.runtime_cache.get_snapshot("b") is not None
