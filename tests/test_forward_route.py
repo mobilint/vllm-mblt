@@ -17,8 +17,9 @@ VOCAB = 5
 class _RecordingModel:
     """A transformers-mblt causal LM double: logits encode (row, position) so tests can tell them apart.
 
-    Like the transformers-mblt batched forward, ``logits_to_keep=1`` returns each row's last *valid* position
-    (padding excluded by ``attention_mask``), not the padded width's last column.
+    ``logits_to_keep=1`` returns the batch's last column, as upstream transformers does, so a row whose last token is
+    not in that column would get a padding position. ``logits_to_keep=0`` returns each row's own positions from
+    column 0, as the transformers-mblt batched forward does (padding dropped by ``attention_mask``).
     """
 
     def __init__(self) -> None:
@@ -29,14 +30,16 @@ class _RecordingModel:
         self.calls.append({**kwargs, "starts": [cache.get_seq_length(row) for row in range(len(cache.layers))]})
         rows, width = kwargs["inputs_embeds"].shape[:2]
         mask = kwargs["attention_mask"]
-        lengths = [width] * rows if mask is None else mask.sum(dim=1).tolist()
-        keep = width if kwargs["logits_to_keep"] == 0 else 1
-        logits = torch.full((rows, keep, VOCAB), float("-inf"))
+        mask = torch.ones(rows, width, dtype=torch.long) if mask is None else mask
+        keep_all = kwargs["logits_to_keep"] == 0
+        logits = torch.full((rows, width if keep_all else 1, VOCAB), float("-inf"))
         for row in range(rows):
-            positions = range(lengths[row]) if keep > 1 else [lengths[row] - 1]
-            for column, position in enumerate(positions):
-                logits[row, column, 0] = row
-                logits[row, column, 1] = position
+            valid = [column for column in range(width) if mask[row, column]]
+            columns = valid if keep_all else [width - 1]
+            for out, column in enumerate(columns):
+                logits[row, out, 0] = row
+                # The row-local position of that column; -1 marks a padding column.
+                logits[row, out, 1] = valid.index(column) if column in valid else -1
         return SimpleNamespace(logits=logits)
 
 
@@ -71,7 +74,7 @@ def test_a_batch_step_runs_every_request_on_its_own_cache_in_one_forward() -> No
     assert call["starts"] == [10, 4]  # b was rewound to 4 tokens before the forward
     assert call["past_key_values"].layers == [worker._slot_cache(2).layers[0], worker._slot_cache(0).layers[0]]
     assert [call["past_key_values"].slot_of(row) for row in range(2)] == [(0, 2), (0, 0)]
-    assert call["attention_mask"].tolist() == [[1, 0, 0], [1, 1, 1]]
+    assert call["attention_mask"].tolist() == [[0, 0, 1], [1, 1, 1]]  # left-padded
     assert call["inputs_embeds"][1].tolist() == [[2.0] * 3] * 3
     assert call["logits_to_keep"] == 1
     assert [output.last_token_logits[0] for output in outputs] == [0.0, 1.0]

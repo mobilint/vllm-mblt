@@ -2161,8 +2161,11 @@ class MbltWorker(WorkerBase):
         inputs_embeds = torch.zeros((rows, width, int(input_embeds_batch[0].shape[-1])), dtype=torch.float32)
         attention_mask = torch.zeros((rows, width), dtype=torch.long)
         for row, embeds in enumerate(input_embeds_batch):
-            inputs_embeds[row, : lengths[row]] = torch.from_numpy(np.ascontiguousarray(embeds, dtype=np.float32))
-            attention_mask[row, : lengths[row]] = 1
+            # Left-padded, so every row's last token sits in the last column: ``logits_to_keep=1`` is then each row's
+            # own next-token logits whichever way the forward reads it.
+            start = width - lengths[row]
+            inputs_embeds[row, start:] = torch.from_numpy(np.ascontiguousarray(embeds, dtype=np.float32))
+            attention_mask[row, start:] = 1
         with torch.no_grad():
             output = self.model(
                 inputs_embeds=inputs_embeds,
@@ -2175,7 +2178,8 @@ class MbltWorker(WorkerBase):
         logits = output.logits.reshape(rows, -1, output.logits.shape[-1]).to(torch.float32).numpy()
         results = []
         for row, length in enumerate(lengths):
-            # Copies, so what a row keeps does not hold the whole batched [rows, width, vocab] output alive.
+            # With ``logits_to_keep=0`` the forward returns each row's own positions from column 0 (padding dropped by
+            # the mask). Copies, so what a row keeps does not hold the whole batched output alive.
             sequence = logits[row, :length].copy() if keep_all and keep_sequence_logits[row] else None
             last_token = sequence[-1] if sequence is not None else logits[row, length - 1 if keep_all else 0].copy()
             results.append(InferenceLogits(last_token_logits=last_token, full_sequence_logits=sequence))
