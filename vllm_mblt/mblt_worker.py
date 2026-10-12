@@ -3,7 +3,6 @@ import math
 import os
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Sequence
 
@@ -15,7 +14,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 from mblt_model_zoo.hf_transformers.utils.generation_utils import MobilintGenerationMixin
-from qbruntime import BatchParam
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 from transformers_mblt.utils.cache_utils import MobilintCache, MobilintDeepStackCache
 from vllm.logger import init_logger
@@ -173,7 +171,6 @@ class RequestState:
     num_output_tokens: int
     prompt_embeds: np.ndarray
     prompt_deepstack_embeds: Optional[np.ndarray]
-    prompt_rope_embeds: Optional[np.ndarray]
     mrope_position_delta: int
     is_multimodal: bool
     prompt_len: int
@@ -243,7 +240,6 @@ class NormalBatchChunkState:
     output_index: int
     input_embeds: np.ndarray
     deepstack_embeds: Optional[np.ndarray]
-    rope_embeds: Optional[np.ndarray]
     cache_id: int
     cache_size: int
     offset: int = 0
@@ -415,7 +411,6 @@ class MbltWorker(WorkerBase):
         self.input_embeddings: Optional[nn.Module] = None
         self.cache_model: Optional[Any] = None
         self.cache_backend: Optional[Any] = None
-        self._infer_output_buffers: Optional[list[np.ndarray]] = None
 
         self.req_states: Dict[str, RequestState] = {}
         self._warned_last_logit_prompt_logprobs = False
@@ -448,7 +443,6 @@ class MbltWorker(WorkerBase):
             os.getenv("VLLM_MBLT_ENABLE_SAMPLING_PENALTIES")
         )
         self._warned_penalties_disabled = False
-        self._warned_ambiguous_extra_input_order = False
         # Built on the first profile() call, not here: resolving the trace
         # directory eagerly would make every worker create it even for runs
         # that never trace.
@@ -638,22 +632,6 @@ class MbltWorker(WorkerBase):
         if models:
             return list(models)
         return [self._get_cache_model()]
-
-    def _cache_slot(self, cache_id: int) -> tuple[Any, int, int]:
-        """Map a worker-global cache row to ``(model, model_idx, local_id)``."""
-        backend = getattr(self, "cache_backend", None)
-        backend_models = getattr(backend, "mxq_models", None)
-        if not backend_models:
-            return self._get_cache_model(), 0, int(cache_id)
-        models = list(backend_models)
-        k_per_model = max(1, int(getattr(backend, "k_per_model", 1) or 1))
-        model_idx, local_cache_id = divmod(int(cache_id), k_per_model)
-        if model_idx >= len(models):
-            raise RuntimeError(
-                "Mobilint cache slot exceeds the loaded multi-card capacity: "
-                f"cache_id={cache_id}, models={len(models)}, k_per_model={k_per_model}."
-            )
-        return models[model_idx], model_idx, local_cache_id
 
     def _supports_deepstack_input(self) -> bool:
         hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
@@ -871,9 +849,6 @@ class MbltWorker(WorkerBase):
         self.request_caches.prepare(cache, self._slot_key(slot_id), cache_size)
         return cache
 
-    def _commit_slot(self, cache: Optional[Any], num_tokens: int) -> None:
-        self.request_caches.commit(cache, num_tokens)
-
     def _own_prefix_length(self, slot_id: Optional[int]) -> int:
         """Tokens the slot's request cache holds, before a prompt-logprob replay of the request's own prefix."""
         cache = self._slot_cache(slot_id)
@@ -926,33 +901,6 @@ class MbltWorker(WorkerBase):
             except Exception as exc:
                 logger.debug("Skipping Mobilint prefix-cache prefill calibration: %s", exc)
                 break
-        self._infer_output_buffers = None
-
-    def _make_batch_params(
-        self,
-        sequence_lengths: list[int],
-        cache_sizes: list[int],
-        cache_ids: list[int],
-    ) -> list[BatchParam]:
-        if not (len(sequence_lengths) == len(cache_sizes) == len(cache_ids)):
-            raise RuntimeError(
-                "BatchParam inputs must have identical lengths: "
-                f"sequence_lengths={len(sequence_lengths)}, "
-                f"cache_sizes={len(cache_sizes)}, cache_ids={len(cache_ids)}"
-            )
-
-        return [
-            BatchParam(
-                sequence_length=sequence_length,
-                cache_size=cache_size,
-                cache_id=cache_id,
-            )
-            for sequence_length, cache_size, cache_id in zip(
-                sequence_lengths,
-                cache_sizes,
-                cache_ids,
-            )
-        ]
 
     def _normal_batch_chunk_token_cap(self) -> Optional[int]:
         scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
@@ -1372,38 +1320,6 @@ class MbltWorker(WorkerBase):
             language_model = getattr(getattr(self.model, "model", None), "language_model", None)
         return language_model
 
-    def _get_qwen3_vl_rotary_embedding(self) -> Any | None:
-        if not self._supports_deepstack_input():
-            return None
-
-        language_model = self._language_model()
-        for attribute in ("_mobilint_rotary_emb", "rotary_emb"):
-            rotary_emb = getattr(language_model, attribute, None)
-            if callable(rotary_emb):
-                return rotary_emb
-        return None
-
-    def _build_rope_embeddings_from_position_ids(self, position_ids: torch.Tensor) -> np.ndarray:
-        rotary_emb = self._get_qwen3_vl_rotary_embedding()
-        if rotary_emb is None:
-            raise RuntimeError(
-                "Qwen3-VL dynamic text MXQ requires a callable language_model._mobilint_rotary_emb "
-                "(Model Zoo 2.7+) to build RoPE input tensors."
-            )
-        rotary_context = torch.empty((), device=position_ids.device, dtype=torch.float32)
-        return np.asarray(rotary_emb(rotary_context, position_ids), dtype=np.float32)
-
-    def _build_prompt_rope_embeds(
-        self,
-        prompt_token_ids: Optional[list[int]],
-        mm_features: Optional[list[MultiModalFeatureSpec]],
-        prompt_len: int,
-    ) -> tuple[Optional[np.ndarray], int]:
-        position_ids, delta = self._build_prompt_position_ids(prompt_token_ids, mm_features, prompt_len)
-        if position_ids is None:
-            return None, 0
-        return self._build_rope_embeddings_from_position_ids(position_ids), delta
-
     def _build_prompt_position_ids(
         self,
         prompt_token_ids: Optional[list[int]],
@@ -1485,45 +1401,6 @@ class MbltWorker(WorkerBase):
             pieces.append(torch.arange(max(start, prompt_len) + delta, end + delta, dtype=torch.long).expand(3, -1))
         return torch.cat(pieces, dim=1) if len(pieces) > 1 else pieces[0]
 
-    def _build_rope_input_embeds(
-        self,
-        req_state: RequestState,
-        start: int,
-        end: int,
-    ) -> Optional[np.ndarray]:
-        prompt_rope = req_state.prompt_rope_embeds
-        if prompt_rope is None:
-            return None
-        if end < start:
-            raise RuntimeError(f"Invalid token slice: start={start}, end={end}")
-        if end == start:
-            return np.empty((1, 0, prompt_rope.shape[-1]), dtype=np.float32)
-
-        pieces: list[np.ndarray] = []
-        prompt_start = min(start, req_state.prompt_len)
-        prompt_end = min(end, req_state.prompt_len)
-        if prompt_end > prompt_start:
-            pieces.append(prompt_rope[:, prompt_start:prompt_end, :])
-
-        if end > req_state.prompt_len:
-            decode_start = max(start, req_state.prompt_len)
-            position_ids = (
-                torch.arange(
-                    decode_start + req_state.mrope_position_delta,
-                    end + req_state.mrope_position_delta,
-                    dtype=torch.long,
-                )
-                .view(1, 1, -1)
-                .expand(3, 1, -1)
-            )
-            pieces.append(self._build_rope_embeddings_from_position_ids(position_ids))
-
-        if not pieces:
-            return np.empty((1, 0, prompt_rope.shape[-1]), dtype=np.float32)
-        if len(pieces) == 1:
-            return pieces[0].astype(np.float32, copy=False)
-        return np.concatenate(pieces, axis=1).astype(np.float32, copy=False)
-
     def _ensure_batch_vlm_supported(self, req_state: RequestState) -> None:
         if getattr(req_state, "is_multimodal", False):
             if req_state.prompt_deepstack_embeds is not None and not self._supports_deepstack_input():
@@ -1547,409 +1424,6 @@ class MbltWorker(WorkerBase):
         if not self._supports_deepstack_input():
             return False
         return len(self._cache_model_input_shapes(self._get_cache_model())) in (3, 5)
-
-    @staticmethod
-    def _classify_qwen3_vl_tail_order(
-        tail_shapes: Sequence[Sequence[int]],
-        hidden_size: int,
-    ) -> Optional[tuple[str, str]]:
-        """Classify the two trailing text-MXQ inputs as rope / deepstack.
-
-        Two discriminators, strongest first:
-
-        * the leading axis -- deepstack's is its layer count, which both callers
-          require to be fixed and positive, while rope's must be 1 or dynamic.
-          A leading axis greater than 1 therefore cannot be rope. This holds
-          unconditionally.
-        * the last axis -- deepstack's is the hidden size, rope's is pe_size.
-          Weaker, because rope satisfies it too whenever pe_size == hidden_size,
-          so it is consulted only when the leading axis is 1 or dynamic on both
-          tails and cannot separate them.
-
-        The order is the point. With the weak test first, a pair combining the
-        two signatures it cannot read -- rope declaring pe_size == hidden_size
-        and deepstack declaring a dynamic hidden axis -- gets actively inverted
-        and the reliable test never runs.
-
-        Returns None for what neither can tell apart -- a single-layer deepstack
-        whose declared size the rope input shares, say. Callers decide what to
-        do with an unreadable signature; None is deliberately not the positional
-        guess, so that choice is theirs to make and to report.
-        """
-
-        if len(tail_shapes) != 2 or hidden_size <= 0:
-            return None
-        # A rank-0 shape cannot be classified. Leave it to the rank checks that
-        # follow in the callers, which say what is wrong with the signature --
-        # indexing into it here would replace that with a bare IndexError.
-        if any(len(shape) < 1 for shape in tail_shapes):
-            return None
-
-        holds_layers = tuple(int(shape[0]) > 1 for shape in tail_shapes)
-        if holds_layers == (True, False):
-            return ("deepstack", "rope")
-        if holds_layers == (False, True):
-            return ("rope", "deepstack")
-
-        # Both leading axes are 1 or dynamic, so fall through to the weaker test.
-        matches_hidden = tuple(int(shape[-1]) > 0 and int(shape[-1]) == hidden_size for shape in tail_shapes)
-        if matches_hidden == (True, False):
-            return ("deepstack", "rope")
-        if matches_hidden == (False, True):
-            return ("rope", "deepstack")
-        return None
-
-    @classmethod
-    def _detect_qwen3_vl_tail_order(
-        cls,
-        tail_shapes: Sequence[Sequence[int]],
-        hidden_size: int,
-        default: tuple[str, str],
-    ) -> tuple[str, str]:
-        """`_classify_qwen3_vl_tail_order`, with `default` for an unreadable pair."""
-
-        classified = cls._classify_qwen3_vl_tail_order(tail_shapes, hidden_size)
-        return default if classified is None else classified
-
-    def _qwen3_vl_text_extra_input_order(
-        self,
-        input_shapes: Sequence[Sequence[int]],
-        hidden_size: int,
-    ) -> tuple[str, str]:
-        """Return the Qwen3-VL 3-input text MXQ extra-input order.
-
-        The positional fallback records only what mblt-model-zoo 2.3.0 happened
-        to ship: non-batch [inputs, deepstack, rope], Batch16 [inputs, rope,
-        deepstack]. The compiler guarantees neither -- the reference Batch16
-        rebuild this classification was written against declares
-        [(1,-1,4096), (3,-1,4096), (1,-1,256)], i.e. deepstack before rope,
-        against the shipped Batch16 order. So the declared shapes decide, and
-        these defaults are consulted only for a signature they cannot read.
-
-        `input_shapes` is the list the caller already read, and is required:
-        re-reading it here would go through `_cache_model_input_shapes`, which
-        swallows every exception and returns `[]`, so a transient failure would
-        hand back the positional default while the caller still indexes a
-        3-entry list.
-        """
-
-        default = ("rope", "deepstack") if self._is_batch_model() else ("deepstack", "rope")
-        if len(input_shapes) < 3:
-            return default
-        classified = self._classify_qwen3_vl_tail_order(input_shapes[1:3], hidden_size)
-        if classified is not None:
-            return classified
-        # Unreadable, so the positional guess decides -- and this is the one path
-        # that can put the tensors in the wrong slots without raising: the two
-        # declared shapes are indistinguishable, so every validation check below
-        # passes either way. Say so once per worker; this runs every decode step.
-        if not getattr(self, "_warned_ambiguous_extra_input_order", False):
-            logger.warning(
-                "Qwen3-VL 3-input text MXQ declares rope and deepstack shapes that cannot be "
-                "told apart (%s, %s). Assuming %s, the order shipped for this model kind. If "
-                "this artifact wants the other order, the logits will be wrong with no error.",
-                tuple(input_shapes[1]),
-                tuple(input_shapes[2]),
-                default,
-            )
-            self._warned_ambiguous_extra_input_order = True
-        return default
-
-    def _qwen3_vl_text_extra_input_layout(
-        self,
-        input_shapes: Sequence[Sequence[int]],
-        hidden_size: int,
-    ) -> tuple[tuple[str, ...], Optional[Sequence[int]], list[Sequence[int]]]:
-        """Resolve roles and shapes for bundled or per-layer DeepStack inputs.
-
-        Both builders need the same three answers from the same shapes, and the
-        order must be the one they later emit in: classifying one way and
-        emitting the other would put RoPE in the deepstack slot and produce
-        wrong logits with no error. Deriving all three here is what keeps them
-        from drifting apart.
-
-        Model Zoo 2.7 adds the split layouts ``[input, ds0, ds1, ds2]`` and
-        ``[input, ds0, ds1, ds2, rope]``. Their positional contract is fixed;
-        only the legacy bundled 3-input layout needs shape-based ordering.
-        """
-
-        if len(input_shapes) == 2:
-            return ("deepstack",), None, [input_shapes[1]]
-        if len(input_shapes) == 3:
-            order = self._qwen3_vl_text_extra_input_order(input_shapes, hidden_size)
-            shapes = dict(zip(order, input_shapes[1:3]))
-            return order, shapes["rope"], [shapes["deepstack"]]
-        if len(input_shapes) in (4, 5):
-            if len(input_shapes) == 4 and self._is_batch_model():
-                raise RuntimeError(
-                    "Batched split-static Qwen3-VL text MXQs are unsupported; "
-                    "use a 5-input split-dynamic artifact with external RoPE."
-                )
-            deepstack_count = len(input_shapes) - 1 - int(len(input_shapes) == 5)
-            roles = tuple(f"deepstack_{index}" for index in range(deepstack_count))
-            rope_shape = None
-            if len(input_shapes) == 5:
-                roles += ("rope",)
-                rope_shape = input_shapes[-1]
-            return roles, rope_shape, list(input_shapes[1 : 1 + deepstack_count])
-        raise RuntimeError(
-            "Unsupported Qwen3-VL text MXQ signature: expected 2/3-input bundled "
-            f"or 4/5-input split DeepStack layout, got {len(input_shapes)} inputs."
-        )
-
-    def _build_infer_inputs(
-        self,
-        input_embeds: np.ndarray,
-        deepstack_embeds: Optional[np.ndarray],
-        rope_embeds: Optional[np.ndarray] = None,
-    ) -> np.ndarray | list[np.ndarray]:
-        cache_model = self._get_cache_model()
-        input_shapes = self._cache_model_input_shapes(cache_model)
-        batched_input = np.expand_dims(input_embeds, axis=0)
-        if len(input_shapes) < 2:
-            return batched_input
-        if not self._supports_deepstack_input():
-            if deepstack_embeds is not None:
-                raise RuntimeError("Deepstack embeddings are only supported for Qwen3-VL models.")
-            return batched_input
-
-        extra_input_order, rope_shape, deepstack_shapes = self._qwen3_vl_text_extra_input_layout(
-            input_shapes, int(input_embeds.shape[-1])
-        )
-        uses_rope_input = rope_shape is not None
-        if uses_rope_input:
-            if rope_embeds is None:
-                raise RuntimeError("Qwen3-VL dynamic text MXQ requires RoPE embeddings.")
-            if len(rope_shape) != 3:
-                raise RuntimeError(
-                    f"Qwen3-VL text MXQ rope input must have rank 3 (1, sequence, pe_size), but got shape={rope_shape}."
-                )
-            expected_rope_batch, expected_rope_seq, expected_rope_size = rope_shape
-            if expected_rope_batch not in (-1, 1):
-                raise RuntimeError(f"Qwen3-VL text MXQ rope batch dimension must be 1, got {rope_shape}.")
-            if expected_rope_seq > 0 and expected_rope_seq != input_embeds.shape[0]:
-                raise RuntimeError(
-                    "Qwen3-VL text MXQ rope sequence dimension mismatch: "
-                    f"expected={expected_rope_seq}, input_seq_len={input_embeds.shape[0]}, shape={rope_shape}."
-                )
-            if expected_rope_size > 0 and expected_rope_size != rope_embeds.shape[-1]:
-                raise RuntimeError(
-                    "Qwen3-VL text MXQ rope hidden dimension mismatch: "
-                    f"expected={expected_rope_size}, rope_size={rope_embeds.shape[-1]}, shape={rope_shape}."
-                )
-            expected_rope_shape = (1, int(input_embeds.shape[0]), int(rope_embeds.shape[-1]))
-            if tuple(rope_embeds.shape) != expected_rope_shape:
-                raise RuntimeError(
-                    "RoPE embedding shape mismatch for Qwen3-VL text MXQ: "
-                    f"expected={expected_rope_shape}, got={tuple(rope_embeds.shape)}."
-                )
-        input_seq_len = int(input_embeds.shape[0])
-        input_hidden = int(input_embeds.shape[-1])
-        split_deepstack = len(deepstack_shapes) > 1
-        for deepstack_shape in deepstack_shapes:
-            if len(deepstack_shape) != 3:
-                raise RuntimeError(
-                    "Qwen3-VL DeepStack input must have rank 3 "
-                    f"(layers, sequence, hidden), but got shape={deepstack_shape}."
-                )
-            expected_shape_layers, expected_seq_len, expected_hidden = deepstack_shape
-            if split_deepstack and expected_shape_layers not in (-1, 1):
-                raise RuntimeError(
-                    f"Split Qwen3-VL DeepStack inputs must each contain one layer, but got shape={deepstack_shape}."
-                )
-            if expected_seq_len > 0 and expected_seq_len != input_seq_len:
-                raise RuntimeError(
-                    "Qwen3-VL DeepStack sequence dimension mismatch: "
-                    f"expected={expected_seq_len}, input_seq_len={input_seq_len}, shape={deepstack_shape}."
-                )
-            if expected_hidden > 0 and expected_hidden != input_hidden:
-                raise RuntimeError(
-                    "Qwen3-VL DeepStack hidden dimension mismatch: "
-                    f"expected={expected_hidden}, input_hidden={input_hidden}, shape={deepstack_shape}."
-                )
-
-        expected_layers = len(deepstack_shapes) if split_deepstack else int(deepstack_shapes[0][0])
-        if expected_layers <= 0:
-            raise RuntimeError("Qwen3-VL bundled DeepStack layer dimension must be fixed and positive.")
-
-        if deepstack_embeds is None:
-            deepstack_embeds = np.zeros(
-                (int(expected_layers), input_seq_len, input_hidden),
-                dtype=np.float32,
-            )
-        else:
-            expected_shape = (int(expected_layers), input_seq_len, input_hidden)
-            if tuple(deepstack_embeds.shape) != expected_shape:
-                raise RuntimeError(
-                    "Deepstack embedding shape mismatch for dual-input model: "
-                    f"expected={expected_shape}, got={tuple(deepstack_embeds.shape)}."
-                )
-        deepstack_array = deepstack_embeds.astype(np.float32, copy=False)
-        extras = {"deepstack": deepstack_array}
-        extras.update({f"deepstack_{index}": deepstack_array[index : index + 1] for index in range(expected_layers)})
-        if uses_rope_input:
-            extras["rope"] = rope_embeds.astype(np.float32, copy=False)
-        return [batched_input, *(extras[name] for name in extra_input_order)]
-
-    def _build_batch_infer_inputs(
-        self,
-        input_embeds_batch: list[np.ndarray],
-        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]],
-        rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
-    ) -> list[np.ndarray]:
-        cache_model = self._get_cache_model()
-        input_shapes = self._cache_model_input_shapes(cache_model)
-        has_deepstack_input = len(input_shapes) >= 2
-        if deepstack_embeds_batch is not None and len(deepstack_embeds_batch) != len(input_embeds_batch):
-            raise RuntimeError(
-                "Batched deepstack inputs must match input embeddings: "
-                f"input_embeds={len(input_embeds_batch)}, deepstack={len(deepstack_embeds_batch)}"
-            )
-        if rope_embeds_batch is not None and len(rope_embeds_batch) != len(input_embeds_batch):
-            raise RuntimeError(
-                "Batched RoPE inputs must match input embeddings: "
-                f"input_embeds={len(input_embeds_batch)}, rope={len(rope_embeds_batch)}"
-            )
-        if deepstack_embeds_batch is not None and not has_deepstack_input:
-            if any(deepstack_embeds is not None for deepstack_embeds in deepstack_embeds_batch):
-                raise RuntimeError("Batched deepstack embeddings require a dual-input Qwen3-VL MXQ.")
-
-        concat_input = np.concatenate(input_embeds_batch, axis=0).astype(
-            np.float32,
-            copy=False,
-        )
-        text_input = np.expand_dims(concat_input, axis=0)
-
-        if not has_deepstack_input:
-            while text_input.ndim < 4:
-                text_input = np.expand_dims(text_input, axis=0)
-            return [text_input]
-
-        if not self._supports_deepstack_input():
-            if deepstack_embeds_batch is not None and any(
-                deepstack_embeds is not None for deepstack_embeds in deepstack_embeds_batch
-            ):
-                raise RuntimeError("Deepstack embeddings are only supported for Qwen3-VL models.")
-            while text_input.ndim < 4:
-                text_input = np.expand_dims(text_input, axis=0)
-            return [text_input]
-
-        hidden_size = int(concat_input.shape[-1])
-        packed_tokens = int(concat_input.shape[0])
-        extra_input_order, rope_shape, deepstack_shapes = self._qwen3_vl_text_extra_input_layout(
-            input_shapes, hidden_size
-        )
-        uses_rope_input = rope_shape is not None
-        if uses_rope_input:
-            if rope_embeds_batch is None:
-                raise RuntimeError("Qwen3-VL dynamic batch text MXQ requires batched RoPE embeddings.")
-            if len(rope_shape) != 3:
-                raise RuntimeError(
-                    "Qwen3-VL batch text MXQ rope input must have rank 3 "
-                    f"(1, packed_tokens, pe_size), but got shape={rope_shape}."
-                )
-            expected_rope_batch, expected_rope_seq, expected_rope_size = rope_shape
-            if expected_rope_batch not in (-1, 1):
-                raise RuntimeError(f"Qwen3-VL batch text MXQ rope batch dimension must be 1, got {rope_shape}.")
-            if expected_rope_seq > 0 and expected_rope_seq != packed_tokens:
-                raise RuntimeError(
-                    "Qwen3-VL batch text MXQ rope packed-token dimension mismatch: "
-                    f"expected={expected_rope_seq}, packed_tokens={packed_tokens}, shape={rope_shape}."
-                )
-        split_deepstack = len(deepstack_shapes) > 1
-        for deepstack_shape in deepstack_shapes:
-            if len(deepstack_shape) != 3:
-                raise RuntimeError(
-                    "Qwen3-VL batch DeepStack input must have rank 3 "
-                    f"(layers, packed_tokens, hidden), but got shape={deepstack_shape}."
-                )
-            expected_shape_layers, expected_seq_len, expected_hidden = deepstack_shape
-            if split_deepstack and expected_shape_layers not in (-1, 1):
-                raise RuntimeError(
-                    "Split Qwen3-VL batch DeepStack inputs must each contain one layer, "
-                    f"but got shape={deepstack_shape}."
-                )
-            if expected_seq_len > 0 and expected_seq_len != packed_tokens:
-                raise RuntimeError(
-                    "Qwen3-VL batch DeepStack packed-token dimension mismatch: "
-                    f"expected={expected_seq_len}, packed_tokens={packed_tokens}, shape={deepstack_shape}."
-                )
-            if expected_hidden > 0 and expected_hidden != hidden_size:
-                raise RuntimeError(
-                    "Qwen3-VL batch DeepStack hidden dimension mismatch: "
-                    f"expected={expected_hidden}, hidden_size={hidden_size}, shape={deepstack_shape}."
-                )
-
-        expected_layers = len(deepstack_shapes) if split_deepstack else int(deepstack_shapes[0][0])
-        if expected_layers <= 0:
-            raise RuntimeError("Qwen3-VL bundled batch DeepStack layer dimension must be fixed and positive.")
-
-        deepstack_chunks: list[np.ndarray] = []
-        for i, input_embeds in enumerate(input_embeds_batch):
-            seq_len = int(input_embeds.shape[0])
-            deepstack_embeds = None if deepstack_embeds_batch is None else deepstack_embeds_batch[i]
-            if deepstack_embeds is None:
-                deepstack_embeds = np.zeros((int(expected_layers), seq_len, hidden_size), dtype=np.float32)
-            else:
-                expected_shape = (int(expected_layers), seq_len, hidden_size)
-                if tuple(deepstack_embeds.shape) != expected_shape:
-                    raise RuntimeError(
-                        "Batched deepstack embedding shape mismatch for dual-input model: "
-                        f"expected={expected_shape}, got={tuple(deepstack_embeds.shape)}."
-                    )
-                deepstack_embeds = deepstack_embeds.astype(np.float32, copy=False)
-            deepstack_chunks.append(deepstack_embeds)
-
-        deepstack_concat = np.concatenate(deepstack_chunks, axis=1)
-        extras = {"deepstack": deepstack_concat}
-        extras.update({f"deepstack_{index}": deepstack_concat[index : index + 1] for index in range(expected_layers)})
-        if not uses_rope_input:
-            return [text_input, *(extras[name] for name in extra_input_order)]
-
-        rope_chunks: list[np.ndarray] = []
-        assert rope_embeds_batch is not None
-        for i, input_embeds in enumerate(input_embeds_batch):
-            seq_len = int(input_embeds.shape[0])
-            rope_embeds = rope_embeds_batch[i]
-            if rope_embeds is None:
-                raise RuntimeError("Qwen3-VL dynamic batch text MXQ is missing RoPE embeddings for a request.")
-            expected_rope_shape = (1, seq_len, int(rope_embeds.shape[-1]))
-            if tuple(rope_embeds.shape) != expected_rope_shape:
-                raise RuntimeError(
-                    "Batched RoPE embedding shape mismatch for Qwen3-VL text MXQ: "
-                    f"expected={expected_rope_shape}, got={tuple(rope_embeds.shape)}."
-                )
-            if expected_rope_size > 0 and expected_rope_size != rope_embeds.shape[-1]:
-                raise RuntimeError(
-                    "Qwen3-VL batch text MXQ rope hidden dimension mismatch: "
-                    f"expected={expected_rope_size}, rope_size={rope_embeds.shape[-1]}, shape={rope_shape}."
-                )
-            rope_chunks.append(rope_embeds.astype(np.float32, copy=False))
-
-        extras["rope"] = np.concatenate(rope_chunks, axis=1)
-        return [text_input, *(extras[name] for name in extra_input_order)]
-
-    @staticmethod
-    def _last_token_logits(logits: np.ndarray) -> np.ndarray:
-        logits = np.asarray(logits)
-        if logits.ndim == 3:
-            return logits[:, -1, :]
-        return logits
-
-    @staticmethod
-    def _normalize_sequence_logits(logits: np.ndarray, expected_seq_len: int) -> Optional[np.ndarray]:
-        logits = np.asarray(logits)
-        if logits.ndim == 3:
-            if logits.shape[0] != 1:
-                return None
-            if logits.shape[1] != expected_seq_len:
-                return None
-            return logits[0]
-        if logits.ndim == 2:
-            if logits.shape[0] != expected_seq_len:
-                return None
-            return logits
-        return None
 
     @staticmethod
     def _shape_dim_matches_sequence(dim: int, input_seq_len: int) -> bool:
@@ -2060,25 +1534,6 @@ class MbltWorker(WorkerBase):
             return "last_token"
         return "unknown"
 
-    def _normalize_runtime_sequence_logits(self, logits: np.ndarray, expected_seq_len: int) -> Optional[np.ndarray]:
-        """Return per-position logits only when the MXQ output is known to contain them.
-
-        OpenAI completions with ``echo=true`` and ``logprobs=N`` require prompt
-        token ``i`` to be scored from logits at prompt position ``i - 1``.  A
-        last-token-only MXQ can return a 2-D tensor with shape ``(1, vocab)``;
-        for Batch1/single-core requests this may accidentally match a
-        one-token scheduled/microstep input and looks like valid sequence
-        logits if we check the tensor shape alone.  Treat known last-token
-        runtime outputs as unavailable for prompt-logprob sequence scoring so
-        callers use the dedicated prompt-logprob microstep/fallback path instead
-        of reusing the same final-position distribution for prompt tokens.
-        """
-
-        mode = self._runtime_output_logits_mode(expected_seq_len)
-        if mode != "full_sequence":
-            return None
-        return self._normalize_sequence_logits(logits, expected_seq_len=expected_seq_len)
-
     def _needs_last_logit_prompt_logprob_microsteps(
         self,
         req_state: RequestState,
@@ -2127,55 +1582,34 @@ class MbltWorker(WorkerBase):
             self._live_cache_prefix_incomplete_count,
         )
 
-    @staticmethod
-    def _can_reuse_output_buffers(
-        cache_model: Any,
-        output_buffers: list[np.ndarray],
-        input_seq_len: int,
-    ) -> bool:
-        if not output_buffers:
-            return False
-        get_output_shape = getattr(cache_model, "get_model_output_shape", None)
-        if not callable(get_output_shape):
-            return True
-        try:
-            output_shapes = get_output_shape()
-        except Exception:
-            return True
-        if not output_shapes:
-            return True
+    def _check_text_mxq_supported(self) -> None:
+        """Refuse a text MXQ the transformers-mblt forward cannot run, at load time rather than on the first batch.
 
-        output_shape = tuple(output_shapes[0])
-        if any(dim == -1 for dim in output_shape):
-            return False
-        if len(output_shape) != output_buffers[0].ndim:
-            return True
-
-        expected_shape = tuple(input_seq_len if dim == -1 else dim for dim in output_shape)
-        return output_buffers[0].shape == expected_shape
-
-    def _can_forward_through_model(self) -> bool:
-        """Whether infers go through the transformers-mblt forward instead of the MXQ directly.
-
-        Text models, Mixture-of-Experts models and Qwen2-VL with a plain text MXQ do, and so does Qwen3-VL:
-        non-batch with any text MXQ layout, batch with a RoPE-input text MXQ (the only layout the batched deepstack
-        forward takes). Audio-text models still feed the MXQ themselves. ``VLLM_MBLT_DIRECT_INFER=1`` keeps every
-        model on the direct MXQ path.
+        transformers-mblt's batched deepstack forward takes only a Qwen3-VL text MXQ with a RoPE input; every
+        Qwen3-VL Batch16 release has one.
         """
-        if os.getenv("VLLM_MBLT_DIRECT_INFER", "0") in _TRUE_ENV_VALUES:
-            return False
-        if isinstance(self.cache_model, MbltMoECacheModel):
-            return True
+        if self._supports_deepstack_input() and self._is_batch_model() and not self._text_mxq_uses_rope_input():
+            raise RuntimeError(
+                "Batched Qwen3-VL text MXQs without a RoPE input are unsupported; "
+                "use a dynamic text MXQ, which has one."
+            )
+
+    def _is_audio_text_model(self) -> bool:
         model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)
-        if model_type == "mobilint-qwen3_asr":
-            return False
-        if self._supports_deepstack_input():
-            return not self._is_batch_model() or self._text_mxq_uses_rope_input()
-        return len(self._cache_model_input_shapes(self._get_cache_model())) == 1
+        return model_type == "mobilint-qwen3_asr"
 
     def _forward_model(self) -> Any:
-        """What ``_forward_rows`` calls: an image-text model's text decoder, which takes the merged embeddings."""
-        return self._language_model() if self._is_multimodal_model() else self.model
+        """What ``_forward_rows`` calls: the text decoder of an image-text or audio-text model, which takes the merged
+        embeddings, else the causal LM itself.
+
+        Qwen3-ASR's decoder sits under its thinker; given a plain request cache rather than a beam cache, it decodes
+        one sequence like a text model.
+        """
+        if self._is_multimodal_model():
+            return self._language_model()
+        if self._is_audio_text_model():
+            return self.model.thinker.model
+        return self.model
 
     def _vl_forward_inputs(
         self,
@@ -2258,9 +1692,9 @@ class MbltWorker(WorkerBase):
         if self._is_multimodal_model():
             extra = self._vl_forward_inputs(slot_ids, cache_sizes, lengths, attention_mask, deepstack_batch)
         if not isinstance(self.cache_model, MbltMoECacheModel):
-            # vLLM already sized the step for the MXQ (chunked prefill): feed it in one infer, as the direct path
-            # did, rather than re-splitting it at the model's own prefill chunk size. The split changes the NPU's
-            # numerics as well as the number of infers. A Mixture-of-Experts forward keeps its own split: its
+            # vLLM already sized the step for the MXQ (chunked prefill): feed it in one infer rather than
+            # re-splitting it at the model's own prefill chunk size. The split changes the NPU's numerics as well
+            # as the number of infers. A Mixture-of-Experts forward keeps its own split: its
             # shared MXQs take at most that many tokens per infer.
             extra["npu_prefill_chunk_size"] = width
         with torch.no_grad():
@@ -2291,82 +1725,19 @@ class MbltWorker(WorkerBase):
         input_embeds: np.ndarray,
         deepstack_embeds: Optional[np.ndarray],
         cache_size: int,
-        rope_embeds: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        if getattr(self, "_forward_through_model", False):
-            deepstack = None if deepstack_embeds is None else [deepstack_embeds]
-            return self._forward_rows([None], [cache_size], [input_embeds], [False], deepstack)[0].last_token_logits
-        cache_model = self._get_cache_model()
-        infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
-        output_buffers = self._infer_output_buffers
-        request_cache = self._prepare_slot(None, cache_size)
-
-        if output_buffers is not None and self._can_reuse_output_buffers(
-            cache_model,
-            output_buffers,
-            input_seq_len=int(input_embeds.shape[0]),
-        ):
-            infer_output = cache_model.infer(
-                infer_inputs,
-                outputs=output_buffers,
-                cache_size=cache_size,
-            )
-            self._commit_slot(request_cache, int(input_embeds.shape[0]))
-            if infer_output is None:
-                return self._last_token_logits(output_buffers[0])
-            return self._last_token_logits(infer_output[0])
-
-        infer_output = cache_model.infer(infer_inputs, cache_size=cache_size)
-        if infer_output is None:
-            raise RuntimeError("mxq infer result is None!")
-        self._commit_slot(request_cache, int(input_embeds.shape[0]))
-
-        logits = infer_output[0]
-        self._infer_output_buffers = [np.empty_like(logits)]
-        return self._last_token_logits(logits)
+        deepstack = None if deepstack_embeds is None else [deepstack_embeds]
+        return self._forward_rows([None], [cache_size], [input_embeds], [False], deepstack)[0].last_token_logits
 
     def _infer_logits_with_sequence(
         self,
         input_embeds: np.ndarray,
         deepstack_embeds: Optional[np.ndarray],
         cache_size: int,
-        rope_embeds: Optional[np.ndarray] = None,
         keep_sequence_logits: bool = True,
     ) -> InferenceLogits:
-        if getattr(self, "_forward_through_model", False):
-            deepstack = None if deepstack_embeds is None else [deepstack_embeds]
-            return self._forward_rows([None], [cache_size], [input_embeds], [keep_sequence_logits], deepstack)[0]
-        cache_model = self._get_cache_model()
-        infer_inputs = self._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
-        output_buffers = self._infer_output_buffers
-        request_cache = self._prepare_slot(None, cache_size)
-
-        if output_buffers is not None and self._can_reuse_output_buffers(
-            cache_model,
-            output_buffers,
-            input_seq_len=int(input_embeds.shape[0]),
-        ):
-            infer_output = cache_model.infer(
-                infer_inputs,
-                outputs=output_buffers,
-                cache_size=cache_size,
-            )
-            logits = output_buffers[0] if infer_output is None else infer_output[0]
-        else:
-            infer_output = cache_model.infer(infer_inputs, cache_size=cache_size)
-            if infer_output is None:
-                raise RuntimeError("mxq infer result is None!")
-            logits = infer_output[0]
-            self._infer_output_buffers = [np.empty_like(logits)]
-        self._commit_slot(request_cache, int(input_embeds.shape[0]))
-
-        logits_np = np.asarray(logits)
-        return InferenceLogits(
-            last_token_logits=self._last_token_logits(logits_np),
-            full_sequence_logits=self._normalize_runtime_sequence_logits(
-                logits_np, expected_seq_len=int(input_embeds.shape[0])
-            ),
-        )
+        deepstack = None if deepstack_embeds is None else [deepstack_embeds]
+        return self._forward_rows([None], [cache_size], [input_embeds], [keep_sequence_logits], deepstack)[0]
 
     def _infer_logits_batch(
         self,
@@ -2374,7 +1745,6 @@ class MbltWorker(WorkerBase):
         cache_sizes: list[int],
         cache_ids: list[int],
         deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
-        rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
     ) -> list[np.ndarray]:
         return [
             output.last_token_logits
@@ -2383,74 +1753,9 @@ class MbltWorker(WorkerBase):
                 cache_sizes,
                 cache_ids,
                 deepstack_embeds_batch,
-                rope_embeds_batch,
+                keep_sequence_logits=[False] * len(input_embeds_batch),
             )
         ]
-
-    def _infer_logits_batch_group(
-        self,
-        cache_model: Any,
-        input_embeds_batch: list[np.ndarray],
-        cache_sizes: list[int],
-        local_cache_ids: list[int],
-        deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]],
-        rope_embeds_batch: Optional[list[Optional[np.ndarray]]],
-    ) -> list[InferenceLogits]:
-        """Run one Model slot and parse its logits without changing row order."""
-        batch_size = len(input_embeds_batch)
-        sequence_lengths = [int(input_embeds.shape[0]) for input_embeds in input_embeds_batch]
-        if any(seq_len <= 0 for seq_len in sequence_lengths):
-            # No row can be read back for an empty slice under either reading.
-            raise RuntimeError("Batched infer received an empty input embedding slice.")
-        total_tokens = sum(sequence_lengths)
-        params = self._make_batch_params(
-            sequence_lengths=[int(input_embeds.shape[0]) for input_embeds in input_embeds_batch],
-            cache_sizes=cache_sizes,
-            cache_ids=local_cache_ids,
-        )
-        infer_inputs = self._build_batch_infer_inputs(
-            input_embeds_batch,
-            deepstack_embeds_batch,
-            rope_embeds_batch=rope_embeds_batch,
-        )
-        infer_output = cache_model.infer(infer_inputs, params=params)
-
-        logits = infer_output[0] if isinstance(infer_output, (list, tuple)) else infer_output
-        logits_np = np.asarray(logits)
-        # qbruntime returns a batch MXQ's declared ``[1, -1, vocab]`` output as
-        # ``[1, 1, rows, vocab]`` (measured on aries for rank-3 and rank-4
-        # inputs), so read the rows off the last two axes.
-        if logits_np.ndim >= 2 and all(int(dim) == 1 for dim in logits_np.shape[:-2]):
-            rows = logits_np.reshape(-1, logits_np.shape[-1])
-            if rows.shape[0] == total_tokens:
-                # One row per packed input token: a full-logits MXQ, or a step in
-                # which every request is a single token (decode), where the
-                # per-token and last-token readings coincide.
-                outputs: list[InferenceLogits] = []
-                offset = 0
-                for seq_len in sequence_lengths:
-                    # Copy the row's own slice: a view would keep the whole
-                    # [total_tokens, vocab] output alive as long as any row is.
-                    sequence_logits = rows[offset : offset + seq_len, :].copy()
-                    outputs.append(
-                        InferenceLogits(
-                            last_token_logits=sequence_logits[-1, :],
-                            full_sequence_logits=sequence_logits,
-                        )
-                    )
-                    offset += seq_len
-                return outputs
-            if logits_np.ndim >= 3 and rows.shape[0] != batch_size:
-                raise RuntimeError(
-                    "Batched infer returned logits with unexpected sequence length: "
-                    f"shape={logits_np.shape}, expected_tokens={total_tokens} or rows={batch_size}"
-                )
-        if logits_np.size % batch_size != 0:
-            raise RuntimeError(
-                f"Batched infer returned logits with unexpected shape: shape={logits_np.shape}, batch_size={batch_size}"
-            )
-        logits_np = logits_np.reshape(batch_size, -1)
-        return [InferenceLogits(last_token_logits=logits_np[i], full_sequence_logits=None) for i in range(batch_size)]
 
     def _infer_logits_batch_with_sequence(
         self,
@@ -2458,62 +1763,14 @@ class MbltWorker(WorkerBase):
         cache_sizes: list[int],
         cache_ids: list[int],
         deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
-        rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
         keep_sequence_logits: Optional[list[bool]] = None,
     ) -> list[InferenceLogits]:
         if not input_embeds_batch:
             return []
         if not (len(input_embeds_batch) == len(cache_sizes) == len(cache_ids)):
             raise RuntimeError("Batched infer inputs, cache sizes, and cache IDs must have identical lengths.")
-        if getattr(self, "_forward_through_model", False):
-            keep = [True] * len(input_embeds_batch) if keep_sequence_logits is None else keep_sequence_logits
-            return self._forward_rows(cache_ids, cache_sizes, input_embeds_batch, keep, deepstack_embeds_batch)
-
-        groups: dict[int, list[tuple[int, int]]] = {}
-        models: dict[int, Any] = {}
-        for row_index, cache_id in enumerate(cache_ids):
-            cache_model, model_idx, local_cache_id = self._cache_slot(cache_id)
-            models[model_idx] = cache_model
-            groups.setdefault(model_idx, []).append((row_index, local_cache_id))
-        # Bind on this thread before the per-card infers fan out: the owner table is not thread-safe.
-        request_caches = [
-            self._prepare_slot(cache_id, int(cache_size)) for cache_id, cache_size in zip(cache_ids, cache_sizes)
-        ]
-
-        outputs: list[Optional[InferenceLogits]] = [None] * len(input_embeds_batch)
-
-        def _slice_optional(
-            values: Optional[list[Optional[np.ndarray]]], indices: list[int]
-        ) -> Optional[list[Optional[np.ndarray]]]:
-            return None if values is None else [values[index] for index in indices]
-
-        def _run_group(model_idx: int) -> None:
-            entries = groups[model_idx]
-            indices = [entry[0] for entry in entries]
-            group_outputs = self._infer_logits_batch_group(
-                models[model_idx],
-                [input_embeds_batch[index] for index in indices],
-                [cache_sizes[index] for index in indices],
-                [entry[1] for entry in entries],
-                _slice_optional(deepstack_embeds_batch, indices),
-                _slice_optional(rope_embeds_batch, indices),
-            )
-            for index, output in zip(indices, group_outputs):
-                outputs[index] = output
-
-        if len(groups) == 1:
-            _run_group(next(iter(groups)))
-        else:
-            with ThreadPoolExecutor(max_workers=len(groups), thread_name_prefix="mblt-npu") as executor:
-                futures = [executor.submit(_run_group, model_idx) for model_idx in sorted(groups)]
-                for future in futures:
-                    future.result()
-
-        if any(output is None for output in outputs):
-            raise RuntimeError("Multi-card batched infer did not produce every requested output row.")
-        for request_cache, input_embeds in zip(request_caches, input_embeds_batch):
-            self._commit_slot(request_cache, int(input_embeds.shape[0]))
-        return [output for output in outputs if output is not None]
+        keep = [True] * len(input_embeds_batch) if keep_sequence_logits is None else keep_sequence_logits
+        return self._forward_rows(cache_ids, cache_sizes, input_embeds_batch, keep, deepstack_embeds_batch)
 
     def _infer_normal_logits_batch_chunked(
         self,
@@ -2522,7 +1779,6 @@ class MbltWorker(WorkerBase):
         cache_sizes: list[int],
         cache_ids: list[int],
         deepstack_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
-        rope_embeds_batch: Optional[list[Optional[np.ndarray]]] = None,
         keep_sequence_logits: Optional[list[bool]] = None,
     ) -> dict[int, InferenceLogits]:
         """Forward normal batch rows in chunks.
@@ -2547,11 +1803,6 @@ class MbltWorker(WorkerBase):
                 "Normal batch deepstack inputs must match input embeddings: "
                 f"input_embeds={len(input_embeds_batch)}, deepstack={len(deepstack_embeds_batch)}"
             )
-        if rope_embeds_batch is not None and len(rope_embeds_batch) != len(input_embeds_batch):
-            raise RuntimeError(
-                "Normal batch RoPE inputs must match input embeddings: "
-                f"input_embeds={len(input_embeds_batch)}, rope={len(rope_embeds_batch)}"
-            )
         if len(keep_sequence_logits) != len(output_indices):
             raise RuntimeError(
                 "Normal batch sequence-logit flags must match output indices: "
@@ -2564,16 +1815,14 @@ class MbltWorker(WorkerBase):
                 output_index=output_index,
                 input_embeds=input_embeds,
                 deepstack_embeds=None if deepstack_embeds_batch is None else deepstack_embeds,
-                rope_embeds=None if rope_embeds_batch is None else rope_embeds,
                 cache_size=cache_size,
                 cache_id=cache_id,
                 full_sequence_logits=[] if keep else None,
             )
-            for output_index, input_embeds, deepstack_embeds, rope_embeds, cache_size, cache_id, keep in zip(
+            for output_index, input_embeds, deepstack_embeds, cache_size, cache_id, keep in zip(
                 output_indices,
                 input_embeds_batch,
                 [None] * len(input_embeds_batch) if deepstack_embeds_batch is None else deepstack_embeds_batch,
-                [None] * len(input_embeds_batch) if rope_embeds_batch is None else rope_embeds_batch,
                 cache_sizes,
                 cache_ids,
                 keep_sequence_logits,
@@ -2589,7 +1838,6 @@ class MbltWorker(WorkerBase):
                 batch_states = active_states[batch_start : batch_start + self.max_batch_size]
                 chunk_embeds_batch: list[np.ndarray] = []
                 chunk_deepstack_batch: list[Optional[np.ndarray]] = []
-                chunk_rope_batch: list[Optional[np.ndarray]] = []
                 chunk_cache_sizes: list[int] = []
                 chunk_cache_ids: list[int] = []
                 for state in batch_states:
@@ -2603,9 +1851,6 @@ class MbltWorker(WorkerBase):
                     chunk_deepstack_batch.append(
                         None if state.deepstack_embeds is None else state.deepstack_embeds[:, chunk_start:chunk_end, :]
                     )
-                    chunk_rope_batch.append(
-                        None if state.rope_embeds is None else state.rope_embeds[:, chunk_start:chunk_end, :]
-                    )
                     chunk_cache_sizes.append(state.cache_size)
                     chunk_cache_ids.append(state.cache_id)
 
@@ -2615,8 +1860,6 @@ class MbltWorker(WorkerBase):
                 infer_kwargs: dict[str, object] = {}
                 if any(deepstack_embeds is not None for deepstack_embeds in chunk_deepstack_batch):
                     infer_kwargs["deepstack_embeds_batch"] = chunk_deepstack_batch
-                if any(rope_embeds is not None for rope_embeds in chunk_rope_batch):
-                    infer_kwargs["rope_embeds_batch"] = chunk_rope_batch
                 logits_batch = self._infer_logits_batch_with_sequence(
                     input_embeds_batch=chunk_embeds_batch,
                     cache_sizes=chunk_cache_sizes,
@@ -2842,37 +2085,16 @@ class MbltWorker(WorkerBase):
                 if req_state.prompt_deepstack_embeds is not None
                 else None
             )
-            input_rope = self._build_rope_input_embeds(req_state, input_start, input_end)
             if cache_id is not None:
-                infer_kwargs: dict[str, object] = {}
-                if input_deepstack is not None:
-                    infer_kwargs["deepstack_embeds_batch"] = [input_deepstack]
-                if input_rope is not None:
-                    infer_kwargs["rope_embeds_batch"] = [input_rope]
                 logits = self._infer_logits_batch(
                     input_embeds_batch=[input_embeds],
                     cache_sizes=[fallback_cache_size],
                     cache_ids=[cache_id],
-                    **infer_kwargs,
+                    deepstack_embeds_batch=None if input_deepstack is None else [input_deepstack],
                 )[0]
             else:
-                if input_rope is None:
-                    logits = self._infer_logits(input_embeds, input_deepstack, cache_size=fallback_cache_size)
-                else:
-                    logits = self._infer_logits(
-                        input_embeds,
-                        input_deepstack,
-                        cache_size=fallback_cache_size,
-                        rope_embeds=input_rope,
-                    )
-            # _infer_logits may return a view into qbruntime's reusable output
-            # buffer.  Prompt logprob replay/microstep paths keep one row per
-            # prompt position, so each row must be detached immediately.  If we
-            # store the view, later infer() calls overwrite the same memory and
-            # every echoed prompt position can become identical to the final
-            # prefill/decode distribution (for example repeated "Hello" or
-            # " Paris" top-1 rows).
-            rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1).copy())
+                logits = self._infer_logits(input_embeds, input_deepstack, cache_size=fallback_cache_size)
+            rows.append(np.asarray(logits).reshape(-1))
             fallback_cache_size += int(input_embeds.shape[0])
 
         self._restore_own_prefix_length(cache_id, own_prefix)
@@ -2922,7 +2144,7 @@ class MbltWorker(WorkerBase):
 
         Each active request owns an isolated qbruntime cache_id.  The replay
         cache starts empty and advances one prompt position at a time, but the
-        work for different requests is submitted together through BatchParam.
+        work for different requests is submitted together in one batched forward.
         """
 
         states = [
@@ -2952,7 +2174,6 @@ class MbltWorker(WorkerBase):
                 batch_states = active_states[batch_start : batch_start + self.max_batch_size]
                 input_embeds_batch: list[np.ndarray] = []
                 deepstack_embeds_batch: list[Optional[np.ndarray]] = []
-                rope_embeds_batch: list[Optional[np.ndarray]] = []
                 cache_sizes: list[int] = []
                 cache_ids: list[int] = []
 
@@ -2971,18 +2192,14 @@ class MbltWorker(WorkerBase):
                         if state.req_state.prompt_deepstack_embeds is not None
                         else None
                     )
-                    input_rope = self._build_rope_input_embeds(state.req_state, input_start, input_end)
                     input_embeds_batch.append(input_embeds)
                     deepstack_embeds_batch.append(input_deepstack)
-                    rope_embeds_batch.append(input_rope)
                     cache_sizes.append(state.fallback_cache_size)
                     cache_ids.append(state.cache_id)
 
                 infer_kwargs: dict[str, object] = {}
                 if any(deepstack_embeds is not None for deepstack_embeds in deepstack_embeds_batch):
                     infer_kwargs["deepstack_embeds_batch"] = deepstack_embeds_batch
-                if any(rope_embeds is not None for rope_embeds in rope_embeds_batch):
-                    infer_kwargs["rope_embeds_batch"] = rope_embeds_batch
                 logits_batch = self._infer_logits_batch(
                     input_embeds_batch=input_embeds_batch,
                     cache_sizes=cache_sizes,
@@ -2991,9 +2208,7 @@ class MbltWorker(WorkerBase):
                 )
 
                 for state, input_embeds, logits in zip(batch_states, input_embeds_batch, logits_batch):
-                    # Detach from any backend-owned/reused logits buffer before
-                    # the next microstep overwrites it.
-                    state.rows.append(np.asarray(self._last_token_logits(logits)).reshape(-1).copy())
+                    state.rows.append(np.asarray(logits).reshape(-1))
                     state.fallback_cache_size += int(input_embeds.shape[0])
                     state.current_prompt_pos += 1
 
@@ -3058,18 +2273,12 @@ class MbltWorker(WorkerBase):
                     self._build_deepstack_input_embeds(state.req_state, state.cache_size, state.cache_size + 1)
                     for state in batch_states
                 ]
-                rope_embeds_batch = [
-                    self._build_rope_input_embeds(state.req_state, state.cache_size, state.cache_size + 1)
-                    for state in batch_states
-                ]
                 cache_sizes = [state.cache_size for state in batch_states]
                 cache_ids = [state.cache_id for state in batch_states]
 
                 infer_kwargs: dict[str, object] = {}
                 if any(deepstack_embeds is not None for deepstack_embeds in deepstack_embeds_batch):
                     infer_kwargs["deepstack_embeds_batch"] = deepstack_embeds_batch
-                if any(rope_embeds is not None for rope_embeds in rope_embeds_batch):
-                    infer_kwargs["rope_embeds_batch"] = rope_embeds_batch
                 logits_batch = self._infer_logits_batch(
                     input_embeds_batch=input_embeds_batch,
                     cache_sizes=cache_sizes,
@@ -3078,11 +2287,7 @@ class MbltWorker(WorkerBase):
                 )
 
                 for state, logits in zip(batch_states, logits_batch):
-                    # Keep a copy of the position-specific logits row.  Some
-                    # runtimes reuse the same output buffer for every infer()
-                    # call; storing a view would broadcast the last step's
-                    # logits across all prompt echo logprob positions.
-                    logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1).copy()
+                    logits_row = np.asarray(logits).reshape(-1)
                     prompt_pos = state.cache_size + 1
                     if prompt_pos < state.prompt_logits_end:
                         state.rows.append(logits_row)
@@ -3145,20 +2350,8 @@ class MbltWorker(WorkerBase):
         while cache_size < scheduled_end:
             input_embeds = self._build_input_embeds(req_state, cache_size, cache_size + 1)
             deepstack_embeds = self._build_deepstack_input_embeds(req_state, cache_size, cache_size + 1)
-            rope_embeds = self._build_rope_input_embeds(req_state, cache_size, cache_size + 1)
-            if rope_embeds is None:
-                logits = self._infer_logits(input_embeds, deepstack_embeds, cache_size=cache_size)
-            else:
-                logits = self._infer_logits(
-                    input_embeds,
-                    deepstack_embeds,
-                    cache_size=cache_size,
-                    rope_embeds=rope_embeds,
-                )
-            # Keep a copy of the position-specific logits row.  _infer_logits
-            # can return a view into self._infer_output_buffers/qbruntime output
-            # memory, which is overwritten by the next infer() call.
-            logits_row = np.asarray(self._last_token_logits(logits)).reshape(-1).copy()
+            logits = self._infer_logits(input_embeds, deepstack_embeds, cache_size=cache_size)
+            logits_row = np.asarray(logits).reshape(-1)
 
             # The logits emitted after consuming token at cache_size predict the
             # next token at prompt_pos=cache_size + 1.  There is no prompt
@@ -3758,10 +2951,8 @@ class MbltWorker(WorkerBase):
             cache_model_slots=len(cache_models),
             cache_slots_per_model=getattr(self.cache_backend, "k_per_model", self.max_batch_size),
         )
-        self._forward_through_model = self._can_forward_through_model()
-        self._log_init_stage("load_model:infer_route", route="model forward" if self._forward_through_model else "MXQ")
+        self._check_text_mxq_supported()
         self._reset_cache_slots()
-        self._infer_output_buffers = None
         self._calibrate_prefix_cache_prefill_costs()
         self._log_init_stage("load_model:done")
         return
@@ -4011,12 +3202,6 @@ class MbltWorker(WorkerBase):
                 new_req.mm_features,
                 int(prompt_embeds_np.shape[0]),
             )
-            # The forward builds RoPE from positions itself; only the direct MXQ path takes the embeddings.
-            prompt_rope_embeds_np = (
-                None
-                if prompt_position_ids is None or getattr(self, "_forward_through_model", False)
-                else self._build_rope_embeddings_from_position_ids(prompt_position_ids)
-            )
             cache_slot_id = self._assign_cache_slot(new_req.req_id) if self._is_batch_model() else None
 
             self.req_states[new_req.req_id] = RequestState(
@@ -4034,7 +3219,6 @@ class MbltWorker(WorkerBase):
                 num_output_tokens=0,
                 prompt_embeds=prompt_embeds_np,
                 prompt_deepstack_embeds=prompt_deepstack_embeds_np,
-                prompt_rope_embeds=prompt_rope_embeds_np,
                 prompt_position_ids=(
                     None if prompt_position_ids is None else prompt_position_ids.reshape(3, -1).contiguous()
                 ),
@@ -4129,7 +3313,6 @@ class MbltWorker(WorkerBase):
 
             input_embeds_batch: list[np.ndarray] = []
             deepstack_embeds_batch: list[Optional[np.ndarray]] = []
-            rope_embeds_batch: list[Optional[np.ndarray]] = []
             cache_sizes: list[int] = []
             cache_ids: list[int] = []
             microstep_indices: list[int] = []
@@ -4154,7 +3337,6 @@ class MbltWorker(WorkerBase):
                 self._start_request_step(req_id, req_state, cache_size, slot_id=slot_id)
                 input_embeds = self._build_input_embeds(req_state, cache_size, scheduled_end)
                 deepstack_embeds = self._build_deepstack_input_embeds(req_state, cache_size, scheduled_end)
-                rope_embeds = self._build_rope_input_embeds(req_state, cache_size, scheduled_end)
                 sequence_length = int(input_embeds.shape[0])
                 next_cache_size = cache_size + sequence_length
                 req_state.is_prefill = scheduled_end < req_state.prompt_len
@@ -4166,7 +3348,6 @@ class MbltWorker(WorkerBase):
                 sequence_lengths.append(sequence_length)
                 input_embeds_batch.append(input_embeds)
                 deepstack_embeds_batch.append(deepstack_embeds)
-                rope_embeds_batch.append(rope_embeds)
                 cache_sizes.append(cache_size)
                 cache_ids.append(slot_id)
 
@@ -4192,15 +3373,12 @@ class MbltWorker(WorkerBase):
             batched_logits: list[Optional[InferenceLogits]] = [None for _ in req_ids]
 
             if normal_indices:
-                # Batch-compiled MXQs require BatchParam even when only one request
-                # is currently active; keep active batch size 1 on the batch helper.
                 normal_logits = self._infer_normal_logits_batch_chunked(
                     output_indices=normal_indices,
                     input_embeds_batch=[input_embeds_batch[i] for i in normal_indices],
                     cache_sizes=[cache_sizes[i] for i in normal_indices],
                     cache_ids=[cache_ids[i] for i in normal_indices],
                     deepstack_embeds_batch=[deepstack_embeds_batch[i] for i in normal_indices],
-                    rope_embeds_batch=[rope_embeds_batch[i] for i in normal_indices],
                     keep_sequence_logits=[
                         self._num_prompt_logprobs(self.req_states[req_ids[i]].sampling_params) is not None
                         for i in normal_indices
@@ -4286,11 +3464,6 @@ class MbltWorker(WorkerBase):
                     cache_size,
                     scheduled_end,
                 )
-                rope_embeds = self._build_rope_input_embeds(
-                    req_state,
-                    cache_size,
-                    scheduled_end,
-                )
                 sequence_length = int(input_embeds.shape[0])
                 next_cache_size = cache_size + sequence_length
                 req_state.is_prefill = scheduled_end < req_state.prompt_len
@@ -4311,7 +3484,6 @@ class MbltWorker(WorkerBase):
                         input_embeds,
                         deepstack_embeds,
                         cache_size=cache_size,
-                        rope_embeds=rope_embeds,
                         keep_sequence_logits=self._num_prompt_logprobs(req_state.sampling_params) is not None,
                     )
                 prompt_logprob_pos_before = req_state.next_prompt_logprob_pos
@@ -4338,11 +3510,6 @@ class MbltWorker(WorkerBase):
                         0,
                         scheduled_end,
                     )
-                    rope_embeds = self._build_rope_input_embeds(
-                        req_state,
-                        0,
-                        scheduled_end,
-                    )
                     sequence_length = int(input_embeds.shape[0])
                     next_cache_size = sequence_length
                     next_cache_sizes[-1] = next_cache_size
@@ -4351,7 +3518,6 @@ class MbltWorker(WorkerBase):
                         input_embeds,
                         deepstack_embeds,
                         cache_size=0,
-                        rope_embeds=rope_embeds,
                     )
                 req_state.num_computed_tokens = next_cache_size
                 if self._should_sample_after_step(
@@ -4514,5 +3680,4 @@ class MbltWorker(WorkerBase):
         self.cache_model = None
         self.cache_backend = None
         self.input_embeddings = None
-        self._infer_output_buffers = None
         self.runtime_cache.reset()

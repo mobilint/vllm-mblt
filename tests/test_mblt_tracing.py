@@ -304,7 +304,6 @@ class TestMbltWorkerProfileHook:
         worker.model = None
         worker.cache_model = None
         worker.input_embeddings = None
-        worker._infer_output_buffers = None
         worker.runtime_cache = SimpleNamespace(reset=lambda: None)
 
         worker.profile(is_start=True)
@@ -319,7 +318,6 @@ class TestMbltWorkerProfileHook:
         worker.model = None
         worker.cache_model = None
         worker.input_embeddings = None
-        worker._infer_output_buffers = None
         worker.runtime_cache = SimpleNamespace(reset=lambda: None)
 
         worker.shutdown()

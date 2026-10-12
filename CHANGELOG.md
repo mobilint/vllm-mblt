@@ -4,6 +4,13 @@
 
 ### Changed
 
+- The worker no longer calls the MXQ itself: every model runs through the transformers-mblt forward, and the direct
+  MXQ path is removed with `VLLM_MBLT_DIRECT_INFER`. Building MXQ inputs (RoPE tables, deepstack layouts and their
+  order), `BatchParam`s, output-buffer reuse and the multi-card fan-out all live in transformers-mblt now. A Qwen3-VL
+  batch text MXQ without a RoPE input is refused at load; every Qwen3-VL Batch16 release has one.
+- Qwen3-ASR now runs through the transformers-mblt forward too: each step calls the thinker's text decoder with the
+  merged audio-text embeddings on the request's plain cache, which it decodes as one sequence. Transcriptions and
+  their speed are unchanged.
 - Mixture-of-Experts models (Qwen3-30B-A3B) now run through the same `_forward_rows` route as the other models:
   the request's own `MobilintMixtureOfExpertsCache` goes to the model forward directly (it cannot be joined), and the
   forward keeps its own prefill split, which the shared MXQs' width requires. Outputs stay within the model's

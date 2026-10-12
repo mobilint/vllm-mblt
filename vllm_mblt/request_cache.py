@@ -27,7 +27,7 @@ class RequestCacheSlots:
     Slot ``s`` is row ``divmod(s, k_per_model)`` of the cache MXQs, as in the worker's batch ``cache_id``; a
     non-batch worker has the one slot ``None`` on ``(models[0], 0)``. A Mixture-of-Experts model keeps its KV in
     every shared MXQ and binds its cache inside its own forward: ``moe`` is the worker's
-    :class:`~vllm_mblt.moe_runtime.MbltMoECacheModel`, and preparing a cache hands it to that adapter.
+    :class:`~vllm_mblt.moe_runtime.MbltMoECacheModel`, which builds its caches.
     """
 
     def __init__(
@@ -105,9 +105,7 @@ class RequestCacheSlots:
 
         Without a cache (prefill-cost calibration) the slot's owner is saved and the slot is left unowned.
         """
-        if self.moe is not None:
-            self.moe.use_cache(cache)
-        elif cache is None:
+        if self.moe is None and cache is None:
             bind_cacheless([(self.models[self._row_slot(slot_id)[0]], self._row_slot(slot_id)[1])])
         if cache is None:
             return
@@ -119,8 +117,3 @@ class RequestCacheSlots:
         if self.moe is None:
             cache.bind_rows(self._topology, [0])
 
-    def commit(self, cache: Optional[Any], num_tokens: int) -> None:
-        """Record that the infer just written ``num_tokens`` tokens of KV after the prepared position."""
-        if cache is None or self.moe is not None:
-            return  # the MoE forward advances its own cache
-        cache.update_seen_tokens(int(num_tokens))
