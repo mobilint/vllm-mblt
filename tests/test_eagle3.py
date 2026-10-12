@@ -290,6 +290,8 @@ def test_platform_refuses_sampling_options_eagle3_rounds_cannot_honor() -> None:
     MbltPlatform.check_and_update_config(_eagle3_vllm_config())
     try:
         MbltPlatform.validate_request("p", SamplingParams(temperature=0.6, top_p=0.9, top_k=20), {"type": "token"})
+        # vLLM fans n > 1 out into child requests with their own ids, so each candidate gets its own cache.
+        MbltPlatform.validate_request("p", SamplingParams(n=3, temperature=0.8), {"type": "token"})
         with pytest.raises(ValueError, match="unsupported here: logprobs, repetition_penalty, seed"):
             MbltPlatform.validate_request(
                 "p", SamplingParams(logprobs=1, repetition_penalty=1.1, seed=3), {"type": "token"}
