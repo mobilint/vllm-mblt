@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 ### Added
 
@@ -11,7 +11,7 @@
   EAGLE3-JPharmatron-7B it decodes at about 11.9 tokens/s. The base MXQ holds one sequence, so the scheduler runs one
   request at a time, and prefix caching is off. Requests sample with temperature, top-k and top-p only: the platform
   refuses logprobs, penalties, `min_p`, `min_tokens`, seeds, logit bias, allowed or bad words, logits processors and
-  structured output with HTTP 400. Needs a transformers-mblt release with the round API (newer than 0.4.0).
+  structured output with HTTP 400. Needs transformers-mblt 0.5.0, which adds the round API.
 
 ### Changed
 

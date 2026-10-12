@@ -68,8 +68,8 @@ class Eagle3Runner:
     def __init__(self, model: Any, *, max_model_len: int) -> None:
         if not callable(getattr(model, "eagle3_decode_step", None)):
             raise RuntimeError(
-                "Serving EAGLE-3 needs a transformers-mblt release with eagle3_prefill / eagle3_decode_step "
-                "(newer than 0.4.0)."
+                "Serving EAGLE-3 needs transformers-mblt 0.5.0 or newer, which adds eagle3_prefill / "
+                "eagle3_decode_step."
             )
         self.model = model
         self.max_model_len = int(max_model_len)
