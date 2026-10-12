@@ -61,7 +61,6 @@ def _make_request_state(
         num_output_tokens=0,
         prompt_embeds=np.zeros((prompt_len, 2), dtype=np.float32),
         prompt_deepstack_embeds=None,
-        prompt_rope_embeds=None,
         mrope_position_delta=0,
         is_multimodal=False,
         prompt_len=prompt_len,
@@ -76,7 +75,7 @@ def _run(worker: MbltWorker, req_id: str, req_state: RequestState, num_tokens: i
     worker.req_states[req_id] = req_state
     cache_size = worker._load_snapshot_if_needed(req_id, req_state, slot_id=req_state.cache_slot_id)
     worker._start_request_step(req_id, req_state, cache_size, slot_id=req_state.cache_slot_id)
-    worker.request_caches.commit(req_state.kv_cache, num_tokens - cache_size)
+    req_state.kv_cache.update_seen_tokens(num_tokens - cache_size)
     req_state.num_computed_tokens = num_tokens
     return cache_size
 

@@ -49,7 +49,6 @@ def _make_worker(*, max_batch_size: int, full_logits: bool = False) -> MbltWorke
     worker.req_states = {}
     worker.model = _RecordingModel()
     worker.cache_model = object()  # the text MXQ handle; tests never call it on this route
-    worker._forward_through_model = True
     worker._runtime_output_logits_mode = lambda _length: "full_sequence" if full_logits else "last_token"
     attach_request_caches(worker, k_per_model=max(max_batch_size, 1))
     return worker
@@ -144,42 +143,21 @@ def test_calibration_before_any_request_runs_on_a_scratch_cache() -> None:
 
 
 @pytest.mark.parametrize(
-    ("change", "expected"),
-    [
-        ({}, True),
-        ({"env": "1"}, False),
-        ({"model_type": "mobilint-qwen3_asr"}, True),
-        ({"model_type": "mobilint-qwen3_asr", "inputs": 2}, False),
-        ({"inputs": 2}, False),
-        ({"moe": True}, True),
-        ({"qwen3_vl": True}, True),
-        ({"qwen3_vl": True, "batch": True, "rope_input": True}, True),
-        ({"qwen3_vl": True, "batch": True}, False),
-    ],
-    ids=[
-        "text",
-        "env-direct",
-        "audio-text",
-        "audio-text-extra-mxq-inputs",
-        "extra-mxq-inputs",
-        "moe",
-        "qwen3-vl-non-batch",
-        "qwen3-vl-batch-rope-input",
-        "qwen3-vl-batch-static",
-    ],
+    ("batch", "rope_input", "supported"),
+    [(False, False, True), (True, True, True), (True, False, False)],
+    ids=["non-batch-static", "batch-rope-input", "batch-static"],
 )
-def test_which_models_forward_through_transformers_mblt(monkeypatch, change, expected) -> None:
+def test_only_a_batched_qwen3_vl_text_mxq_without_rope_input_is_refused(batch, rope_input, supported) -> None:
     worker = MbltWorker.__new__(MbltWorker)
-    worker.max_batch_size = 16 if change.get("batch") else 1
-    worker.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=change.get("model_type", "llama")))
-    worker.cache_model = MbltMoECacheModel.__new__(MbltMoECacheModel) if change.get("moe") else object()
-    worker._supports_deepstack_input = lambda: change.get("qwen3_vl", False)
-    worker._text_mxq_uses_rope_input = lambda: change.get("rope_input", False)
-    worker._get_cache_model = lambda: worker.cache_model
-    worker._cache_model_input_shapes = lambda _model: [(1, -1, 8)] * change.get("inputs", 1)
-    monkeypatch.setenv("VLLM_MBLT_DIRECT_INFER", change.get("env", "0"))
+    worker.max_batch_size = 16 if batch else 1
+    worker._supports_deepstack_input = lambda: True
+    worker._text_mxq_uses_rope_input = lambda: rope_input
 
-    assert worker._can_forward_through_model() is expected
+    if supported:
+        worker._check_text_mxq_supported()
+    else:
+        with pytest.raises(RuntimeError, match="without a RoPE input"):
+            worker._check_text_mxq_supported()
 
 
 class _RecordingTextDecoder(_RecordingModel):

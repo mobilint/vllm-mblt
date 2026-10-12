@@ -1,4 +1,3 @@
-import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,7 +24,7 @@ from vllm_mblt.mblt_worker import (
 )
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest
 
-from .kv_slot_fakes import FakeKVSlotModel, attach_request_caches, make_snapshot_cache
+from .kv_slot_fakes import FakeForwardModel, FakeKVSlotModel, attach_request_caches, make_snapshot_cache
 
 
 class TestMbltWorkerOptimizations:
@@ -354,6 +353,20 @@ class TestMbltWorkerOptimizations:
         worker.kv_slot_models = attach_request_caches(worker, k_per_model=64)
         return worker
 
+    def _install_zero_forward(self, worker: MbltWorker, vocab_size: int) -> FakeForwardModel:
+        """Make ``worker`` run every step through a forward returning zero logits; return it to read its calls."""
+        worker.model = FakeForwardModel(
+            lambda embeds, _cache_size, _slot: np.zeros((len(embeds), vocab_size), dtype=np.float32),
+            config=worker.model.config,
+        )
+        return worker.model
+
+    def _activate(self, worker: MbltWorker, req_id: str, req_state: RequestState, slot_id: int, tokens: int) -> None:
+        """Make ``req_id``'s cache, holding ``tokens`` tokens, the one this step's infers on ``slot_id`` run on."""
+        worker.req_states[req_id] = req_state
+        worker._activate_request_cache(req_id, req_state, slot_id)
+        req_state.kv_cache.fake_prefill(tokens)
+
     def _make_scheduler_output(self, num_scheduled_tokens: dict[str, int]) -> SimpleNamespace:
         return SimpleNamespace(
             finished_req_ids=[],
@@ -412,7 +425,6 @@ class TestMbltWorkerOptimizations:
             num_output_tokens=0,
             prompt_embeds=np.empty((0, 1), dtype=np.float32),
             prompt_deepstack_embeds=None,
-            prompt_rope_embeds=None,
             mrope_position_delta=0,
             is_multimodal=False,
             prompt_len=0,
@@ -783,20 +795,14 @@ class TestMbltWorkerOptimizations:
         worker.max_batch_size = 4
         worker.max_seq_len = 128
         worker.input_embeddings = torch.nn.Embedding(1, 4)
-        calls = []
-
-        def infer(inputs, *, params):
-            calls.extend((int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params)
-            total_tokens = sum(int(param.sequence_length) for param in params)
-            return [np.zeros((1, total_tokens, 8), dtype=np.float32)]
-
-        worker.cache_model = SimpleNamespace(infer=infer)
+        worker.cache_model = SimpleNamespace()
+        forward = self._install_zero_forward(worker, vocab_size=8)
         worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=128)
 
         worker._calibrate_prefix_cache_prefill_costs()
 
-        assert calls
-        assert all(call == (128, 0, 1) for call in calls)
+        assert forward.calls
+        assert all(call == ((128, 0, 1),) for call in forward.calls)
         assert worker.prefix_cache_cost_model.prefill_ms(128) is not None
 
     def test_llm_prefix_cache_dump_saves_prompt_and_generated_token_identity(self) -> None:
@@ -1481,7 +1487,7 @@ class TestMbltWorkerOptimizations:
         vocab_size = max(prompt_token_ids) + 1
         calls: list[tuple[int, int, int]] = []
 
-        def infer_logits_batch(input_embeds_batch, cache_sizes, cache_ids):
+        def infer_logits_batch(input_embeds_batch, cache_sizes, cache_ids, deepstack_embeds_batch=None):
             assert len(input_embeds_batch) == len(cache_sizes) == len(cache_ids) == 1
             submitted_tokens = int(input_embeds_batch[0].shape[0])
             cache_size = int(cache_sizes[0])
@@ -1581,23 +1587,14 @@ class TestMbltWorkerOptimizations:
         req_state.prompt_len = len(prompt_token_ids)
         req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
 
-        calls: list[tuple[int, int, int]] = []
-        vocab_size = 320
-
-        def infer(_inputs, *, params):
-            calls.extend((int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params)
-            return [np.zeros((len(params), vocab_size), dtype=np.float32)]
-
-        worker.cache_model = SimpleNamespace(
-            infer=infer,
-            get_model_output_shape=lambda: [(2, vocab_size)],
-        )
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(2, 320)])
+        forward = self._install_zero_forward(worker, vocab_size=320)
+        self._activate(worker, "req", req_state, 7, 256)
 
         outputs = worker._run_prompt_logprob_microsteps_batch([(0, "req", req_state, 256, 258, 7)])
 
         assert set(outputs) == {0}
-        assert calls == [(1, 256, 7), (1, 257, 7)]
-        assert all(sequence_length == 1 for sequence_length, _cache_size, _cache_id in calls)
+        assert forward.calls == [((1, 256, 7),), ((1, 257, 7),)]
 
     def test_prompt_logprob_microsteps_batch_requests_up_to_max_batch_size(self) -> None:
         worker = self._make_worker()
@@ -1611,19 +1608,10 @@ class TestMbltWorkerOptimizations:
             req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
             req_states.append(req_state)
 
-        calls: list[tuple[tuple[int, int, int], ...]] = []
-        vocab_size = 64
-
-        def infer(_inputs, *, params):
-            calls.append(
-                tuple((int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params)
-            )
-            return [np.zeros((len(params), vocab_size), dtype=np.float32)]
-
-        worker.cache_model = SimpleNamespace(
-            infer=infer,
-            get_model_output_shape=lambda: [(2, vocab_size)],
-        )
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(2, 64)])
+        forward = self._install_zero_forward(worker, vocab_size=64)
+        for req_id, req_state, slot_id in zip(("req-a", "req-b", "req-c"), req_states, (11, 12, 13)):
+            self._activate(worker, req_id, req_state, slot_id, 0)
 
         outputs = worker._run_prompt_logprob_microsteps_batch(
             [
@@ -1634,7 +1622,7 @@ class TestMbltWorkerOptimizations:
         )
 
         assert set(outputs) == {0, 1, 2}
-        assert calls == [
+        assert forward.calls == [
             ((1, 0, 11), (1, 0, 12)),
             ((1, 0, 13),),
             ((1, 1, 11), (1, 1, 12)),
@@ -1896,10 +1884,9 @@ class TestMbltWorkerOptimizations:
         req_state.prompt_len = 2
         req_state.prompt_embeds = np.ones((2, 4), dtype=np.float32)
 
-        worker.cache_model = SimpleNamespace(
-            infer=lambda _inputs, *, params: [np.zeros((len(params), 8), dtype=np.float32)],
-            get_model_output_shape=lambda: [(1, 8)],
-        )
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, 8)])
+        self._install_zero_forward(worker, vocab_size=8)
+        self._activate(worker, "req", req_state, 0, 0)
 
         caplog.set_level("WARNING")
         worker._run_prompt_logprob_microsteps_batch([(0, "req", req_state, 0, 1, 0)])
@@ -1932,32 +1919,19 @@ class TestMbltWorkerOptimizations:
         assert req_state.next_prompt_logprob_pos == len(prompt_token_ids)
         assert not worker._should_recompute_prompt_logprobs_from_start(req_state)
 
-    def test_2d_single_row_logits_are_not_treated_as_full_sequence_logits(self) -> None:
-        vocab_size = 8
-        last_token_logits = np.zeros((1, vocab_size), dtype=np.float32)
-
-        assert MbltWorker._normalize_sequence_logits(last_token_logits, expected_seq_len=2) is None
-        sequence_logits = MbltWorker._normalize_sequence_logits(last_token_logits, expected_seq_len=1)
-        assert sequence_logits is last_token_logits
-
     def test_runtime_last_token_shape_is_not_prompt_sequence_logits_for_batch1_single_core(self) -> None:
         worker = self._make_worker()
         worker.max_batch_size = 1
         worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, 8)])
-        last_token_logits = np.zeros((1, 8), dtype=np.float32)
 
         assert worker._runtime_output_logits_mode(input_seq_len=1) == "last_token"
-        assert worker._normalize_runtime_sequence_logits(last_token_logits, expected_seq_len=1) is None
 
     def test_runtime_full_sequence_shape_is_preserved_for_prompt_logprobs(self) -> None:
         worker = self._make_worker()
         worker.max_batch_size = 1
         worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(-1, 8)])
-        sequence_logits = np.zeros((3, 8), dtype=np.float32)
 
-        normalized = worker._normalize_runtime_sequence_logits(sequence_logits, expected_seq_len=3)
-
-        assert normalized is sequence_logits
+        assert worker._runtime_output_logits_mode(input_seq_len=3) == "full_sequence"
 
     def test_batch1_single_core_echo_prompt_logprobs_microstep_live_cache_not_final_row(self) -> None:
         worker = self._make_worker()
@@ -1965,7 +1939,6 @@ class TestMbltWorkerOptimizations:
         worker.req_states = {}
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker.print_debug = False
-        worker._infer_output_buffers = None
 
         # The simple prompt mirrors "The capital of France is" tokenized into a
         # short sequence for this worker-level regression.  Requesting both
@@ -1982,10 +1955,8 @@ class TestMbltWorkerOptimizations:
 
         infer_calls: list[tuple[int, int]] = []
 
-        def infer(inputs, *, cache_size, outputs=None):
-            input_embeds = np.asarray(inputs[0] if isinstance(inputs, list) else inputs)
-            sequence_length = int(input_embeds.shape[1])
-            cache_size = int(cache_size)
+        def step(input_embeds, cache_size, _slot):
+            sequence_length = int(input_embeds.shape[0])
             infer_calls.append((sequence_length, cache_size))
             prompt_pos = cache_size + sequence_length
             if prompt_pos >= len(prompt_token_ids):
@@ -2002,11 +1973,8 @@ class TestMbltWorkerOptimizations:
             logits[0, 20 + prompt_pos] = 39.0
             return [logits]
 
-        worker.cache_model = SimpleNamespace(
-            infer=infer,
-            get_model_output_shape=lambda: [(1, vocab_size)],
-            get_num_model_variants=lambda: 0,
-        )
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, vocab_size)])
+        worker.model = FakeForwardModel(step, config=worker.model.config)
         worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
 
         output = worker.execute_model(self._make_scheduler_output({"france": len(prompt_token_ids)}))
@@ -2069,7 +2037,7 @@ class TestMbltWorkerOptimizations:
             ),
         ],
     )
-    def test_echo_prompt_logprob_microsteps_copy_rows_from_reused_runtime_output_buffer(
+    def test_echo_prompt_logprob_microsteps_keep_each_position_row(
         self,
         name: str,
         prompt_token_ids: list[int],
@@ -2080,7 +2048,6 @@ class TestMbltWorkerOptimizations:
         worker.req_states = {}
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker.print_debug = False
-        worker._infer_output_buffers = None
 
         generated_token_id = 7
         vocab_size = max(max(prompt_token_ids), repeated_final_top_id, generated_token_id) + 16
@@ -2090,7 +2057,7 @@ class TestMbltWorkerOptimizations:
         req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
         worker.req_states = {name: req_state}
 
-        infer_calls: list[tuple[int, int, bool]] = []
+        infer_calls: list[tuple[int, int]] = []
 
         def make_logits(cache_size: int, sequence_length: int) -> np.ndarray:
             prompt_pos = cache_size + sequence_length
@@ -2108,28 +2075,18 @@ class TestMbltWorkerOptimizations:
                 logits[0, (20 + prompt_pos) % vocab_size] = 39.0
             return logits
 
-        def infer(inputs, *, cache_size, outputs=None):
-            input_embeds = np.asarray(inputs[0] if isinstance(inputs, list) else inputs)
-            sequence_length = int(input_embeds.shape[1])
-            cache_size = int(cache_size)
-            infer_calls.append((sequence_length, cache_size, outputs is not None))
-            logits = make_logits(cache_size, sequence_length)
-            if outputs is not None:
-                outputs[0][...] = logits
-                return None
-            return [logits]
+        def step(input_embeds, cache_size, _slot):
+            infer_calls.append((int(input_embeds.shape[0]), cache_size))
+            return make_logits(cache_size, int(input_embeds.shape[0]))
 
-        worker.cache_model = SimpleNamespace(
-            infer=infer,
-            get_model_output_shape=lambda: [(1, vocab_size)],
-            get_num_model_variants=lambda: 0,
-        )
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, vocab_size)])
+        worker.model = FakeForwardModel(step, config=worker.model.config)
         worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
 
         output = worker.execute_model(self._make_scheduler_output({name: len(prompt_token_ids)}))
 
         assert output is not None
-        assert infer_calls == [(1, pos, pos > 0) for pos in range(len(prompt_token_ids))]
+        assert infer_calls == [(1, pos) for pos in range(len(prompt_token_ids))]
         assert output.sampled_token_ids[output.req_id_to_index[name]].tolist() == [generated_token_id]
         assert output.logprobs is not None
         assert output.logprobs.logprob_token_ids.tolist()[0][0] == generated_token_id
@@ -2174,8 +2131,9 @@ class TestMbltWorkerOptimizations:
 
         assert worker._needs_last_logit_prompt_logprob_microsteps(req_state, sequence_length=128)
 
-    def _make_fake_batch_mxq(
+    def _install_fake_batch_mxq(
         self,
+        worker: MbltWorker,
         *,
         full_logits: bool,
         vocab_size: int,
@@ -2183,42 +2141,32 @@ class TestMbltWorkerOptimizations:
         next_token: dict[int, list[int]],
         infer_calls: list[tuple[tuple[int, int, int], ...]],
         token_budget: int = 256,
-    ) -> SimpleNamespace:
-        """Fake batch MXQ with the shapes a real one reports.
+    ) -> None:
+        """Give ``worker`` a fake batch MXQ with the shapes a real one reports, and a forward over it.
 
         Both kinds declare ``[1, -1, vocab]``; the output buffer's max width is
         the token budget for a full-logits MXQ and the row count for a
         last-logit one (Llama-3.2-1B bs16 reports input 256 / output 16).
-        ``infer`` returns ``[1, 1, rows, vocab]`` as qbruntime does for a batch
-        MXQ, one row per packed token or one per request.
         ``next_token[cache_id][p]`` is the token the logits at absolute
-        position ``p`` of that slot predict.
+        position ``p`` of that slot predict. Every forward appends its rows
+        to ``infer_calls`` as ``(tokens, cache_size, cache_id)``.
         """
 
-        def infer(inputs, *, params):
-            text_input = np.asarray(inputs[0])
-            assert text_input.ndim == 4
-            call = tuple((int(p.sequence_length), int(p.cache_size), int(p.cache_id)) for p in params)
-            assert text_input.shape[2] == sum(seq_len for seq_len, _, _ in call)
-            infer_calls.append(call)
-            rows = []
-            for seq_len, cache_size, cache_id in call:
-                positions = range(cache_size, cache_size + seq_len) if full_logits else [cache_size + seq_len - 1]
-                for position in positions:
-                    row = np.full(vocab_size, -40.0, dtype=np.float32)
-                    row[next_token[cache_id][position]] = 40.0
-                    rows.append(row)
-            return [np.stack(rows)[None, None]]
+        def step(embeds, cache_size, cache_id):
+            positions = range(cache_size, cache_size + len(embeds)) if full_logits else [cache_size + len(embeds) - 1]
+            rows = np.full((len(positions), vocab_size), -40.0, dtype=np.float32)
+            for row, position in enumerate(positions):
+                rows[row, next_token[cache_id][position]] = 40.0
+            return rows
 
         output_width = token_budget if full_logits else max_batch_size
-        return SimpleNamespace(
-            infer=infer,
+        worker.cache_model = SimpleNamespace(
             get_model_output_shape=lambda: [(1, -1, vocab_size)],
             get_input_buffer_info=lambda: [SimpleNamespace(max_width=token_budget)],
             get_output_buffer_info=lambda: [SimpleNamespace(max_width=output_width)],
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(get_model_input_shape=lambda: [(1, -1, 4)]),
         )
+        worker.model = FakeForwardModel(step, config=worker.model.config)
+        worker.model.calls = infer_calls
 
     def _make_batch_prompt_state(
         self,
@@ -2309,7 +2257,8 @@ class TestMbltWorkerOptimizations:
             1: plain_prompt[1:] + [42],
         }
         infer_calls: list[tuple[tuple[int, int, int], ...]] = []
-        worker.cache_model = self._make_fake_batch_mxq(
+        self._install_fake_batch_mxq(
+            worker,
             full_logits=True,
             vocab_size=vocab_size,
             max_batch_size=4,
@@ -2356,7 +2305,8 @@ class TestMbltWorkerOptimizations:
         vocab_size = 64
         next_token = {0: [12, 13, 14, 41], 1: [22, 23, 42]}
         infer_calls: list[tuple[tuple[int, int, int], ...]] = []
-        worker.cache_model = self._make_fake_batch_mxq(
+        self._install_fake_batch_mxq(
+            worker,
             full_logits=True,
             vocab_size=vocab_size,
             max_batch_size=4,
@@ -2394,58 +2344,14 @@ class TestMbltWorkerOptimizations:
 
         assert worker._runtime_output_logits_mode(input_seq_len=4) == "unknown"
 
-    def _run_batch_group(self, worker: MbltWorker, sequence_lengths: list[int], output: np.ndarray):
-        worker.cache_model = SimpleNamespace(
-            infer=lambda _inputs, *, params: [output],
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(get_model_input_shape=lambda: [(1, -1, 4)]),
-        )
-        return worker._infer_logits_batch_group(
-            worker.cache_model,
-            [np.ones((seq_len, 4), dtype=np.float32) for seq_len in sequence_lengths],
-            [0] * len(sequence_lengths),
-            list(range(len(sequence_lengths))),
-            None,
-            None,
-        )
-
-    def test_batch_group_rejects_rows_matching_neither_tokens_nor_requests(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 4
-        # Two requests, 3 + 1 tokens: neither 4 rows nor 2 rows.
-        with pytest.raises(RuntimeError, match="unexpected sequence length"):
-            self._run_batch_group(worker, [3, 1], np.zeros((1, 1, 3, 8), dtype=np.float32))
-
-    def test_batch_group_rejects_empty_input_slice(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 4
-        worker.cache_model = SimpleNamespace(infer=lambda *_args, **_kwargs: pytest.fail("infer ran"))
-        # Two rows for two requests would pass the last-token reading, so the
-        # empty slice must be refused before infer, not after.
-        with pytest.raises(RuntimeError, match="empty input embedding slice"):
-            self._run_batch_group(worker, [2, 0], np.zeros((1, 1, 2, 8), dtype=np.float32))
-
-    def test_batch_group_full_logits_rows_do_not_view_the_chunk_output(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 4
-        output = np.arange(4 * 8, dtype=np.float32).reshape(1, 1, 4, 8)
-
-        logits = self._run_batch_group(worker, [3, 1], output)
-
-        assert [row.full_sequence_logits.shape for row in logits] == [(3, 8), (1, 8)]
-        for row in logits:
-            assert not np.shares_memory(row.full_sequence_logits, output)
-            assert not np.shares_memory(row.last_token_logits, output)
-        np.testing.assert_array_equal(logits[0].full_sequence_logits, output[0, 0, :3])
-        np.testing.assert_array_equal(logits[1].last_token_logits, output[0, 0, 3])
-
     def test_batch_last_logit_prompt_logprobs_still_use_microsteps(self) -> None:
         worker = self._make_batch_worker(max_batch_size=4)
         vocab_size = 64
         scored_prompt = [11, 12, 13, 14]
         next_token = {0: scored_prompt[1:] + [41]}
         infer_calls: list[tuple[tuple[int, int, int], ...]] = []
-        worker.cache_model = self._make_fake_batch_mxq(
+        self._install_fake_batch_mxq(
+            worker,
             full_logits=False,
             vocab_size=vocab_size,
             max_batch_size=4,
@@ -2483,7 +2389,8 @@ class TestMbltWorkerOptimizations:
             2: [7, 8, 9, 52],
         }
         infer_calls: list[tuple[tuple[int, int, int], ...]] = []
-        worker.cache_model = self._make_fake_batch_mxq(
+        self._install_fake_batch_mxq(
+            worker,
             full_logits=full_logits,
             vocab_size=vocab_size,
             max_batch_size=4,
@@ -2512,7 +2419,8 @@ class TestMbltWorkerOptimizations:
         }
         next_token = {slot: [0, 10 + slot, 20 + slot] for slot in range(3)}
         infer_calls: list[tuple[tuple[int, int, int], ...]] = []
-        worker.cache_model = self._make_fake_batch_mxq(
+        self._install_fake_batch_mxq(
+            worker,
             full_logits=full_logits,
             vocab_size=vocab_size,
             max_batch_size=4,
@@ -2860,7 +2768,7 @@ class TestMbltWorkerOptimizations:
                 mm_features=[feature],
             )
 
-    def test_build_prompt_rope_embeds_passes_mixed_dynamic_features_to_model_zoo(self) -> None:
+    def test_build_prompt_position_ids_passes_mixed_dynamic_features_to_model_zoo(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
         worker.cache_model = SimpleNamespace(
@@ -2879,19 +2787,16 @@ class TestMbltWorkerOptimizations:
 
         worker.model = SimpleNamespace(
             config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
-            get_language_model=lambda: SimpleNamespace(
-                rotary_emb=lambda _x, position_ids: position_ids[0].unsqueeze(-1).repeat(1, 1, 2).float()
-            ),
             get_mrope_input_positions=get_mrope_input_positions,
         )
 
-        rope, delta = worker._build_prompt_rope_embeds([1, 2, 3, 4, 5], features, prompt_len=5)
+        positions, delta = worker._build_prompt_position_ids([1, 2, 3, 4, 5], features, prompt_len=5)
 
-        assert rope is not None
+        assert positions is not None
         assert delta == 4
         assert captured == {"prompt_token_ids": [1, 2, 3, 4, 5], "mm_features": features}
 
-    def test_build_prompt_rope_embeds_uses_qwen3_vl_rope_index_and_image_grid(self) -> None:
+    def test_build_prompt_position_ids_uses_qwen3_vl_rope_index_and_image_grid(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
         worker.cache_model = SimpleNamespace(
@@ -2902,19 +2807,13 @@ class TestMbltWorkerOptimizations:
         )
         captured = {}
 
-        def rotary_emb(_x, position_ids):
-            captured["position_ids"] = position_ids.clone()
-            return position_ids[0].to(torch.float32).unsqueeze(-1).repeat(1, 1, 2).numpy()
-
         def get_rope_index(**kwargs):
             captured["rope_kwargs"] = kwargs
             position_ids = torch.arange(5, dtype=torch.long).view(1, 1, -1).expand(3, 1, -1) + 10
             return position_ids, torch.tensor([[7]], dtype=torch.long)
 
-        language_model = SimpleNamespace(rotary_emb=rotary_emb)
         worker.model = SimpleNamespace(
             config=SimpleNamespace(model_type="mobilint-qwen3_vl"),
-            get_language_model=lambda: language_model,
             model=SimpleNamespace(get_rope_index=get_rope_index),
         )
         feature = self._make_mm_feature(
@@ -2922,17 +2821,16 @@ class TestMbltWorkerOptimizations:
             data={"image_grid_thw": torch.tensor([1, 4, 4]), "pixel_values": torch.zeros(16, 2)},
         )
 
-        rope, delta = worker._build_prompt_rope_embeds([1, 2, 3, 4, 5], [feature], prompt_len=5)
+        positions, delta = worker._build_prompt_position_ids([1, 2, 3, 4, 5], [feature], prompt_len=5)
 
         assert delta == 7
-        assert rope is not None
-        assert tuple(rope.shape) == (1, 5, 2)
-        np.testing.assert_array_equal(rope[0, :, 0], np.arange(10, 15, dtype=np.float32))
+        assert tuple(positions.shape) == (3, 1, 5)
+        assert positions[0, 0].tolist() == list(range(10, 15))
         assert tuple(captured["rope_kwargs"]["image_grid_thw"].shape) == (1, 3)
         assert captured["rope_kwargs"]["video_grid_thw"] is None
         assert captured["rope_kwargs"]["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
 
-    def test_build_prompt_rope_embeds_uses_qwen3_vl_rope_index_and_video_grid(self) -> None:
+    def test_build_prompt_position_ids_uses_qwen3_vl_rope_index_and_video_grid(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
         worker.cache_model = SimpleNamespace(
@@ -2949,9 +2847,6 @@ class TestMbltWorkerOptimizations:
 
         worker.model = SimpleNamespace(
             config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
-            get_language_model=lambda: SimpleNamespace(
-                rotary_emb=lambda _x, position_ids: position_ids[0].unsqueeze(-1).repeat(1, 1, 2).float()
-            ),
             model=SimpleNamespace(get_rope_index=get_rope_index),
         )
         feature = self._make_mm_feature(
@@ -2959,84 +2854,15 @@ class TestMbltWorkerOptimizations:
             data={"video_grid_thw": torch.tensor([16, 12, 20]), "pixel_values_videos": torch.zeros(3840, 2)},
         )
 
-        rope, delta = worker._build_prompt_rope_embeds([1, 2, 3, 4, 5], [feature], prompt_len=5)
+        positions, delta = worker._build_prompt_position_ids([1, 2, 3, 4, 5], [feature], prompt_len=5)
 
-        assert rope is not None
+        assert positions is not None
         assert delta == 3
         assert captured["image_grid_thw"] is None
         assert captured["video_grid_thw"].tolist() == [[16, 12, 20]]
         assert "second_per_grid_ts" not in captured
 
-    def test_build_rope_embeddings_passes_context_tensor_to_rotary_embedding(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        captured = {}
-
-        def rotary_emb(x, position_ids):
-            captured["device"] = x.device
-            captured["dtype"] = x.dtype
-            return position_ids[0].to(dtype=x.dtype, device=x.device).unsqueeze(-1).repeat(1, 1, 2)
-
-        worker.model = SimpleNamespace(
-            config=SimpleNamespace(model_type="mobilint-qwen3_vl"),
-            get_language_model=lambda: SimpleNamespace(rotary_emb=rotary_emb),
-        )
-        position_ids = torch.arange(3, dtype=torch.long).view(1, 1, -1).expand(3, 1, -1)
-
-        rope = worker._build_rope_embeddings_from_position_ids(position_ids)
-
-        assert captured == {"device": torch.device("cpu"), "dtype": torch.float32}
-        np.testing.assert_array_equal(
-            rope,
-            np.asarray([[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]], dtype=np.float32),
-        )
-
-    def test_build_rope_embeddings_uses_model_zoo_27_runtime_helper(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        expected = np.full((1, 2, 6), 7.0, dtype=np.float32)
-        worker.model = SimpleNamespace(
-            get_language_model=lambda: SimpleNamespace(
-                _mobilint_rotary_emb=lambda _x, _position_ids: expected,
-                rotary_emb=None,
-            )
-        )
-
-        rope = worker._build_rope_embeddings_from_position_ids(torch.zeros((3, 1, 2), dtype=torch.long))
-
-        np.testing.assert_array_equal(rope, expected)
-
-    def test_build_rope_input_embeds_uses_prompt_rows_and_mrope_delta_for_decode(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 2), (2, -1, 4)]
-            ),
-        )
-
-        def rotary_emb(_x, position_ids):
-            return position_ids[0].to(torch.float32).unsqueeze(-1).repeat(1, 1, 2).numpy()
-
-        worker.model = SimpleNamespace(
-            config=SimpleNamespace(model_type="mobilint-qwen3_vl", vocab_size=32000),
-            get_language_model=lambda: SimpleNamespace(rotary_emb=rotary_emb),
-        )
-        req_state = self._make_request_state(worker, SamplingParams.from_optional(), [1, 2, 3])
-        req_state.prompt_len = 3
-        req_state.prompt_rope_embeds = np.asarray([[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]], dtype=np.float32)
-        req_state.mrope_position_delta = 5
-
-        rope = worker._build_rope_input_embeds(req_state, 2, 5)
-
-        assert rope is not None
-        np.testing.assert_array_equal(
-            rope,
-            np.asarray([[[2.0, 2.0], [8.0, 8.0], [9.0, 9.0]]], dtype=np.float32),
-        )
-
-    def test_build_prompt_rope_embeds_rejects_multimodal_without_mrope_helper(self) -> None:
+    def test_build_prompt_position_ids_rejects_multimodal_without_mrope_helper(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
         worker.cache_model = SimpleNamespace(
@@ -3047,7 +2873,6 @@ class TestMbltWorkerOptimizations:
         )
         worker.model = SimpleNamespace(
             config=SimpleNamespace(model_type="mobilint-qwen3_vl", vocab_size=32000),
-            get_language_model=lambda: SimpleNamespace(rotary_emb=lambda _x, _position_ids: np.zeros((1, 1, 2))),
         )
         feature = self._make_mm_feature(
             "image",
@@ -3055,7 +2880,7 @@ class TestMbltWorkerOptimizations:
         )
 
         with pytest.raises(RuntimeError, match="requires get_mrope_input_positions"):
-            worker._build_prompt_rope_embeds([1, 2, 3], [feature], prompt_len=3)
+            worker._build_prompt_position_ids([1, 2, 3], [feature], prompt_len=3)
 
     def test_build_prompt_embeds_ignores_deepstack_outputs_for_non_qwen3_vl(self) -> None:
         worker = self._make_worker()
@@ -3084,7 +2909,6 @@ class TestMbltWorkerOptimizations:
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen2_vl")
         worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", vocab_size=32000)
         worker.req_states = {}
-        worker._infer_output_buffers = None
         base_prompt_embeds = torch.arange(130 * 4, dtype=torch.float32).reshape(130, 4)
         feature = SimpleNamespace(
             modality="image",
@@ -3126,17 +2950,14 @@ class TestMbltWorkerOptimizations:
 
         infer_calls: list[tuple[int, int, np.ndarray]] = []
 
-        def infer(inputs, *, cache_size, outputs=None):
-            input_embeds = np.asarray(inputs[0] if isinstance(inputs, list) else inputs)
-            infer_calls.append((int(input_embeds.shape[1]), int(cache_size), input_embeds.copy()))
-            return [np.full((1, 16), 1.0, dtype=np.float32)]
+        def step(input_embeds, cache_size, _slot):
+            infer_calls.append((int(input_embeds.shape[0]), cache_size, input_embeds.copy()))
+            return np.full((1, 16), 1.0, dtype=np.float32)
 
         worker.model.get_image_features = get_image_features
-        worker.cache_model = SimpleNamespace(
-            infer=infer,
-            get_model_output_shape=lambda: [(1, 16)],
-            get_num_model_variants=lambda: 0,
-        )
+        language_model = FakeForwardModel(step)
+        worker.model.get_language_model = lambda: language_model
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, 16)])
         worker._make_sampling_metadata = lambda _states: None
         worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
             sampled_token_ids=torch.tensor([[7]], dtype=torch.int64),
@@ -3159,7 +2980,7 @@ class TestMbltWorkerOptimizations:
         assert output is not None
         assert image_feature_calls and tuple(image_feature_calls[0]["image_grid_thw"].shape) == (1, 3)
         assert [(sequence_length, cache_size) for sequence_length, cache_size, _inputs in infer_calls] == [(2, 128)]
-        np.testing.assert_array_equal(infer_calls[0][2][0], base_prompt_embeds[128:130].numpy())
+        np.testing.assert_array_equal(infer_calls[0][2], base_prompt_embeds[128:130].numpy())
         snapshot = worker.runtime_cache.get_snapshot("shared-text-prefix")
         assert snapshot is not None
         request_prompt_embed_identity = worker._make_prompt_embed_cache_identity(worker.req_states["vlm-hit"])
@@ -3174,7 +2995,6 @@ class TestMbltWorkerOptimizations:
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen2_vl")
         worker.model.config = SimpleNamespace(model_type="mobilint-qwen2_vl", vocab_size=32000)
         worker.req_states = {}
-        worker._infer_output_buffers = None
 
         image_feature_call_count = 0
 
@@ -3185,17 +3005,14 @@ class TestMbltWorkerOptimizations:
 
         infer_inputs: list[np.ndarray] = []
 
-        def infer(inputs, *, cache_size, outputs=None):
-            del cache_size, outputs
-            infer_inputs.append(np.asarray(inputs[0] if isinstance(inputs, list) else inputs).copy())
-            return [np.full((1, 16), 1.0, dtype=np.float32)]
+        def step(input_embeds, _cache_size, _slot):
+            infer_inputs.append(input_embeds.copy())
+            return np.full((1, 16), 1.0, dtype=np.float32)
 
         worker.model.get_image_features = get_image_features
-        worker.cache_model = SimpleNamespace(
-            infer=infer,
-            get_model_output_shape=lambda: [(1, 16)],
-            get_num_model_variants=lambda: 0,
-        )
+        language_model = FakeForwardModel(step)
+        worker.model.get_language_model = lambda: language_model
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, 16)])
         worker._make_sampling_metadata = lambda _states: None
         worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
             sampled_token_ids=torch.tensor([[7]], dtype=torch.int64),
@@ -3224,8 +3041,8 @@ class TestMbltWorkerOptimizations:
 
         assert image_feature_call_count == 2
         assert len(infer_inputs) == 2
-        np.testing.assert_array_equal(infer_inputs[0][0, 2:4], np.full((2, 4), 1.0, dtype=np.float32))
-        np.testing.assert_array_equal(infer_inputs[1][0, 2:4], np.full((2, 4), 2.0, dtype=np.float32))
+        np.testing.assert_array_equal(infer_inputs[0][2:4], np.full((2, 4), 1.0, dtype=np.float32))
+        np.testing.assert_array_equal(infer_inputs[1][2:4], np.full((2, 4), 2.0, dtype=np.float32))
 
     def test_build_deepstack_input_embeds_pads_decode_tokens(self) -> None:
         worker = self._make_worker()
@@ -3239,215 +3056,6 @@ class TestMbltWorkerOptimizations:
         np.testing.assert_array_equal(sliced[:, :2, :], req_state.prompt_deepstack_embeds[:, 2:4, :])
         np.testing.assert_array_equal(sliced[:, 2:, :], np.zeros((2, 2, 3), dtype=np.float32))
 
-    def test_build_infer_inputs_adds_zero_deepstack_for_qwen3_vl_dual_input_model(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 4)]
-            ),
-        )
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        infer_inputs = worker._build_infer_inputs(input_embeds, None)
-        assert isinstance(infer_inputs, list)
-        assert isinstance(infer_inputs, list)
-        assert tuple(infer_inputs[0].shape) == (1, 5, 4)
-        assert tuple(infer_inputs[1].shape) == (3, 5, 4)
-        np.testing.assert_array_equal(infer_inputs[1], np.zeros((3, 5, 4), dtype=np.float32))
-
-    def test_build_infer_inputs_follows_declared_deepstack_then_rope_shapes(self) -> None:
-        # max_batch_size is set but inert: these shapes are unambiguous, so the
-        # declared order decides and the batch/non-batch default never applies.
-        # test_build_infer_inputs_falls_back_to_*_order_when_shapes_are_ambiguous
-        # below covers the default itself.
-        worker = self._make_worker()
-        worker.max_batch_size = 1
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 4), (1, -1, 6)]
-            ),
-        )
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        rope_embeds = np.full((1, 5, 6), 2.0, dtype=np.float32)
-        deepstack_embeds = np.full((3, 5, 4), 3.0, dtype=np.float32)
-
-        infer_inputs = worker._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
-
-        assert isinstance(infer_inputs, list)
-        assert [tuple(item.shape) for item in infer_inputs] == [(1, 5, 4), (3, 5, 4), (1, 5, 6)]
-        np.testing.assert_array_equal(infer_inputs[1], deepstack_embeds)
-        np.testing.assert_array_equal(infer_inputs[2], rope_embeds)
-
-    def test_build_infer_inputs_follows_declared_rope_then_deepstack_shapes(self) -> None:
-        # Mirror of the test above, and max_batch_size is inert here too.
-        worker = self._make_worker()
-        worker.max_batch_size = 16
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 6), (3, -1, 4)]
-            ),
-        )
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        rope_embeds = np.full((1, 5, 6), 2.0, dtype=np.float32)
-        deepstack_embeds = np.full((3, 5, 4), 3.0, dtype=np.float32)
-
-        infer_inputs = worker._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
-
-        assert isinstance(infer_inputs, list)
-        assert [tuple(item.shape) for item in infer_inputs] == [(1, 5, 4), (1, 5, 6), (3, 5, 4)]
-        np.testing.assert_array_equal(infer_inputs[1], rope_embeds)
-        np.testing.assert_array_equal(infer_inputs[2], deepstack_embeds)
-
-    def _make_ambiguous_three_input_worker(self, max_batch_size: int):
-        """A 3-input Qwen3-VL worker whose two trailing shapes are identical.
-
-        Neither discriminator can read this signature -- one deepstack layer,
-        and a pe_size equal to the hidden size -- so `_is_batch_model()` decides
-        the order. That fallback is the only remaining path that can emit the
-        tensors in the wrong slots without raising, since both declared shapes
-        pass every validation check either way, so it needs pinning in both
-        directions: swapping the two branches of the `default` ternary in
-        `_qwen3_vl_text_extra_input_order` has to fail one of these two tests.
-        """
-
-        worker = self._make_worker()
-        worker.max_batch_size = max_batch_size
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 4), (1, -1, 4)]
-            ),
-        )
-        return worker
-
-    def test_build_infer_inputs_falls_back_to_nonbatch_order_when_shapes_are_ambiguous(self) -> None:
-        worker = self._make_ambiguous_three_input_worker(max_batch_size=1)
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        rope_embeds = np.full((1, 5, 4), 2.0, dtype=np.float32)
-        deepstack_embeds = np.full((1, 5, 4), 3.0, dtype=np.float32)
-
-        infer_inputs = worker._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
-
-        np.testing.assert_array_equal(infer_inputs[1], deepstack_embeds)
-        np.testing.assert_array_equal(infer_inputs[2], rope_embeds)
-
-    def test_build_infer_inputs_falls_back_to_batch_order_when_shapes_are_ambiguous(self) -> None:
-        worker = self._make_ambiguous_three_input_worker(max_batch_size=16)
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        rope_embeds = np.full((1, 5, 4), 2.0, dtype=np.float32)
-        deepstack_embeds = np.full((1, 5, 4), 3.0, dtype=np.float32)
-
-        infer_inputs = worker._build_infer_inputs(input_embeds, deepstack_embeds, rope_embeds=rope_embeds)
-
-        np.testing.assert_array_equal(infer_inputs[1], rope_embeds)
-        np.testing.assert_array_equal(infer_inputs[2], deepstack_embeds)
-
-    def test_build_infer_inputs_requires_rope_for_qwen3_vl_three_input_model(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 4), (1, -1, 6)]
-            ),
-        )
-
-        with pytest.raises(RuntimeError, match="requires RoPE"):
-            worker._build_infer_inputs(np.ones((5, 4), dtype=np.float32), None)
-
-    def test_build_infer_inputs_ignores_dual_input_shape_for_non_qwen3_vl_model(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="qwen2_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 4)]
-            ),
-        )
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        infer_inputs = worker._build_infer_inputs(input_embeds, None)
-        assert isinstance(infer_inputs, np.ndarray)
-        assert tuple(infer_inputs.shape) == (1, 5, 4)
-
-    def test_build_infer_inputs_rejects_explicit_deepstack_for_non_qwen3_vl_model(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="qwen2_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 4)]
-            ),
-        )
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        deepstack_embeds = np.zeros((3, 5, 4), dtype=np.float32)
-        with pytest.raises(RuntimeError, match="only supported for Qwen3-VL"):
-            worker._build_infer_inputs(input_embeds, deepstack_embeds)
-
-    def test_build_infer_inputs_rejects_invalid_deepstack_shape(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 8)]
-            ),
-        )
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        with pytest.raises(RuntimeError, match="hidden dimension mismatch"):
-            worker._build_infer_inputs(input_embeds, None)
-
-    def test_build_infer_inputs_rejects_mismatched_deepstack_embeds(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (3, -1, 4)]
-            ),
-        )
-        input_embeds = np.ones((5, 4), dtype=np.float32)
-        deepstack_embeds = np.ones((2, 5, 4), dtype=np.float32)
-        with pytest.raises(RuntimeError, match="Deepstack embedding shape mismatch"):
-            worker._build_infer_inputs(input_embeds, deepstack_embeds)
-
-    def test_infer_logits_passes_deepstack_to_dual_input_model(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        captured = {}
-
-        def infer(inputs, **kwargs):
-            captured["inputs"] = inputs
-            captured["kwargs"] = kwargs
-            return [np.arange(1 * 2 * 5, dtype=np.float32).reshape(1, 2, 5)]
-
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (2, -1, 4)]
-            ),
-            infer=infer,
-            get_model_output_shape=lambda: [],
-        )
-        worker._infer_output_buffers = None
-        input_embeds = np.ones((2, 4), dtype=np.float32)
-        deepstack_embeds = np.full((2, 2, 4), 3.0, dtype=np.float32)
-        logits = worker._infer_logits(input_embeds, deepstack_embeds, cache_size=7)
-        assert tuple(logits.shape) == (1, 5)
-        assert "inputs" in captured
-        infer_inputs = captured["inputs"]
-        assert isinstance(infer_inputs, list)
-        assert isinstance(infer_inputs, list)
-        assert len(infer_inputs) == 2
-        np.testing.assert_array_equal(infer_inputs[0], np.expand_dims(input_embeds, axis=0))
-        np.testing.assert_array_equal(infer_inputs[1], deepstack_embeds)
-        assert captured["kwargs"] == {"cache_size": 7}
-
     def test_batch_vlm_no_longer_fails_fast_for_qwen3_vl(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
@@ -3455,82 +3063,6 @@ class TestMbltWorkerOptimizations:
         req_state.is_multimodal = True
         req_state.prompt_deepstack_embeds = np.zeros((2, 3, 4), dtype=np.float32)
         worker._ensure_batch_vlm_supported(req_state)
-
-    def test_infer_logits_batch_passes_qwen3_vl_deepstack_inputs_and_params(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        captured = {}
-
-        def infer(inputs, **kwargs):
-            captured["inputs"] = inputs
-            captured["params"] = kwargs["params"]
-            return [np.arange(2 * 5, dtype=np.float32).reshape(2, 5)]
-
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (2, -1, 4)]
-            ),
-            infer=infer,
-        )
-        input_a = np.full((2, 4), 1.0, dtype=np.float32)
-        input_b = np.full((1, 4), 2.0, dtype=np.float32)
-        deepstack_a = np.full((2, 2, 4), 3.0, dtype=np.float32)
-
-        logits = worker._infer_logits_batch(
-            [input_a, input_b],
-            cache_sizes=[5, 7],
-            cache_ids=[1, 2],
-            deepstack_embeds_batch=[deepstack_a, None],
-        )
-
-        assert [tuple(row.shape) for row in logits] == [(5,), (5,)]
-        assert len(captured["inputs"]) == 2
-        np.testing.assert_array_equal(captured["inputs"][0], np.expand_dims(np.concatenate([input_a, input_b]), 0))
-        assert captured["inputs"][1].shape == (2, 3, 4)
-        np.testing.assert_array_equal(captured["inputs"][1][:, :2, :], deepstack_a)
-        np.testing.assert_array_equal(captured["inputs"][1][:, 2:, :], np.zeros((2, 1, 4), dtype=np.float32))
-        assert [
-            (int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in captured["params"]
-        ] == [(2, 5, 1), (1, 7, 2)]
-
-    def test_infer_logits_batch_dispatches_cache_rows_across_backend_models(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 2
-        barrier = threading.Barrier(2)
-        calls: list[tuple[int, list[tuple[int, int, int]]]] = []
-
-        def make_model(marker: int):
-            def infer(_inputs, **kwargs):
-                params = kwargs["params"]
-                calls.append(
-                    (
-                        marker,
-                        [(int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in params],
-                    )
-                )
-                barrier.wait(timeout=2)
-                return [np.full((len(params), 4), float(marker), dtype=np.float32)]
-
-            return SimpleNamespace(
-                infer=infer,
-                get_num_model_variants=lambda: 0,
-            )
-
-        model0 = make_model(10)
-        model1 = make_model(20)
-        worker.cache_model = model0
-        worker.cache_backend = SimpleNamespace(mxq_models=[model0, model1], k_per_model=1)
-
-        logits = worker._infer_logits_batch(
-            [np.ones((1, 4), dtype=np.float32), np.ones((2, 4), dtype=np.float32)],
-            cache_sizes=[3, 5],
-            cache_ids=[1, 0],
-        )
-
-        np.testing.assert_array_equal(logits[0], np.full(4, 20.0, dtype=np.float32))
-        np.testing.assert_array_equal(logits[1], np.full(4, 10.0, dtype=np.float32))
-        assert sorted(calls) == [(10, [(2, 5, 0)]), (20, [(1, 3, 0)])]
 
     def test_request_caches_route_global_slot_to_backend_model(self) -> None:
         worker = self._make_worker()
@@ -3543,7 +3075,7 @@ class TestMbltWorkerOptimizations:
 
         cache = worker.request_caches.new_cache(3)
         worker.request_caches.prepare(cache, 3, 0)
-        worker.request_caches.commit(cache, 4)
+        cache.update_seen_tokens(4)
         moved = worker.request_caches.relocate(cache, 2, 4)
         worker.request_caches.prepare(moved, 2, 4)
 
@@ -3564,98 +3096,7 @@ class TestMbltWorkerOptimizations:
 
         assert worker._resolve_cache_backend() is backend
 
-    def test_infer_logits_batch_passes_qwen3_vl_rope_then_deepstack_inputs(self) -> None:
-        worker = self._make_worker()
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        captured = {}
-
-        def infer(inputs, **kwargs):
-            captured["inputs"] = inputs
-            captured["params"] = kwargs["params"]
-            return [np.arange(2 * 5, dtype=np.float32).reshape(2, 5)]
-
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 6), (2, -1, 4)]
-            ),
-            infer=infer,
-        )
-        input_a = np.full((2, 4), 1.0, dtype=np.float32)
-        input_b = np.full((1, 4), 2.0, dtype=np.float32)
-        rope_a = np.full((1, 2, 6), 4.0, dtype=np.float32)
-        rope_b = np.full((1, 1, 6), 5.0, dtype=np.float32)
-        deepstack_a = np.full((2, 2, 4), 3.0, dtype=np.float32)
-
-        worker._infer_logits_batch(
-            [input_a, input_b],
-            cache_sizes=[5, 7],
-            cache_ids=[1, 2],
-            deepstack_embeds_batch=[deepstack_a, None],
-            rope_embeds_batch=[rope_a, rope_b],
-        )
-
-        assert len(captured["inputs"]) == 3
-        np.testing.assert_array_equal(captured["inputs"][0], np.expand_dims(np.concatenate([input_a, input_b]), 0))
-        np.testing.assert_array_equal(captured["inputs"][1], np.concatenate([rope_a, rope_b], axis=1))
-        assert captured["inputs"][2].shape == (2, 3, 4)
-        np.testing.assert_array_equal(captured["inputs"][2][:, :2, :], deepstack_a)
-        np.testing.assert_array_equal(captured["inputs"][2][:, 2:, :], np.zeros((2, 1, 4), dtype=np.float32))
-
-    def test_batch_compiled_single_qwen3_vl_execute_uses_batch_params_and_deepstack(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 16
-        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=16, block_size=128)
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker.req_states = {}
-        worker._infer_output_buffers = None
-
-        req_state = self._make_request_state(worker, SamplingParams.from_optional(temperature=0.0), list(range(82)))
-        req_state.prompt_len = 82
-        req_state.prompt_embeds = np.ones((82, 4), dtype=np.float32)
-        req_state.prompt_deepstack_embeds = np.full((2, 82, 4), 3.0, dtype=np.float32)
-        req_state.is_multimodal = True
-        worker.req_states = {"vlm": req_state}
-
-        captured = {}
-
-        def infer(inputs, **kwargs):
-            captured["inputs"] = inputs
-            captured["kwargs"] = kwargs
-            return [np.zeros((1, 82, 8), dtype=np.float32)]
-
-        worker.cache_model = SimpleNamespace(
-            infer=infer,
-            get_model_output_shape=lambda: [(1, -1, 8)],
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (2, -1, 4)]
-            ),
-        )
-        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
-        worker._infer_logits_with_sequence = lambda *_args, **_kwargs: pytest.fail(
-            "batch-compiled single request used cache_size-only infer"
-        )
-        worker._make_sampling_metadata = lambda _states: None
-        worker._sample_next_token = lambda _logits, _metadata: SimpleNamespace(
-            sampled_token_ids=torch.tensor([[7]], dtype=torch.int64),
-            logprobs_tensors=None,
-        )
-
-        output = worker.execute_model(self._make_scheduler_output({"vlm": 82}))
-
-        assert output is not None
-        assert output.sampled_token_ids[output.req_id_to_index["vlm"]].tolist() == [7]
-        assert tuple(captured["inputs"][0].shape) == (1, 82, 4)
-        assert tuple(captured["inputs"][1].shape) == (2, 82, 4)
-        np.testing.assert_array_equal(captured["inputs"][1], req_state.prompt_deepstack_embeds)
-        assert "cache_size" not in captured["kwargs"]
-        assert [
-            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
-            for param in captured["kwargs"]["params"]
-        ] == [(82, 0, 0)]
-
-    def test_batch_compiled_single_text_execute_uses_batch_params(self) -> None:
+    def test_single_request_on_a_batch_model_runs_on_its_slot(self) -> None:
         worker = self._make_worker()
         worker.max_batch_size = 16
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=16, block_size=128)
@@ -3666,19 +3107,8 @@ class TestMbltWorkerOptimizations:
         req_state.prompt_embeds = np.ones((5, 4), dtype=np.float32)
         worker.req_states = {"text": req_state}
 
-        captured = {}
-
-        def infer(inputs, **kwargs):
-            captured["inputs"] = inputs
-            captured["kwargs"] = kwargs
-            return [np.zeros((1, 8), dtype=np.float32)]
-
-        worker.cache_model = SimpleNamespace(
-            infer=infer,
-            get_model_output_shape=lambda: [(16, 8)],
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(get_model_input_shape=lambda: [(1, 1, -1, 4)]),
-        )
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(16, 8)])
+        forward = self._install_zero_forward(worker, vocab_size=8)
         worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
         worker._infer_logits_with_sequence = lambda *_args, **_kwargs: pytest.fail(
             "batch-compiled single request used cache_size-only infer"
@@ -3693,72 +3123,7 @@ class TestMbltWorkerOptimizations:
 
         assert output is not None
         assert output.sampled_token_ids[output.req_id_to_index["text"]].tolist() == [9]
-        assert tuple(captured["inputs"][0].shape) == (1, 1, 5, 4)
-        assert "cache_size" not in captured["kwargs"]
-        assert [
-            (int(param.sequence_length), int(param.cache_size), int(param.cache_id))
-            for param in captured["kwargs"]["params"]
-        ] == [(5, 0, 0)]
-
-    def test_text_only_batch_input_shape_remains_rank4(self) -> None:
-        worker = self._make_worker()
-        captured = {}
-
-        def infer(inputs, **kwargs):
-            captured["inputs"] = inputs
-            captured["params"] = kwargs["params"]
-            return [np.arange(2 * 5, dtype=np.float32).reshape(2, 5)]
-
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(get_model_input_shape=lambda: [(1, 1, -1, 4)]),
-            infer=infer,
-        )
-
-        worker._infer_logits_batch(
-            [
-                np.full((2, 4), 1.0, dtype=np.float32),
-                np.full((1, 4), 2.0, dtype=np.float32),
-            ],
-            cache_sizes=[0, 3],
-            cache_ids=[1, 2],
-        )
-
-        assert len(captured["inputs"]) == 1
-        assert captured["inputs"][0].shape == (1, 1, 3, 4)
-        assert [
-            (int(param.sequence_length), int(param.cache_size), int(param.cache_id)) for param in captured["params"]
-        ] == [(2, 0, 1), (1, 3, 2)]
-
-    def test_max_batch_size_one_vlm_still_uses_single_request_infer_inputs(self) -> None:
-        worker = self._make_worker()
-        worker.max_batch_size = 1
-        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
-        worker._infer_output_buffers = None
-        captured = {}
-
-        def infer(inputs, **kwargs):
-            captured["inputs"] = inputs
-            captured["kwargs"] = kwargs
-            return [np.arange(1 * 2 * 5, dtype=np.float32).reshape(1, 2, 5)]
-
-        worker.cache_model = SimpleNamespace(
-            get_num_model_variants=lambda: 1,
-            get_model_variant_handle=lambda _idx: SimpleNamespace(
-                get_model_input_shape=lambda: [(1, -1, 4), (2, -1, 4)]
-            ),
-            infer=infer,
-            get_model_output_shape=lambda: [],
-        )
-
-        input_embeds = np.ones((2, 4), dtype=np.float32)
-        deepstack_embeds = np.full((2, 2, 4), 3.0, dtype=np.float32)
-        worker._infer_logits(input_embeds, deepstack_embeds, cache_size=9)
-
-        assert len(captured["inputs"]) == 2
-        np.testing.assert_array_equal(captured["inputs"][0], np.expand_dims(input_embeds, axis=0))
-        np.testing.assert_array_equal(captured["inputs"][1], deepstack_embeds)
-        assert captured["kwargs"] == {"cache_size": 9}
+        assert forward.calls == [((5, 0, 0),)]
 
     def test_init_uses_text_runtime_max_batch_size_for_cache_slots(self, monkeypatch) -> None:
         def worker_base_init(self, vllm_config, local_rank, rank, distributed_init_method, is_driver_worker=False):
@@ -3833,7 +3198,6 @@ class TestMbltWorkerOptimizations:
         worker.local_rank = 0
         worker.model = None
         worker.cache_model = None
-        worker._infer_output_buffers = None
         worker.max_batch_size = 1
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker.load_config = SimpleNamespace(
@@ -3901,7 +3265,6 @@ class TestMbltWorkerOptimizations:
         worker.local_rank = 0
         worker.model = None
         worker.cache_model = None
-        worker._infer_output_buffers = None
         worker.max_batch_size = 1
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker.load_config = SimpleNamespace(
@@ -3972,7 +3335,6 @@ class TestMbltWorkerOptimizations:
         worker.local_rank = 0
         worker.model = None
         worker.cache_model = None
-        worker._infer_output_buffers = None
         worker.max_batch_size = 1
         worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
         worker.load_config = SimpleNamespace(model_loader_extra_config={})
@@ -3989,7 +3351,13 @@ class TestMbltWorkerOptimizations:
         fake_model = SimpleNamespace(
             eval=lambda: None,
             get_input_embeddings=lambda: SimpleNamespace(),
-            get_cache_mxq_model=lambda: SimpleNamespace(),
+            # A Batch16 text MXQ with its RoPE input: inputs_embeds, rope, deepstack.
+            get_cache_mxq_model=lambda: SimpleNamespace(
+                get_num_model_variants=lambda: 1,
+                get_model_variant_handle=lambda _idx: SimpleNamespace(
+                    get_model_input_shape=lambda: [(1, -1, 4), (1, -1, 2), (3, -1, 4)]
+                ),
+            ),
             sync_dynamic_vision_from_model=lambda: calls.append("sync"),
         )
 
@@ -4007,7 +3375,7 @@ class TestMbltWorkerOptimizations:
         slot_key = worker._slot_key(req_state.cache_slot_id)
         cache = worker._request_cache(req_state, req_state.cache_slot_id)
         worker.request_caches.prepare(cache, slot_key, 0)
-        worker.request_caches.commit(cache, num_tokens)
+        cache.update_seen_tokens(num_tokens)
 
     def _make_two_slot_worker(self) -> MbltWorker:
         worker = self._make_worker()

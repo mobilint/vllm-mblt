@@ -451,9 +451,10 @@ batched forward; a single request runs on its own cache. Image-text models call
 their text decoder with the merged embeddings, M-RoPE `position_ids` and
 deepstack features, and Qwen3-ASR calls its thinker's text decoder with the
 merged audio-text embeddings. Mixture-of-Experts models serve one request at a
-time, so each step runs on that request's `MobilintMixtureOfExpertsCache`. Set
-`VLLM_MBLT_DIRECT_INFER=1` to call the MXQ directly instead, as Qwen3-VL batch
-MXQs without a RoPE input still do.
+time, so each step runs on that request's `MobilintMixtureOfExpertsCache`. The
+worker never calls an MXQ itself. A Qwen3-VL batch MXQ without a RoPE input is
+refused at load, as the batched deepstack forward cannot run it; every Qwen3-VL
+Batch16 release has one.
 
 Every request keeps its own transformers-mblt cache on the NPU slot it runs on,
 and the worker binds it before each infer. transformers-mblt records which
