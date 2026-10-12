@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 ### Added
 
@@ -11,7 +11,7 @@
   EAGLE3-JPharmatron-7B it decodes at about 11.9 tokens/s. The base MXQ holds one sequence, so the scheduler runs one
   request at a time, and prefix caching is off. Requests sample with temperature, top-k and top-p only: the platform
   refuses logprobs, penalties, `min_p`, `min_tokens`, seeds, logit bias, allowed or bad words, logits processors and
-  structured output with HTTP 400. Needs a transformers-mblt release with the round API (newer than 0.4.0).
+  structured output with HTTP 400. Needs transformers-mblt 0.5.0, which adds the round API.
 
 ### Changed
 
@@ -30,16 +30,14 @@
   merged embeddings. Each request keeps its prompt's M-RoPE positions and passes them as `position_ids`
   (transformers-mblt builds the RoPE input), and Qwen3-VL passes its deepstack features with them; Qwen3-VL request
   caches are `MobilintDeepStackCache`. Covered: Qwen3-VL non-batch MXQs, Qwen3-VL batch MXQs with a RoPE input, and
-  Qwen2-VL with a plain text MXQ; other layouts keep the direct path. Every forward takes the step as vLLM sized it
+  Qwen2-VL with a plain text MXQ. Every forward takes the step as vLLM sized it
   (`npu_prefill_chunk_size` = the step's width), as the direct path did, instead of re-splitting it at the model's
   prefill chunk size, which also changes the NPU's numerics.
 - Text-only models now run every infer through the transformers-mblt forward instead of calling the MXQ directly:
   the step's requests are joined with `MobilintCache.from_rows` and run in one batched forward, each on its own
   cache from its own length. transformers-mblt binds the slots, splits inputs to the MXQ width, packs the batch,
   spreads it across cards and reads the logits layout. Outputs are unchanged; offline throughput is the same on
-  Llama-3.2-1B-Batch16 (16 requests) and 3% higher on Llama-3.2-1B (4 requests). Image-text, audio-text and
-  Mixture-of-Experts models keep their current path for now. `VLLM_MBLT_DIRECT_INFER=1` keeps text models on the
-  direct MXQ path.
+  Llama-3.2-1B-Batch16 (16 requests) and 3% higher on Llama-3.2-1B (4 requests).
 - Every request now keeps its own transformers-mblt cache on the NPU slot it runs on, and the worker binds it
   before each infer. transformers-mblt records which cache's KV each slot holds and saves or restores it when
   another cache takes the slot, so the worker no longer calls `dump_cache_memory` / `load_cache_memory` itself
@@ -51,7 +49,8 @@
   - A new request whose prefix snapshot is still on its own slot takes that cache over, KV in place, instead of
     loading a copy.
   - Prefix snapshots are cache copies instead of raw dump blobs, for dense and Mixture-of-Experts models alike.
-- Requires `transformers-mblt>=0.4.0` and `mblt-model-zoo[transformers]>=2.11.0`.
+- Requires `transformers-mblt>=0.5.0` (the round API for EAGLE-3; `from_rows` came in 0.4.0) and
+  `mblt-model-zoo[transformers]>=2.11.0`.
 - Finished-request prefix snapshots are also capped by host memory: at most
   `VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB` / `prefix_cache_max_host_mib` MiB (4096 by default), each counted as one
   slot's compiled KV buffers (256 MiB for a 4K-token Llama-3 slot, 192 MiB for Qwen3-30B-A3B). The count cap of 16
@@ -59,10 +58,11 @@
 
 ### Added
 
-- Qwen3-MoE (`mobilint/Qwen3-30B-A3B`) can now be served through the new `qwen3-moe` optional extra, which
-  requires `transformers-mblt>=0.2.0`. The worker hands each scheduled chunk to the transformers-mblt MoE
-  forward (shared MXQs, top-k routing, parallel expert MXQs, `lm_head`) through a single-slot cache-model adapter.
-  Each request keeps its own cache of every per-layer shared MXQ.
+- Qwen3-MoE (`mobilint/Qwen3-30B-A3B`) can now be served. The base requirements cover it
+  (`transformers-mblt>=0.5.0`); the `qwen3-moe` optional extra is kept so existing install commands keep working.
+  The worker hands each scheduled chunk to the transformers-mblt MoE forward (shared MXQs, top-k routing, parallel
+  expert MXQs, `lm_head`) on the request's own `MobilintMixtureOfExpertsCache`, which spans every per-layer shared
+  MXQ.
 - Only non-batch serving is supported: a `max_batch_size` above 1 is refused at startup, because MoE releases
   cannot be compiled as batch MXQs.
 - `max_model_len` is clamped to 4096 for MoE models, the KV capacity of the released shared MXQs, and the worker

@@ -159,7 +159,7 @@ Current Mobilint Qwen3-ASR notes:
 
 ### 5. Serve a Mixture-of-Experts Model
 
-Qwen3-30B-A3B needs the optional `qwen3-moe` extra, which installs `transformers-mblt>=0.2.0`:
+Qwen3-30B-A3B needs the optional `qwen3-moe` extra, which installs `transformers-mblt>=0.5.0`:
 
 ```bash
 pip install "vllm-mblt[qwen3-moe]"
@@ -200,8 +200,7 @@ Current Mobilint EAGLE-3 notes:
   the next token is sampled after them, and the draft MXQ builds the next tree. A step returns all of the round's
   tokens for its request, so a streamed response arrives a few tokens per chunk. The tree size comes from the
   release's `generation_config.json` (`num_assistant_tokens`, `eagle3_tree_depth`, `eagle3_tree_top_k`).
-- Requires a transformers-mblt release with the round API (`eagle3_prefill` / `eagle3_decode_step`), newer than
-  0.4.0.
+- Requires transformers-mblt 0.5.0 or newer, which adds the round API (`eagle3_prefill` / `eagle3_decode_step`).
 - One sequence at a time: the base MXQ holds one sequence (`base_max_batch_size` is 1), so the scheduler runs one
   request per step, and a release configured with more is refused. Prefix caching is turned off: every request
   feeds its whole prompt to its own cache.
