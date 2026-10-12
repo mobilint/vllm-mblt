@@ -187,6 +187,16 @@ def test_the_model_length_caps_the_round() -> None:
     assert _sampled(last, "a") == [101, 102]
 
 
+def test_a_prompt_that_fills_the_model_length_still_gets_its_one_token() -> None:
+    model = _FakeEagle3Model()
+    runner = _runner(model, max_model_len=4)
+
+    out = runner.execute(_step({"a": 4}, new=[_new_req("a", [1, 2, 3, 4], max_tokens=8)]))
+
+    assert model.prefills[0]["max"] == 1
+    assert _sampled(out, "a") == [100]
+
+
 def test_requests_keep_their_own_caches_and_finished_ones_are_dropped() -> None:
     model = _FakeEagle3Model()
     runner = _runner(model)

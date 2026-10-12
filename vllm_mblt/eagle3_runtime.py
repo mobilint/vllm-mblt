@@ -109,11 +109,13 @@ class Eagle3Runner:
         remaining = self._remaining_tokens(req)
         if req.cache is None:
             req.cache = self._new_cache()
+            # Like vLLM's own runner, prefill samples one token even without room for it (a prompt that fills the
+            # model length); the scheduler then caps the request at the limit.
             root = self.model.eagle3_prefill(
                 torch.tensor([req.token_ids], dtype=torch.long),
                 req.cache,
                 logits_processor=req.logits_processor,
-                max_new_tokens=remaining,
+                max_new_tokens=max(1, remaining),
             )
             return [int(root)]
         # The round's first token is the root the previous step already returned; the cap counts it.
