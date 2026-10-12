@@ -40,3 +40,10 @@ def register_model():
         "MobilintQwen3ASRForConditionalGeneration",
         "vllm_mblt.models.modeling_qwen3_asr:MobilintQwen3ASRForConditionalGeneration",
     )
+
+    for architecture in (
+        "MobilintLlamaEagle3ForCausalLM",
+        "MobilintQwen2Eagle3ForCausalLM",
+        "MobilintQwen3Eagle3ForCausalLM",
+    ):
+        ModelRegistry.register_model(architecture, f"vllm_mblt.models.modeling_eagle3:{architecture}")

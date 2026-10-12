@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -24,6 +25,8 @@ _MIXTURE_OF_EXPERTS_HF_MODEL_TYPES = frozenset({"mobilint-qwen3_moe"})
 _MIXTURE_OF_EXPERTS_MAX_MODEL_LEN = 4096
 # Qwen3-ASR audio past this token can stall the NPU; the artifact config declares 65536.
 _QWEN3_ASR_MAX_MODEL_LEN = 2048
+# EAGLE-3 releases run speculative rounds through transformers-mblt, one sequence per base MXQ slot.
+_EAGLE3_HF_MODEL_TYPES = frozenset({"mobilint-llama-eagle3", "mobilint-qwen2-eagle3", "mobilint-qwen3-eagle3"})
 _TRUE_ENV_VALUES = {"1", "true", "TRUE", "True"}
 # A batch LLM compiled at a global scheme mixes core modes inside one mxq (the
 # collective segments target the cluster GlobalCore, the iterative ones Core0),
@@ -109,6 +112,34 @@ def _is_multimodal_hf_config(hf_config: object) -> bool:
 
 def _is_mixture_of_experts_hf_config(hf_config: object) -> bool:
     return _get_config_field_value(hf_config, "model_type") in _MIXTURE_OF_EXPERTS_HF_MODEL_TYPES
+
+
+def _is_eagle3_hf_config(hf_config: object) -> bool:
+    return _get_config_field_value(hf_config, "model_type") in _EAGLE3_HF_MODEL_TYPES
+
+
+def _unsupported_eagle3_sampling(params: object) -> list[str]:
+    """The sampling options an EAGLE-3 request sets that its speculative rounds cannot honor.
+
+    A round samples with temperature, top-k and top-p only, from the global torch generator, and returns no
+    logprobs.
+    """
+    checks = (
+        ("logprobs", getattr(params, "logprobs", None) is not None),
+        ("prompt_logprobs", getattr(params, "prompt_logprobs", None) is not None),
+        ("presence_penalty", getattr(params, "presence_penalty", 0.0) != 0.0),
+        ("frequency_penalty", getattr(params, "frequency_penalty", 0.0) != 0.0),
+        ("repetition_penalty", getattr(params, "repetition_penalty", 1.0) != 1.0),
+        ("min_p", getattr(params, "min_p", 0.0) > 0.0),
+        ("min_tokens", getattr(params, "min_tokens", 0) > 0),
+        ("seed", getattr(params, "seed", None) is not None),
+        ("logit_bias", bool(getattr(params, "logit_bias", None))),
+        ("allowed_token_ids", getattr(params, "allowed_token_ids", None) is not None),
+        ("bad_words", bool(getattr(params, "bad_words", None))),
+        ("logits_processors", bool(getattr(params, "logits_processors", None))),
+        ("structured_outputs", getattr(params, "structured_outputs", None) is not None),
+    )
+    return [name for name, is_set in checks if is_set]
 
 
 def _is_qwen3_asr_hf_config(hf_config: object) -> bool:
@@ -313,8 +344,10 @@ def resolve_model_max_batch_size(
         if resolved_text_max_batch_size is not None:
             return resolved_text_max_batch_size
 
+    # An EAGLE-3 release sizes its base, draft and FC MXQs separately; the base MXQ holds the sequences.
     raw_max_batch_size = _get_model_config_value(
         vllm_config,
+        *(("base_max_batch_size",) if _is_eagle3_hf_config(_get_hf_config(vllm_config)) else ()),
         "max_batch_size",
         "npu_max_batch_size",
     )
@@ -330,6 +363,8 @@ class MbltPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_type = "cpu"
     device_name = "cpu"
+    # Whether the engine configured last in this process serves EAGLE-3; validate_request's fallback.
+    _serving_eagle3 = False
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
@@ -347,9 +382,42 @@ class MbltPlatform(Platform):
         return False
 
     @classmethod
+    def _validating_for_eagle3(cls) -> bool:
+        """Whether the engine validating this request serves EAGLE-3.
+
+        vLLM passes ``validate_request`` no engine, so a process with several engines (several ``LLM`` objects) cannot
+        tell them apart from its arguments. Its caller, vLLM 0.11.2's ``Processor.process_inputs``, holds the engine's
+        ``model_config``; without it, the engine configured last decides.
+        """
+        caller = sys._getframe(2).f_locals.get("self")
+        model_config = getattr(caller, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None:
+            return cls._serving_eagle3
+        return _is_eagle3_hf_config(hf_config)
+
+    @classmethod
+    def validate_request(cls, prompt: object, params: object, processed_inputs: object) -> None:
+        """Refuse requests an EAGLE-3 model cannot serve, with the options to drop (an HTTP 400 for the client)."""
+        del prompt
+        if not cls._validating_for_eagle3():
+            return
+        unsupported = _unsupported_eagle3_sampling(params)
+        if unsupported:
+            raise ValueError(
+                "EAGLE-3 models sample with temperature, top_k and top_p only; unsupported here: "
+                + ", ".join(unsupported)
+                + "."
+            )
+        inputs = processed_inputs if isinstance(processed_inputs, dict) else {}
+        if inputs.get("type") in ("embeds", "multimodal"):
+            raise ValueError("EAGLE-3 models take token prompts only, without prompt embeddings or multimodal data.")
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config: ParallelConfig = vllm_config.parallel_config  # type: ignore
         parallel_config.worker_cls = "vllm_mblt.mblt_worker.MbltWorker"
+        cls._serving_eagle3 = _is_eagle3_hf_config(_get_hf_config(vllm_config))
 
         cache_config: CacheConfig = vllm_config.cache_config
         # Keep user-provided value if present. Otherwise, use a smaller block
@@ -358,6 +426,10 @@ class MbltPlatform(Platform):
             cache_config.block_size = 128  # type: ignore
         if cache_config.enable_prefix_caching is None:
             cache_config.enable_prefix_caching = True
+        if cls._serving_eagle3 and cache_config.enable_prefix_caching:
+            # Each EAGLE-3 request feeds its whole prompt to its own cache; a prefix hit would only skip vLLM steps.
+            logger.info("Disabling prefix caching for EAGLE-3: every request feeds its whole prompt.")
+            cache_config.enable_prefix_caching = False
 
         # vLLM 0.11.2's front end records a multimodal item as sent to the engine before the
         # length checks run. If the request is then refused, the engine never receives the item,
@@ -411,6 +483,11 @@ class MbltPlatform(Platform):
                 getattr(scheduler_config, "long_prefill_token_threshold", None),
             )
         resolved_max_batch_size = resolve_model_max_batch_size(vllm_config)
+        if cls._serving_eagle3 and resolved_max_batch_size is not None and resolved_max_batch_size > 1:
+            raise ValueError(
+                f"EAGLE-3 models serve one sequence per base MXQ, but max_batch_size={resolved_max_batch_size} "
+                "was configured."
+            )
         if (
             _is_mixture_of_experts_hf_config(_get_hf_config(vllm_config))
             and resolved_max_batch_size is not None
