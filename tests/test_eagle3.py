@@ -66,7 +66,15 @@ def _new_req(req_id, prompt, *, computed=0, temperature=0.0, max_tokens=16, **ex
         prompt_token_ids=prompt,
         mm_features=extra.get("mm_features", []),
         prompt_embeds=extra.get("prompt_embeds"),
-        sampling_params=SimpleNamespace(temperature=temperature, top_p=1.0, top_k=0, max_tokens=max_tokens),
+        sampling_params=SimpleNamespace(
+            temperature=temperature,
+            top_p=1.0,
+            top_k=0,
+            max_tokens=max_tokens,
+            stop_token_ids=extra.get("stop_token_ids", []),
+            ignore_eos=extra.get("ignore_eos", False),
+            all_stop_token_ids=extra.get("all_stop_token_ids", set()),
+        ),
         num_computed_tokens=computed,
     )
 
@@ -119,6 +127,25 @@ def test_each_step_returns_the_accepted_drafts_and_the_next_token() -> None:
     # The cap counts the round's root, which the previous step returned: max_tokens - outputs + 1.
     assert [step["max"] for step in model.steps] == [10 - 1 + 1, 10 - 4 + 1]
     assert all(step["eos"] is None for step in model.steps)
+
+
+def test_rounds_stop_at_the_tokens_that_finish_the_request_in_vllm() -> None:
+    model = _FakeEagle3Model()
+    runner = _runner(model)
+    runner.execute(
+        _step(
+            {"a": 1, "b": 1},
+            new=[
+                _new_req("a", [1], stop_token_ids=[7], all_stop_token_ids={7, 2}),
+                _new_req("b", [1], ignore_eos=True, stop_token_ids=[7], all_stop_token_ids={7, 2}),
+            ],
+        )
+    )
+
+    runner.execute(_step({"a": 1, "b": 1}, cached=[("a", 1), ("b", 1)]))
+
+    # ignore_eos keeps the explicit stop tokens but drops the model's EOS.
+    assert [step["eos"] for step in model.steps] == [[2, 7], [7]]
 
 
 def test_a_round_split_across_steps_runs_once_all_its_tokens_are_scheduled() -> None:
@@ -302,6 +329,29 @@ def test_platform_refuses_sampling_options_eagle3_rounds_cannot_honor() -> None:
         MbltPlatform.check_and_update_config(_make_vllm_config(128))
     # Other models keep every option.
     MbltPlatform.validate_request("p", SamplingParams(logprobs=1, seed=3), {"type": "token"})
+
+
+class _Processor:
+    """Stands in for vLLM's Processor, which calls validate_request with its engine's model_config at hand."""
+
+    def __init__(self, model_type: str) -> None:
+        self.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+
+    def process_inputs(self, params) -> None:
+        MbltPlatform.validate_request(prompt="p", params=params, processed_inputs={"type": "token"})
+
+
+def test_validation_follows_the_engine_that_processes_the_request() -> None:
+    from vllm import SamplingParams
+
+    eagle3, dense = _Processor("mobilint-qwen2-eagle3"), _Processor("mobilint-qwen2")
+    penalized = SamplingParams(repetition_penalty=1.1, logprobs=1)
+    for configured_last in (_eagle3_vllm_config(), _make_vllm_config(128)):
+        MbltPlatform.check_and_update_config(configured_last)
+        dense.process_inputs(penalized)
+        with pytest.raises(ValueError, match="repetition_penalty"):
+            eagle3.process_inputs(penalized)
+    MbltPlatform.check_and_update_config(_make_vllm_config(128))
 
 
 def test_register_model_registers_the_eagle3_architectures_by_import_path() -> None:

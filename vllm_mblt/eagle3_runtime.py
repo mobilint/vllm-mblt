@@ -27,6 +27,18 @@ def is_eagle3_model(model: Any) -> bool:
     return hasattr(model, "eagle3_base_model")
 
 
+def stop_token_ids(sampling_params: Any) -> Optional[list[int]]:
+    """The token ids that finish the request in vLLM's scheduler, for a round to stop at; ``None`` when there are none.
+
+    vLLM stops on ``stop_token_ids`` and, unless ``ignore_eos``, on the model's EOS ids, which
+    ``all_stop_token_ids`` adds.
+    """
+    ids = set(getattr(sampling_params, "stop_token_ids", None) or ())
+    if not getattr(sampling_params, "ignore_eos", False):
+        ids.update(getattr(sampling_params, "all_stop_token_ids", None) or ())
+    return sorted(ids) or None
+
+
 def make_logits_processor(sampling_params: Any) -> Optional[Any]:
     """The EAGLE-3 logits processor for a request: ``None`` (greedy) at temperature 0."""
     top_k = int(getattr(sampling_params, "top_k", 0) or 0)
@@ -43,10 +55,12 @@ class Eagle3Request:
     prompt_len: int
     max_tokens: int
     logits_processor: Optional[Any]
+    # A round ends at these ids; vLLM finishes the request on them anyway.
+    stop_token_ids: Optional[list[int]] = None
     num_computed_tokens: int = 0
     # None until the prompt is fed.
     cache: Optional[MobilintEagle3Cache] = None
-    # A round reached ``max_tokens`` or the model length; vLLM finishes the request with it.
+    # A round reached a stop token, ``max_tokens`` or the model length; vLLM finishes the request with it.
     exhausted: bool = False
 
 
@@ -79,6 +93,7 @@ class Eagle3Runner:
             prompt_len=len(prompt),
             max_tokens=self.max_model_len - len(prompt) if max_tokens is None else int(max_tokens),
             logits_processor=make_logits_processor(sampling_params),
+            stop_token_ids=stop_token_ids(sampling_params),
             num_computed_tokens=int(new_req.num_computed_tokens),
         )
 
@@ -106,6 +121,7 @@ class Eagle3Runner:
             req.cache,
             logits_processor=req.logits_processor,
             max_new_tokens=remaining + 1,
+            eos_token_id=req.stop_token_ids,
         )
         tokens = step.tokens[0, 1:].tolist()
         if step.next_token is None:

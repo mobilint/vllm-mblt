@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -362,7 +363,7 @@ class MbltPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_type = "cpu"
     device_name = "cpu"
-    # Set by check_and_update_config, which runs in the process that validates requests.
+    # Whether the engine configured last in this process serves EAGLE-3; validate_request's fallback.
     _serving_eagle3 = False
 
     @classmethod
@@ -381,10 +382,25 @@ class MbltPlatform(Platform):
         return False
 
     @classmethod
+    def _validating_for_eagle3(cls) -> bool:
+        """Whether the engine validating this request serves EAGLE-3.
+
+        vLLM passes ``validate_request`` no engine, so a process with several engines (several ``LLM`` objects) cannot
+        tell them apart from its arguments. Its caller, vLLM 0.11.2's ``Processor.process_inputs``, holds the engine's
+        ``model_config``; without it, the engine configured last decides.
+        """
+        caller = sys._getframe(2).f_locals.get("self")
+        model_config = getattr(caller, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None:
+            return cls._serving_eagle3
+        return _is_eagle3_hf_config(hf_config)
+
+    @classmethod
     def validate_request(cls, prompt: object, params: object, processed_inputs: object) -> None:
         """Refuse requests an EAGLE-3 model cannot serve, with the options to drop (an HTTP 400 for the client)."""
         del prompt
-        if not cls._serving_eagle3:
+        if not cls._validating_for_eagle3():
             return
         unsupported = _unsupported_eagle3_sampling(params)
         if unsupported:
