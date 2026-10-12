@@ -28,7 +28,7 @@ artifacts can be served through familiar vLLM commands and OpenAI-compatible API
 - **Out-of-tree vLLM plugin**: registers the `mblt` platform without patching vLLM itself.
 - **Mobilint NPU worker**: dispatches text-generation and multimodal execution to Mobilint runtime models.
 - **Model registry integration**: supports Mobilint wrappers for Llama, HyperCLOVAX, EXAONE/EXAONE4, Qwen2/3,
-  Qwen2/3-VL, Qwen3-ASR, and Qwen3-MoE families.
+  Qwen2/3-VL, Qwen3-ASR, Qwen3-MoE, and EAGLE-3 (Llama, Qwen2, Qwen3) families.
 - **Runtime-aware scheduling**: reads model-configured `npu_prefill_chunk_size` and `max_batch_size` values to
   tune chunked prefill and scheduler concurrency automatically.
 - **vLLM benchmark compatibility**: works with `vllm serve`, `vllm bench serve`, and `vllm bench throughput`.
@@ -185,6 +185,31 @@ Current Mobilint Qwen3-MoE notes:
 - Prompt logprobs use the 1-token microstep path: the last layer only emits the last token's hidden state.
 - Greedy output can differ from run to run where two tokens are nearly tied: transformers-mblt adds the expert
   outputs in the order they finish.
+
+### 6. Serve an EAGLE-3 Model
+
+EAGLE-3 releases pair a base model with a one-block draft model. vllm-mblt serves them with speculative decoding:
+
+```bash
+vllm serve mobilint/EAGLE3-JPharmatron-7B --trust-remote-code
+```
+
+Current Mobilint EAGLE-3 notes:
+
+- transformers-mblt runs each speculative round: the base MXQ verifies the draft tree, the accepted tokens are kept,
+  the next token is sampled after them, and the draft MXQ builds the next tree. A step returns all of the round's
+  tokens for its request, so a streamed response arrives a few tokens per chunk. The tree size comes from the
+  release's `generation_config.json` (`num_assistant_tokens`, `eagle3_tree_depth`, `eagle3_tree_top_k`).
+- Requires a transformers-mblt release with the round API (`eagle3_prefill` / `eagle3_decode_step`), newer than
+  0.4.0.
+- One sequence at a time: the base MXQ holds one sequence (`base_max_batch_size` is 1), so the scheduler runs one
+  request per step, and a release configured with more is refused. Prefix caching is turned off: every request
+  feeds its whole prompt to its own cache.
+- Requests sample with `temperature`, `top_k` and `top_p` only. Requests that set logprobs, prompt logprobs,
+  penalties, `min_p`, `min_tokens`, `seed`, `logit_bias`, `allowed_token_ids`, `bad_words`, logits processors or
+  structured output are refused with HTTP 400. Token prompts only: no prompt embeddings or multimodal data.
+- Greedy output matches transformers-mblt `generate()` in the same environment. EAGLE3-JPharmatron-7B decodes at
+  about 11.9 tokens/s on one Aries.
 
 ## Runtime Tuning
 
@@ -438,6 +463,7 @@ Notes:
 | Qwen3-VL | `MobilintQwen3VLForConditionalGeneration` |
 | Qwen3-ASR | `MobilintQwen3ASRForConditionalGeneration` |
 | Qwen3-MoE | `MobilintQwen3MoEForCausalLM` |
+| EAGLE-3 (Llama, Qwen2, Qwen3) | `MobilintLlamaEagle3ForCausalLM`, `MobilintQwen2Eagle3ForCausalLM`, `MobilintQwen3Eagle3ForCausalLM` |
 
 Model artifacts are available through Mobilint model repositories such as the
 [Mobilint Hugging Face Hub](https://huggingface.co/mobilint).
@@ -564,10 +590,12 @@ vllm_mblt/
 ├── mblt_platform.py            # platform config overrides and runtime-aware defaults
 ├── mblt_worker.py              # custom worker, prefill/decode flow, KV snapshot logic
 ├── moe_runtime.py              # Mixture-of-Experts cache-model adapter over transformers-mblt
+├── eagle3_runtime.py           # EAGLE-3 speculative rounds through transformers-mblt, one cache per request
 ├── tracing.py                  # qbruntime NPU event tracing behind vLLM's profiler hook
 └── models/                     # Mobilint model wrappers for LLM/VLM families
 
 tests/
+├── test_eagle3.py
 ├── test_kv_cache_swap_spec.py
 ├── test_mblt_platform_prefill.py
 ├── test_mblt_tracing.py

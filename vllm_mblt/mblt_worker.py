@@ -28,6 +28,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.worker_base import WorkerBase
 
+from vllm_mblt.eagle3_runtime import Eagle3Runner, is_eagle3_model
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
 from vllm_mblt.moe_runtime import MbltMoECacheModel, is_mixture_of_experts_model
@@ -396,6 +397,8 @@ class PrefixCacheCostModel:
 
 class MbltWorker(WorkerBase):
     MAX_FINISHED_CACHE_SNAPSHOTS = 16
+    # Set for an EAGLE-3 model, which runs whole speculative rounds through transformers-mblt.
+    eagle3_runner: Optional[Eagle3Runner] = None
 
     def __init__(
         self,
@@ -2902,6 +2905,14 @@ class MbltWorker(WorkerBase):
         self.model.eval()
         self._log_init_stage("load_model:after_eval", start)
 
+        if is_eagle3_model(self.model):
+            # The runner keeps one MobilintEagle3Cache per request; the worker's request caches, prefix snapshots and
+            # sampler stay unused.
+            self.input_embeddings = self.model.get_input_embeddings()
+            self.eagle3_runner = Eagle3Runner(self.model, max_model_len=self.max_seq_len)
+            self._log_init_stage("load_model:done", eagle3=True)
+            return
+
         model_max_batch_size = resolve_model_max_batch_size(self.vllm_config)
         if model_max_batch_size is not None:
             self.max_batch_size = model_max_batch_size
@@ -3109,7 +3120,7 @@ class MbltWorker(WorkerBase):
             model_initialized=self.model is not None,
             cache_model_initialized=self.cache_model is not None,
         )
-        if self.model is None or self.cache_model is None:
+        if self.model is None or (self.cache_model is None and self.eagle3_runner is None):
             raise RuntimeError("MBLT Accelerator/Model is not initialized.")
 
     def get_model(self) -> nn.Module:
@@ -3159,6 +3170,8 @@ class MbltWorker(WorkerBase):
             raise RuntimeError("Model is not initialized.")
         if self.input_embeddings is None:
             raise RuntimeError("Input embeddings are not initialized.")
+        if self.eagle3_runner is not None:
+            return self.eagle3_runner.execute(scheduler_output)
 
         print_debug = self.print_debug
 

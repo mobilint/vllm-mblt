@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- EAGLE-3 releases (`MobilintLlamaEagle3ForCausalLM`, `MobilintQwen2Eagle3ForCausalLM`,
+  `MobilintQwen3Eagle3ForCausalLM`) serve with speculative decoding. Each step runs one transformers-mblt round per
+  scheduled request (`eagle3_prefill`, then `eagle3_decode_step`) on the request's own `MobilintEagle3Cache` and
+  returns all the tokens the round settles. Greedy output matches transformers-mblt `generate()`; on
+  EAGLE3-JPharmatron-7B it decodes at about 11.9 tokens/s. The base MXQ holds one sequence, so the scheduler runs one
+  request at a time, and prefix caching is off. Requests sample with temperature, top-k and top-p only: the platform
+  refuses logprobs, penalties, `min_p`, `min_tokens`, seeds, logit bias, allowed or bad words, logits processors and
+  structured output with HTTP 400. Needs a transformers-mblt release with the round API (newer than 0.4.0).
+
 ### Changed
 
 - The worker no longer calls the MXQ itself: every model runs through the transformers-mblt forward, and the direct
