@@ -791,6 +791,93 @@ class TestMbltRuntimeCacheManagerSlots:
         assert loaded.req_id == "other"
 
 
+class TestMbltRuntimeCacheManagerSlotChoice:
+    """Prefix-matching slot first, then card load, then the caller's victim rank, then the lowest slot (#40)."""
+
+    def test_free_prefix_slot_is_taken_over_card_balance(self) -> None:
+        manager = _make_manager(max_batch_size=4)
+        manager.reset_slots(slot_card=lambda slot_id: slot_id % 2)
+        manager.assign_slot("busy")  # slot 0: card 0 runs one request, card 1 none
+
+        assert manager.assign_slot("new", prefix_slot=2) == 2
+
+    def test_prefix_slot_that_is_not_free_is_ignored(self) -> None:
+        manager = _make_manager(max_batch_size=2)
+        manager.assign_slot("busy")
+
+        assert manager.assign_slot("new", prefix_slot=0) == 1
+
+    def test_victim_rank_orders_free_slots_on_one_card(self) -> None:
+        manager = _make_manager(max_batch_size=4)
+        rank = {0: (2, 0), 1: (1, 5), 2: (0, 0), 3: (2, 1)}
+
+        order = [manager.assign_slot(f"r{i}", slot_victim_rank=rank.__getitem__) for i in range(4)]
+
+        assert order == [2, 1, 0, 3]
+
+    def test_card_load_comes_before_victim_rank(self) -> None:
+        manager = _make_manager(max_batch_size=4)
+        manager.reset_slots(slot_card=lambda slot_id: slot_id % 2)
+        manager.assign_slot("busy", prefix_slot=1)  # card 1 runs one request
+        rank = {0: (2, 0), 2: (1, 0), 3: (0, 0)}
+
+        # Card 0 (slots 0, 2) is idle: its cheaper victim, slot 2, wins over the empty slot 3 on card 1.
+        assert manager.assign_slot("a", slot_victim_rank=rank.__getitem__) == 2
+        # Both cards now run one request: the empty slot 3 wins on rank.
+        assert manager.assign_slot("b", slot_victim_rank=rank.__getitem__) == 3
+
+    def test_equal_rank_and_load_take_the_lowest_slot(self) -> None:
+        manager = _make_manager(max_batch_size=3)
+
+        assert manager.assign_slot("a", slot_victim_rank=lambda slot_id: (0, 0)) == 0
+        assert manager.assign_slot("b", slot_victim_rank=lambda slot_id: (0, 0)) == 1
+
+
+class TestMbltRuntimeCacheSnapshotRecency:
+    def test_hit_refreshes_a_finished_snapshot(self) -> None:
+        manager = _make_manager()
+        for req_id, block in (("a", 1), ("b", 2)):
+            _store_snapshot(manager, req_id, (block,), 4)
+            manager.mark_snapshot_finished(req_id)
+        assert [manager.finished_snapshot_age(req_id) for req_id in ("a", "b")] == [0, 1]
+
+        manager.refresh_snapshot_recency("a")
+
+        assert list(manager.finished_snapshot_lru) == ["b", "a"]
+        assert [manager.finished_snapshot_age(req_id) for req_id in ("a", "b")] == [1, 0]
+
+    def test_refresh_ignores_a_live_requests_snapshot(self) -> None:
+        manager = _make_manager()
+        _store_snapshot(manager, "live", (1,), 4)
+
+        manager.refresh_snapshot_recency("live")
+
+        assert list(manager.finished_snapshot_lru) == []
+
+    def test_refreshed_snapshot_outlives_older_ones_at_the_cap(self) -> None:
+        manager = _make_manager(max_finished_snapshots=2)
+        for req_id, block in (("a", 1), ("b", 2)):
+            _store_snapshot(manager, req_id, (block,), 4)
+            manager.mark_snapshot_finished(req_id)
+        manager.refresh_snapshot_recency("a")
+        _store_snapshot(manager, "c", (3,), 4)
+
+        assert manager.mark_snapshot_finished("c") == ["b"]
+
+
+class TestMbltRuntimeCacheCandidateMatch:
+    def test_candidates_limit_the_match_with_the_same_semantics(self) -> None:
+        manager = _make_manager()
+        _store_snapshot(manager, "long", (1, 2), 8, block_hashes=("h1", "h2"))
+        _store_snapshot(manager, "short", (1,), 4, block_hashes=("h1",))
+        request = _request("new", (1, 2), 8, block_hashes=("h1", "h2"))
+
+        assert manager.choose_prefix_snapshot(request).req_id == "long"
+        limited = manager.choose_prefix_snapshot(request, candidate_req_ids={"short"})
+        assert (limited.req_id, limited.matched_tokens) == ("short", 4)
+        assert manager.choose_prefix_snapshot(request, candidate_req_ids=set()).snapshot is None
+
+
 class TestMbltRuntimeCacheWithoutPrefixCaching:
     def _make_manager(self, *, max_batch_size: int = 1) -> MbltRuntimeCacheManager:
         return MbltRuntimeCacheManager(

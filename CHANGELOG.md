@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed
+
+- The prefix cache is device-only by default, as vLLM's GPU prefix cache is (#40). A finished request's snapshot is
+  reused while its NPU slot still holds it; when another cache takes the slot, the snapshot is dropped without a
+  dump, whether or not a load of it could pay. `VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD=1` /
+  `prefix_cache_host_offload` (off by default) saves it to host memory instead, under the cost test that decided it
+  before. On a non-batch model, a finished prefix is therefore reused only by the next request unless host offload is
+  on. Without host offload a batch model keeps up to one finished snapshot per slot, as they take no host memory.
+- A new request takes a free slot that still holds a snapshot of its prefix and continues on it in place, with no
+  load or dump and no cost test (only `prefix_cache_min_hit_tokens` applies). Otherwise it takes a slot on the
+  least-loaded card and, on it, an empty slot first, then one whose snapshot would not be worth saving, then the
+  least recently used snapshot. A prefix hit now marks its snapshot as recently used; before, only finishing did.
+
 ### Fixed
 
 - With prefix caching on, reusing a slot no longer dumps the finished request's KV that is still on it when no
