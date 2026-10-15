@@ -356,11 +356,13 @@ vllm serve mobilint/Qwen3-0.6B \
   (for example `QBRUNTIME_VISIBLE_DEVICES=1,2,3`) or pass a `dev_no` list in `--model-loader-extra-config`
   (`'{"dev_no": [1, 2, 3]}'`); engine `r` takes the `r`-th card. Set only one of them. A single `dev_no` card
   is refused, as it would put every engine on one card, and so is a list shorter than the number of engines.
-- vLLM starts each engine with `QBRUNTIME_VISIBLE_DEVICES` set to that engine's card, so qbruntime sees only it.
+- vLLM starts each engine with `QBRUNTIME_VISIBLE_DEVICES` set to that engine's card. qbruntime renumbers the
+  listed cards from 0, as `CUDA_VISIBLE_DEVICES` does, and cannot open the others (verified on qbruntime 1.5.0
+  with 3 cards), so every engine opens its card as `dev_no` 0.
 - Every NPU role of the model runs on the engine's card: the vision and text MXQs of a VLM, the base, draft and
   FC MXQs of an EAGLE-3 release, the encoder and decoder of Qwen3-ASR, and the shared, expert and `lm_head` MXQs
   of a Mixture-of-Experts model. Each role keeps the cores or clusters the release (or a prefixed `*_target_cores`
-  / `*_target_clusters` key) gives it, moved to that card. Prefixed `dev_no` lists (`text_dev_no`,
+  / `*_target_clusters` key) gives it, on that card. Prefixed `dev_no` lists (`text_dev_no`,
   `draft_dev_no`, ...) are accepted when they all name the same cards. A role whose targets span several cards,
   or an unprefixed `target_cores` / `target_clusters` on a multi-role model, is refused.
 - `max_batch_size` and `max_num_seqs` apply to each engine: three engines of a Batch16 MXQ serve up to 48

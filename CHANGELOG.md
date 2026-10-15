@@ -6,9 +6,9 @@
 
 - Data parallel serving: `vllm serve --data-parallel-size N` runs one EngineCore per NPU card behind vLLM's
   load balancer. The platform names `QBRUNTIME_VISIBLE_DEVICES` as its device control variable, so vLLM gives
-  each engine its own card (`QBRUNTIME_VISIBLE_DEVICES` or a `dev_no` list picks the cards), and the worker places
-  every NPU role (VLM vision/text, EAGLE-3 base/draft/FC, Qwen3-ASR encoder/decoder, MoE shared/expert/`lm_head`)
-  on that card with the release's own cores or clusters. Idle engines in a wave wait about one model step instead
+  each engine its own card (`QBRUNTIME_VISIBLE_DEVICES` or a `dev_no` list picks the cards). qbruntime renumbers
+  the visible card to 0, so the worker places every NPU role (VLM vision/text, EAGLE-3 base/draft/FC, Qwen3-ASR
+  encoder/decoder, MoE shared/expert/`lm_head`) on `dev_no` 0 with the release's own cores or clusters. Idle engines in a wave wait about one model step instead
   of running a dummy batch, and the data parallel group uses gloo. Prefix caches stay per engine. A single engine
   serves as before.
 
