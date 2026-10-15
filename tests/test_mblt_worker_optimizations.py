@@ -22,6 +22,7 @@ from vllm_mblt.mblt_worker import (
     _is_qwen3_vl_hf_config,
     _resolve_enable_sampling_penalties,
 )
+from vllm_mblt.request_cache import RequestCacheSlots
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest
 
 from .kv_slot_fakes import FakeForwardModel, FakeKVSlotModel, attach_request_caches, make_snapshot_cache
@@ -3073,17 +3074,53 @@ class TestMbltWorkerOptimizations:
         worker.cache_backend = SimpleNamespace(mxq_models=[model0, model1], k_per_model=2)
         worker._reset_cache_slots()
 
+        # Slots go round-robin over the cards: slot s is (s % 2, s // 2), so slots 1 and 3 are model1's.
         cache = worker.request_caches.new_cache(3)
         worker.request_caches.prepare(cache, 3, 0)
         cache.update_seen_tokens(4)
-        moved = worker.request_caches.relocate(cache, 2, 4)
-        worker.request_caches.prepare(moved, 2, 4)
+        moved = worker.request_caches.relocate(cache, 1, 4)
+        worker.request_caches.prepare(moved, 1, 4)
 
         assert cache.slot_of(0) == (1, 1)
         assert moved.slot_of(0) == (1, 0)
         assert model1.dumps == [1]
         assert [cache_id for cache_id, _ in model1.loads] == [0]
         assert model0.dumps == [] and model0.loads == []
+
+    def test_concurrent_requests_spread_over_the_cards(self) -> None:
+        """Three cards x K=4: the first requests get one slot on each card, and their caches sit there."""
+        worker = self._make_worker()
+        worker.max_batch_size = 12
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=12, block_size=128)
+        models = [FakeKVSlotModel(f"card{i}") for i in range(3)]
+        worker.cache_model = models[0]
+        worker.cache_backend = SimpleNamespace(mxq_models=models, k_per_model=4)
+        worker._reset_cache_slots()
+
+        slots = [worker._assign_cache_slot(f"r{i}") for i in range(4)]
+        rows = [worker.request_caches.new_cache(slot_id).slot_of(0) for slot_id in slots]
+
+        assert rows == [(0, 0), (1, 0), (2, 0), (0, 1)]
+
+    def test_request_cache_slots_cover_every_row_once(self) -> None:
+        """A capacity that is not a multiple of the card count still maps to distinct rows inside each card's K."""
+        request_caches = RequestCacheSlots([FakeKVSlotModel(f"card{i}") for i in range(3)], k_per_model=16)
+
+        rows = [request_caches._row_slot(slot_id) for slot_id in range(40)]
+
+        assert len(set(rows)) == 40
+        assert all(cache_id < 16 for _model_idx, cache_id in rows)
+        assert {model_idx for model_idx, _cache_id in rows[:3]} == {0, 1, 2}
+        assert sorted(request_caches._row_slot(slot_id) for slot_id in range(48)) == [
+            (m, c) for m in range(3) for c in range(16)
+        ]
+        with pytest.raises(RuntimeError, match="exceeds the loaded multi-card capacity"):
+            request_caches._row_slot(48)
+
+    def test_single_card_slots_keep_their_cache_ids(self) -> None:
+        request_caches = RequestCacheSlots([FakeKVSlotModel()], k_per_model=8)
+
+        assert [request_caches._row_slot(slot_id) for slot_id in range(8)] == [(0, i) for i in range(8)]
 
     @pytest.mark.parametrize("multimodal", [False, True])
     def test_resolve_cache_backend_finds_text_backend(self, multimodal: bool) -> None:

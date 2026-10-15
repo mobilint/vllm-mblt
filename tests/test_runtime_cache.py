@@ -736,6 +736,49 @@ class TestMbltRuntimeCacheManagerSlots:
         assert manager.assign_slot("c") == 0
         assert manager.get_slot("c") == 0
 
+    def test_slots_spread_over_cards_from_empty(self) -> None:
+        """Three cards x four slots, slot ``s`` on card ``s % 3``: the first requests take one slot per card."""
+        manager = _make_manager(max_batch_size=12)
+        manager.reset_slots(slot_card=lambda slot_id: slot_id % 3)
+
+        slots = [manager.assign_slot(f"r{i}") for i in range(6)]
+
+        assert slots == [0, 1, 2, 3, 4, 5]
+        assert [slot_id % 3 for slot_id in slots] == [0, 1, 2, 0, 1, 2]
+
+    def test_slot_goes_to_the_least_loaded_card_after_releases(self) -> None:
+        """The lowest free slot sits on the busiest card here; the new request goes to the idle card instead."""
+        manager = _make_manager(max_batch_size=12)
+        manager.reset_slots(slot_card=lambda slot_id: slot_id % 3)
+        for i in range(7):
+            manager.assign_slot(f"r{i}")  # slots 0..6: card 0 holds 0, 3, 6
+        for req_id in ("r1", "r4"):  # card 1 empties
+            manager.release_slot(req_id)
+        manager.release_slot("r0")  # slot 0 is now the lowest free slot, but card 0 still runs 3 and 6
+
+        assert manager.free_cache_slots[0] == 0
+        assert manager.assign_slot("new") == 1
+        assert manager.assign_slot("next") == 4
+        # Every card now runs two requests: the tie goes to the lowest free slot.
+        assert manager.assign_slot("third") == 0
+
+    def test_slot_card_survives_a_cache_reset(self) -> None:
+        manager = _make_manager(max_batch_size=4)
+        manager.reset_slots(slot_card=lambda slot_id: slot_id % 2)
+        manager.assign_slot("a")
+        manager.reset()
+
+        assert manager.assign_slot("b") == 0
+        assert manager.assign_slot("c") == 1
+
+    def test_without_slot_card_the_lowest_free_slot_is_reused(self) -> None:
+        manager = _make_manager(max_batch_size=4)
+        for i in range(3):
+            manager.assign_slot(f"r{i}")
+        manager.release_slot("r0")
+
+        assert manager.assign_slot("new") == 0
+
     def test_slot_request_selects_a_shared_prefix_snapshot(self) -> None:
         manager = _make_manager(max_batch_size=2, block_size=4)
         slot_id = manager.assign_slot("new")
