@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Each engine sizes its torch CPU thread pool for its share of the host instead of keeping PyTorch's host-sized
+  default: the worker calls transformers-mblt's `apply_host_thread_defaults` with the number of local engines
+  (`data_parallel_size_local`, 1 without data parallelism), which divides the CPUs the process may use among them,
+  clamped to 2–8 threads and never above torch's default. `OMP_NUM_THREADS` or `MKL_NUM_THREADS` still wins when set.
+  vLLM's own `OMP_NUM_THREADS=1` default applies only to its multiprocessing executor, not to the `uni` executor
+  vllm-mblt runs on. Several default-thread engines on one 16-core reservation reached 194–216 tok/s in total, against
+  557–580 tok/s with two threads each (#44). Requires transformers-mblt 0.6.1.
+
 ## 0.8.0
 
 ### Added

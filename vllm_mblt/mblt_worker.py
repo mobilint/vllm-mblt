@@ -29,6 +29,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_mblt.eagle3_runtime import Eagle3Runner, is_eagle3_model
+from vllm_mblt.host_threads import apply_engine_host_thread_defaults
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
 from vllm_mblt.moe_runtime import MbltMoECacheModel, is_mixture_of_experts_model
@@ -2849,6 +2850,7 @@ class MbltWorker(WorkerBase):
 
     def init_device(self) -> None:
         self._log_init_stage("init_device")
+        apply_engine_host_thread_defaults(self.vllm_config)
         return
 
     def load_model(self) -> None:
