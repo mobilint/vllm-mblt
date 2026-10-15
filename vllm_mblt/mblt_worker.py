@@ -28,6 +28,12 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.worker_base import WorkerBase
 
+from vllm_mblt.data_parallel import (
+    IdleStepPacer,
+    place_model_kwargs_on_card,
+    resolve_rank_card,
+    runtime_device_number,
+)
 from vllm_mblt.eagle3_runtime import Eagle3Runner, is_eagle3_model
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
@@ -399,6 +405,8 @@ class MbltWorker(WorkerBase):
     MAX_FINISHED_CACHE_SNAPSHOTS = 16
     # Set for an EAGLE-3 model, which runs whole speculative rounds through transformers-mblt.
     eagle3_runner: Optional[Eagle3Runner] = None
+    # Paces execute_dummy_batch under data parallel; built on the first model step.
+    _idle_step_pacer: Optional[IdleStepPacer] = None
 
     def __init__(
         self,
@@ -2851,6 +2859,38 @@ class MbltWorker(WorkerBase):
         self._log_init_stage("init_device")
         return
 
+    def _place_on_data_parallel_card(self, model_kwargs: Dict[str, object], hf_config: object) -> Dict[str, object]:
+        """Under data parallel, place every NPU role of the model on this engine's own card.
+
+        A single engine (data parallel size 1) keeps the kwargs as given.
+        """
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
+            return model_kwargs
+        local_rank = getattr(parallel_config, "data_parallel_rank_local", None) or 0
+        card = resolve_rank_card(model_kwargs, local_rank=local_rank)
+        device_number = runtime_device_number(card)
+        placed = place_model_kwargs_on_card(model_kwargs, hf_config, device_number=device_number)
+        self._log_init_stage(
+            "load_model:data_parallel_card",
+            data_parallel_rank=getattr(parallel_config, "data_parallel_rank", None),
+            data_parallel_rank_local=local_rank,
+            card=card,
+            dev_no=device_number,
+        )
+        return placed
+
+    def execute_dummy_batch(self) -> None:
+        """The step an idle data parallel engine takes while a peer still has requests.
+
+        Nothing runs on the NPU: each engine owns its card and model, so an idle engine has nothing to keep in step.
+        It waits about one of its recent model steps, so it reaches the periodic all-reduce of the engines'
+        unfinished state together with its busy peers instead of blocking there early (unable to take a new
+        request), and does not spin a CPU core.
+        """
+        pacer = self._idle_step_pacer or IdleStepPacer()
+        time.sleep(pacer.idle_seconds())
+
     def load_model(self) -> None:
         self._log_init_stage("load_model:start", model=self.model_config.model)
         model_kwargs: Dict[str, object] = {}
@@ -2878,6 +2918,7 @@ class MbltWorker(WorkerBase):
 
         hf_config = getattr(self.model_config, "hf_config", None)
         model_kwargs = _normalize_model_kwargs_for_hf_config(model_kwargs, hf_config)
+        model_kwargs = self._place_on_data_parallel_card(model_kwargs, hf_config)
 
         start = time.perf_counter()
         self._log_init_stage(
@@ -3164,8 +3205,18 @@ class MbltWorker(WorkerBase):
         else:
             tracer.stop()
 
-    @torch.inference_mode()
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | None:
+        start = time.perf_counter()
+        try:
+            return self._execute_scheduled_step(scheduler_output)
+        finally:
+            if getattr(scheduler_output, "total_num_scheduled_tokens", 0):
+                if self._idle_step_pacer is None:
+                    self._idle_step_pacer = IdleStepPacer()
+                self._idle_step_pacer.observe_step(time.perf_counter() - start)
+
+    @torch.inference_mode()
+    def _execute_scheduled_step(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | None:
         if self.model is None:
             raise RuntimeError("Model is not initialized.")
         if self.input_embeddings is None:

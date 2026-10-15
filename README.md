@@ -337,6 +337,41 @@ model instance and local cache ID that own them.
 For explicit core or cluster placement across multiple cards, use canonical device-qualified target strings such
 as `"0:0:0"` / `"1:0:0"` for `target_cores` or `"0:0"` / `"1:0"` for `target_clusters`.
 
+### Data Parallel
+
+`--data-parallel-size N` serves one model from one `vllm serve` with N EngineCores, one per NPU card. vLLM's
+built-in load balancer sends each request to the least busy engine, so the cards run independently instead of in
+one lockstep step:
+
+```bash
+vllm serve mobilint/Qwen3-0.6B \
+  --trust-remote-code \
+  --data-parallel-size 3
+```
+
+- Engine `r` (local data parallel rank) runs on card `r`. To pick the cards, set `QBRUNTIME_VISIBLE_DEVICES`
+  (for example `QBRUNTIME_VISIBLE_DEVICES=1,2,3`) or pass a `dev_no` list in `--model-loader-extra-config`
+  (`'{"dev_no": [1, 2, 3]}'`); engine `r` takes the `r`-th card. Set only one of them. A single `dev_no` card
+  is refused, as it would put every engine on one card, and so is a list shorter than the number of engines.
+- vLLM starts each engine with `QBRUNTIME_VISIBLE_DEVICES` set to that engine's card. qbruntime renumbers the
+  listed cards from 0, as `CUDA_VISIBLE_DEVICES` does, and cannot open the others (verified on qbruntime 1.5.0
+  with 3 cards), so every engine opens its card as `dev_no` 0.
+- Every NPU role of the model runs on the engine's card: the vision and text MXQs of a VLM, the base, draft and
+  FC MXQs of an EAGLE-3 release, the encoder and decoder of Qwen3-ASR, and the shared, expert and `lm_head` MXQs
+  of a Mixture-of-Experts model. Each role keeps the cores or clusters the release (or a prefixed `*_target_cores`
+  / `*_target_clusters` key) gives it, on that card. Prefixed `dev_no` lists (`text_dev_no`,
+  `draft_dev_no`, ...) are accepted when they all name the same cards. A role whose targets span several cards,
+  or an unprefixed `target_cores` / `target_clusters` on a multi-role model, is refused.
+- `max_batch_size` and `max_num_seqs` apply to each engine: three engines of a Batch16 MXQ serve up to 48
+  sequences. Multi-card software batching (a `dev_no` list in a single engine) does not combine with data
+  parallel: each engine owns one card.
+- The prefix cache belongs to each engine. A prompt prefix cached on one card is not reused on another; the
+  load balancer does not route by prefix.
+- While any engine has requests, the engines step in waves and all-reduce their unfinished-request state over a
+  gloo group every 32 steps. An idle engine waits about one of its recent model steps per wave step instead of
+  running the model, so it neither spins a CPU core nor blocks early at that all-reduce.
+- `--data-parallel-size 1` (the default) serves exactly as before.
+
 ## Benchmarking
 
 This repository includes `sonnet.txt`, which can be used with vLLM benchmark commands.
@@ -588,12 +623,14 @@ vllm_mblt/
 ├── __init__.py                 # vLLM plugin and model registration entry points
 ├── mblt_platform.py            # platform config overrides and runtime-aware defaults
 ├── mblt_worker.py              # custom worker, prefill/decode flow, KV snapshot logic
+├── data_parallel.py            # data parallel card assignment and per-role placement on the engine's card
 ├── moe_runtime.py              # Mixture-of-Experts cache-model adapter over transformers-mblt
 ├── eagle3_runtime.py           # EAGLE-3 speculative rounds through transformers-mblt, one cache per request
 ├── tracing.py                  # qbruntime NPU event tracing behind vLLM's profiler hook
 └── models/                     # Mobilint model wrappers for LLM/VLM families
 
 tests/
+├── test_data_parallel.py
 ├── test_eagle3.py
 ├── test_kv_cache_swap_spec.py
 ├── test_mblt_platform_prefill.py
