@@ -337,6 +337,47 @@ model instance and local cache ID that own them.
 For explicit core or cluster placement across multiple cards, use canonical device-qualified target strings such
 as `"0:0:0"` / `"1:0:0"` for `target_cores` or `"0:0"` / `"1:0"` for `target_clusters`.
 
+A list `dev_no` still runs every card from one engine: each step waits for the slowest card, and the host work for
+all rows runs between NPU calls. To scale throughput with the number of cards, prefer one engine per card (next
+section).
+
+### One Engine per Card
+
+For serving on several cards, run one `vllm serve` process per card, each pinned to its card with `dev_no` and
+listening on its own port, and give each process a small CPU thread budget:
+
+```bash
+OMP_NUM_THREADS=2 vllm serve mobilint/Llama-3.2-1B-Instruct --trust-remote-code --port 8000 \
+  --model-loader-extra-config '{"dev_no": 0}'
+OMP_NUM_THREADS=2 vllm serve mobilint/Llama-3.2-1B-Instruct --trust-remote-code --port 8001 \
+  --model-loader-extra-config '{"dev_no": 1}'
+```
+
+Spread the clients or a load balancer across the ports.
+
+`vllm-mblt` does not set torch or OpenMP thread counts itself, so without `OMP_NUM_THREADS` each engine process
+uses PyTorch's default, which grows with the cores the process can see. That is fine for a single engine on a large
+host, but several default engines on one host, or in one CPU reservation (cpuset, container CPU limit), compete for
+the same cores, and the oversubscription costs more than the extra threads gain. Set `OMP_NUM_THREADS` before
+launching each engine; it also sets PyTorch's intra-op thread count. Keep the total thread budget of all engines and
+clients on the host within the cores they are allowed to use.
+
+Reference measurement (Qwen3-0.6B, MXQ `global8`, runtime batch 16; three MLA100 cards with one ARIES each; random
+prompts of 128 tokens with 64 output tokens and `--ignore-eos`; vllm-mblt 0.8.0, vLLM 0.11.2, transformers-mblt
+0.6.0, mobilint-qb-runtime 1.5.0):
+
+| Setup | Throughput |
+|---|---|
+| One engine, `dev_no: [0, 1, 2]`, concurrency 48 | 392–411 tok/s |
+| One engine per card, `OMP_NUM_THREADS=2` | 557–580 tok/s total |
+| One engine per card, default threads, engines and three clients on a 16-core reservation | 194–216 tok/s total (reservation saturated at 12.5–13.7 cores) |
+
+On one card at concurrency 16, a default-thread engine used 2.8–2.9 cores and 45 threads; with
+`OMP_NUM_THREADS=2` it used 0.9 cores at the same throughput (180–182 vs 181 tok/s). The trade-off is CPU-side
+sampling: a 48-row sampling step took 9.5 ms with 2 threads instead of 1.6 ms, so raise the budget if a single
+engine owns a large host. These numbers depend on the host and model; measure on your own target before choosing a
+value.
+
 ## Benchmarking
 
 This repository includes `sonnet.txt`, which can be used with vLLM benchmark commands.

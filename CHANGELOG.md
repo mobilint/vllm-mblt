@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- README recommends one `vllm serve` engine per card with a small per-engine thread budget (`OMP_NUM_THREADS`),
+  and explains why several engines with default torch/OpenMP threads on one host lose throughput (#44).
+
 ## 0.8.0
 
 ### Added
