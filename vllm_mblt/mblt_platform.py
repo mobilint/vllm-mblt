@@ -9,6 +9,12 @@ if TYPE_CHECKING:
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
+from vllm_mblt.data_parallel import (
+    QBRUNTIME_VISIBLE_DEVICES_ENV,
+    collect_placement_kwargs,
+    export_card_list_for_ranks,
+)
+
 logger = init_logger(__name__)
 
 SINGLE_CORE_BATCH_MODEL_MAX_PREFILL_CHUNK_SIZE = 128
@@ -363,6 +369,11 @@ class MbltPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_type = "cpu"
     device_name = "cpu"
+    # With --data-parallel-size N, vLLM gives each engine process its own entry of this variable (the parent's list,
+    # or 0..N-1 when unset), so every EngineCore sees one card.
+    device_control_env_var = QBRUNTIME_VISIBLE_DEVICES_ENV
+    # The data parallel engines all-reduce their unfinished-request state over a CPU process group.
+    dist_backend = "gloo"
     # Whether the engine configured last in this process serves EAGLE-3; validate_request's fallback.
     _serving_eagle3 = False
 
@@ -414,10 +425,33 @@ class MbltPlatform(Platform):
             raise ValueError("EAGLE-3 models take token prompts only, without prompt embeddings or multimodal data.")
 
     @classmethod
+    def _prepare_data_parallel(cls, vllm_config: "VllmConfig") -> None:
+        """Check the data parallel card assignment before vLLM starts one engine process per card.
+
+        This runs once, in the front end; each engine's worker places its model on its own card at load time.
+        """
+        parallel_config = vllm_config.parallel_config
+        data_parallel_size = _coerce_positive_int(getattr(parallel_config, "data_parallel_size", 1)) or 1
+        if data_parallel_size <= 1:
+            return
+        local_size = _coerce_positive_int(getattr(parallel_config, "data_parallel_size_local", None))
+        cards = export_card_list_for_ranks(
+            collect_placement_kwargs(_get_model_loader_extra_config(vllm_config)),
+            local_data_parallel_size=local_size or data_parallel_size,
+        )
+        logger.info(
+            "Data parallel size %d: one EngineCore per card (%s=%s).",
+            data_parallel_size,
+            QBRUNTIME_VISIBLE_DEVICES_ENV,
+            ",".join(map(str, cards)) if cards else os.environ.get(QBRUNTIME_VISIBLE_DEVICES_ENV, "<rank number>"),
+        )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config: ParallelConfig = vllm_config.parallel_config  # type: ignore
         parallel_config.worker_cls = "vllm_mblt.mblt_worker.MbltWorker"
         cls._serving_eagle3 = _is_eagle3_hf_config(_get_hf_config(vllm_config))
+        cls._prepare_data_parallel(vllm_config)
 
         cache_config: CacheConfig = vllm_config.cache_config
         # Keep user-provided value if present. Otherwise, use a smaller block
