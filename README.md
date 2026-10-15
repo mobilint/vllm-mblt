@@ -488,7 +488,11 @@ the slot, so a request that loses its slot resumes from its own KV. On top of
 that, `MbltWorker` reuses KV prefixes across requests with these policies:
 
 - A finished request's cache becomes its prefix snapshot, without a dump. Its KV
-  is saved only when another cache takes the slot.
+  is saved only when another cache takes the slot, and only if a later load of
+  it could beat recomputing it under the cost model below; otherwise the
+  snapshot is dropped and the slot is overwritten without a dump. A request
+  whose prefix snapshot is still on its own slot takes that cache over in
+  place either way.
 - On a non-batch model, a request that loses the slot to another one is also
   kept as a snapshot, so the next request can start from its prefix.
 - Finished snapshots are evicted LRU-first beyond 16, or beyond what fits the
@@ -505,7 +509,13 @@ worker tries to measure optimistic one-cache-id prefill costs for 1, 2, 4, and
 8 KV blocks; for batch MXQs this still submits exactly one active `cache_id`.
 Real snapshot loads and dumps update per-`cache_id` EWMA timings. A snapshot is
 loaded only when `load_ms < prefill_ms * 0.9`; otherwise the snapshot remains
-stored and the prompt is recomputed. The policy can be adjusted with environment
+stored and the prompt is recomputed. The same test decides whether a finished
+snapshot is saved when its slot is reused: it is saved only when a load of some
+prefix of it could pass. Until a load has been measured, the measured dump time
+stands in for `load_ms`, since both move the slot's whole KV buffers; with no
+measurement at all, the snapshot is saved. Saving a snapshot still dumps the
+slot's whole KV synchronously, so a workload whose prefixes are long enough to
+pass the test pays that dump on every slot reuse, hit or not. The policy can be adjusted with environment
 variables or equivalent model loader extra config keys:
 
 - `VLLM_MBLT_PREFIX_CACHE_AUTO_THRESHOLD` / `prefix_cache_auto_threshold`
