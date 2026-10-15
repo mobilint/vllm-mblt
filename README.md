@@ -332,7 +332,9 @@ vllm serve mobilint/Llama-3.2-1B-Instruct \
 If one MXQ model instance has compiled batch capacity `K`, the backend loads
 `ceil(max_batch_size / K)` model instances. `max_batch_size` is therefore the aggregate serving capacity across
 all loaded instances, not a per-card value. KV-cache rows, including prefix-cache snapshots, remain bound to the
-model instance and local cache ID that own them.
+model instance and local cache ID that own them. A new request takes a free slot on the model instance running
+the fewest requests, so concurrent requests spread over every loaded instance instead of filling the first
+instance's `K` rows before the next one gets any.
 
 For explicit core or cluster placement across multiple cards, use canonical device-qualified target strings such
 as `"0:0:0"` / `"1:0:0"` for `target_cores` or `"0:0"` / `"1:0"` for `target_clusters`.

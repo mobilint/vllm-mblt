@@ -522,7 +522,11 @@ class MbltWorker(WorkerBase):
             self.request_caches = RequestCacheSlots(models, k_per_model, cache_cls=cache_cls, cache_kwargs=cache_kwargs)
         self._slot_caches = {}
         self.runtime_cache.enable_prefix_caching = self._prefix_caching_enabled()
-        self.runtime_cache.reset_slots(max_batch_size=self.max_batch_size)
+        self.runtime_cache.reset_slots(
+            max_batch_size=self.max_batch_size,
+            # New requests are balanced over the cards their slots run on.
+            slot_card=self.request_caches.slot_model_index if self._is_batch_model() else None,
+        )
         self.runtime_cache.max_finished_snapshots = self._finished_snapshot_cap()
 
     def _finished_snapshot_cap(self) -> int:

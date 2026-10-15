@@ -12,6 +12,10 @@
   measured, the measured dump time stands in for the load time; with no measurement, the snapshot is saved as
   before. A request whose prefix snapshot is still on its own slot takes the cache over in place and, under the
   same test, no longer dumps a host copy for the snapshot.
+- With `dev_no` listing several cards, concurrent requests now spread over every card instead of filling card 0's
+  batch first. Worker slot `s` addresses row `(s % N, s // N)` of the `N` cache MXQs (round-robin, the layout
+  mobilint/transformers-mblt#31 gives its default cache rows) instead of `divmod(s, K)`, and a new request takes a
+  free slot on the card running the fewest requests. With one card nothing changes.
 
 ## 0.8.0
 
