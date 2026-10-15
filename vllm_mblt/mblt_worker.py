@@ -31,8 +31,8 @@ from vllm.v1.worker.worker_base import WorkerBase
 from vllm_mblt.data_parallel import (
     IdleStepPacer,
     place_model_kwargs_on_card,
-    probe_runtime_device_number,
     resolve_rank_card,
+    runtime_device_number,
 )
 from vllm_mblt.eagle3_runtime import Eagle3Runner, is_eagle3_model
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
@@ -2869,7 +2869,7 @@ class MbltWorker(WorkerBase):
             return model_kwargs
         local_rank = getattr(parallel_config, "data_parallel_rank_local", None) or 0
         card = resolve_rank_card(model_kwargs, local_rank=local_rank)
-        device_number = probe_runtime_device_number(card)
+        device_number = runtime_device_number(card)
         placed = place_model_kwargs_on_card(model_kwargs, hf_config, device_number=device_number)
         self._log_init_stage(
             "load_model:data_parallel_card",

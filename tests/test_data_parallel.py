@@ -13,8 +13,8 @@ from vllm_mblt.data_parallel import (
     export_card_list_for_ranks,
     npu_roles,
     place_model_kwargs_on_card,
-    probe_runtime_device_number,
     resolve_rank_card,
+    runtime_device_number,
 )
 from vllm_mblt.mblt_platform import MbltPlatform
 from vllm_mblt.mblt_worker import MbltWorker, _normalize_model_kwargs_for_hf_config
@@ -152,31 +152,20 @@ class TestRankCard:
 
 
 class TestRuntimeDeviceNumber:
-    def test_card_zero_needs_no_probe(self) -> None:
-        def fail(dev_no):
-            raise AssertionError("probed")
+    """qbruntime renumbers QBRUNTIME_VISIBLE_DEVICES from 0 (verified on qbruntime 1.5.0 with 3 cards)."""
 
-        assert probe_runtime_device_number(0, fail) == 0
+    def test_the_only_visible_card_is_dev_no_zero(self) -> None:
+        assert runtime_device_number(2, environ={QBRUNTIME_VISIBLE_DEVICES_ENV: "2"}) == 0
 
-    def test_physical_numbering_keeps_the_card(self) -> None:
-        opened = []
-        assert probe_runtime_device_number(2, lambda dev_no: opened.append(dev_no) or object()) == 2
-        assert opened == [2]
+    def test_a_card_in_a_visible_list_is_its_position(self) -> None:
+        assert runtime_device_number(0, environ={QBRUNTIME_VISIBLE_DEVICES_ENV: "2,0"}) == 1
 
-    def test_renumbered_visible_cards_start_at_zero(self) -> None:
-        def renumbered(dev_no):
-            if dev_no != 0:
-                raise RuntimeError("Acc_DeviceNotFound occurred.")
-            return object()
+    def test_without_the_variable_the_physical_number_opens(self) -> None:
+        assert runtime_device_number(2, environ={}) == 2
 
-        assert probe_runtime_device_number(2, renumbered) == 0
-
-    def test_card_error_surfaces_when_no_card_opens(self) -> None:
-        def broken(dev_no):
-            raise RuntimeError(f"driver error on {dev_no}")
-
-        with pytest.raises(RuntimeError, match="driver error on 2"):
-            probe_runtime_device_number(2, broken)
+    def test_a_hidden_card_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="not in"):
+            runtime_device_number(1, environ={QBRUNTIME_VISIBLE_DEVICES_ENV: "2"})
 
 
 class TestPlacement:
@@ -301,21 +290,16 @@ class TestWorker:
         assert self._worker(data_parallel_size=1)._place_on_data_parallel_card(kwargs, TEXT_CONFIG) is kwargs
 
     def test_rank_places_vlm_on_its_card(self, monkeypatch) -> None:
-        import vllm_mblt.mblt_worker as worker_module
-
-        monkeypatch.setenv(QBRUNTIME_VISIBLE_DEVICES_ENV, "5")
-        monkeypatch.setattr(worker_module, "probe_runtime_device_number", lambda card: card)
+        monkeypatch.delenv(QBRUNTIME_VISIBLE_DEVICES_ENV, raising=False)
         kwargs = _normalize_model_kwargs_for_hf_config({"max_batch_size": 16}, VL_CONFIG)
         placed = self._worker(data_parallel_size=3, local_rank=2)._place_on_data_parallel_card(kwargs, VL_CONFIG)
-        assert placed["text_dev_no"] == placed["vision_dev_no"] == 5
-        assert placed["text_target_clusters"] == ["5:0", "5:1"]
+        # No variable (a launcher that sets none): the physical card number opens it.
+        assert placed["text_dev_no"] == placed["vision_dev_no"] == 2
+        assert placed["text_target_clusters"] == ["2:0", "2:1"]
         assert placed["text_max_batch_size"] == placed["vision_max_batch_size"] == 16
 
-    def test_rank_places_eagle3_draft_with_renumbered_cards(self, monkeypatch) -> None:
-        import vllm_mblt.mblt_worker as worker_module
-
+    def test_rank_places_eagle3_draft_on_its_visible_card(self, monkeypatch) -> None:
         monkeypatch.setenv(QBRUNTIME_VISIBLE_DEVICES_ENV, "2")
-        monkeypatch.setattr(worker_module, "probe_runtime_device_number", lambda card: 0)
         placed = self._worker(data_parallel_size=3, local_rank=1)._place_on_data_parallel_card(
             {"draft_dev_no": [1, 2, 0]}, EAGLE3_CONFIG
         )

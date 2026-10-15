@@ -8,13 +8,14 @@ qbruntime's own ``QBRUNTIME_VISIBLE_DEVICES`` there, so each engine process star
 The worker still builds the model through transformers-mblt ``from_pretrained``; this module only decides which card
 an engine owns and rewrites the placement kwargs of every NPU role (``text_``/``vision_``, ``base_``/``draft_``/
 ``fc_``, ``encoder_``/``decoder_``, ``shared_``/``expert_``/``lm_head_``) onto that card, keeping each role's
-cores and clusters as the release lays them out.
+cores and clusters as the release lays them out. qbruntime renumbers the visible cards from 0, so the engine's card
+is ``dev_no`` 0 in its own process.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 QBRUNTIME_VISIBLE_DEVICES_ENV = "QBRUNTIME_VISIBLE_DEVICES"
@@ -167,34 +168,21 @@ def resolve_rank_card(
     return local_rank
 
 
-def probe_runtime_device_number(card: int, open_accelerator: Callable[[int], object] | None = None) -> int:
-    """The ``dev_no`` that opens ``card`` while ``QBRUNTIME_VISIBLE_DEVICES`` limits the process to it.
+def runtime_device_number(card: int, *, environ: Mapping[str, str] | None = None) -> int:
+    """The ``dev_no`` that opens physical ``card`` in this process.
 
-    If qbruntime keeps physical numbers and only hides the other cards, that is ``card``; if it renumbers the
-    visible cards from zero, as ``CUDA_VISIBLE_DEVICES`` does, it is ``0``. Opening ``card`` decides: when it fails
-    and device ``0`` opens, the visible card was renumbered. qbruntime logs the reason ("Device #N is not
-    visible") rather than putting it in the exception, so the exception text is not consulted.
+    qbruntime renumbers the cards ``QBRUNTIME_VISIBLE_DEVICES`` lists from 0, as ``CUDA_VISIBLE_DEVICES`` does, and
+    a hidden card fails to open (verified on qbruntime 1.5.0 with 3 cards). vLLM starts each data parallel engine
+    with only its own card listed, so every role of the engine opens ``dev_no`` 0. Without the variable the
+    physical number is used.
     """
-    if card == 0:
-        return 0
-    if open_accelerator is None:
-
-        def open_accelerator(dev_no: int) -> object:
-            from qbruntime import Accelerator
-
-            return Accelerator(dev_no)
-
-    try:
-        accelerator = open_accelerator(card)
-    except Exception as card_error:
-        try:
-            accelerator = open_accelerator(0)
-        except Exception:
-            raise card_error from None
-        del accelerator
-        return 0
-    del accelerator
-    return card
+    environ = os.environ if environ is None else environ
+    visible = [entry.strip() for entry in environ.get(QBRUNTIME_VISIBLE_DEVICES_ENV, "").split(",") if entry.strip()]
+    if not visible:
+        return card
+    if str(card) not in visible:
+        raise ValueError(f"Card {card} is not in {QBRUNTIME_VISIBLE_DEVICES_ENV}={','.join(visible)!r}.")
+    return visible.index(str(card))
 
 
 def _retarget(items: object, device_number: int, *, grain: str) -> list[object]:
