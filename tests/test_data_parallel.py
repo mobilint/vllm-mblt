@@ -7,6 +7,7 @@ import pytest
 
 from vllm_mblt import data_parallel
 from vllm_mblt.data_parallel import (
+    DATA_PARALLEL_CARDS_CHECKED_ENV,
     QBRUNTIME_VISIBLE_DEVICES_ENV,
     IdleStepPacer,
     collect_placement_kwargs,
@@ -48,6 +49,12 @@ ASR_CONFIG = SimpleNamespace(
 )
 
 
+@pytest.fixture(autouse=True)
+def _clean_card_environment(monkeypatch):
+    monkeypatch.delenv(QBRUNTIME_VISIBLE_DEVICES_ENV, raising=False)
+    monkeypatch.delenv(DATA_PARALLEL_CARDS_CHECKED_ENV, raising=False)
+
+
 class TestPlatform:
     def test_names_qbruntime_visible_devices_for_vllm_per_rank_split(self) -> None:
         assert MbltPlatform.device_control_env_var == "QBRUNTIME_VISIBLE_DEVICES"
@@ -79,6 +86,57 @@ class TestPlatform:
         MbltPlatform._prepare_data_parallel(self._vllm_config({"dev_no": [0, 1]}, data_parallel_size=1))
         assert QBRUNTIME_VISIBLE_DEVICES_ENV not in os.environ
 
+    @pytest.mark.parametrize("extra_config", [{"dev_no": [0, 1, 2]}, {}], ids=["dev_no_list", "rank_numbering"])
+    def test_front_end_to_engine_flow_loads_each_rank_on_dev_no_zero(self, monkeypatch, extra_config) -> None:
+        """The front end checks and exports the cards; vLLM starts each engine with its card; the engine's config
+        hook runs again and its worker loads every role on dev_no 0."""
+        import vllm.v1.engine.utils as engine_utils
+
+        from tests.test_eagle3 import _FakeEagle3Model
+
+        monkeypatch.setattr(engine_utils, "current_platform", MbltPlatform)
+        front_end_config = self._vllm_config(extra_config, data_parallel_size=3)
+        MbltPlatform._prepare_data_parallel(front_end_config)
+        launch_config = SimpleNamespace(parallel_config=SimpleNamespace(world_size=1, local_world_size=1))
+
+        for rank in range(3):
+            with engine_utils.set_device_control_env_var(launch_config, rank):
+                assert os.environ[QBRUNTIME_VISIBLE_DEVICES_ENV] == str(rank)
+                MbltPlatform._prepare_data_parallel(front_end_config)  # the engine process's config hook
+                assert os.environ[QBRUNTIME_VISIBLE_DEVICES_ENV] == str(rank)
+
+                worker = MbltWorker.__new__(MbltWorker)
+                worker.max_seq_len = 2048
+                worker.rank = 0
+                worker.local_rank = 0
+                worker.load_config = SimpleNamespace(model_loader_extra_config=extra_config)
+                worker.model_config = SimpleNamespace(
+                    model="mobilint/EAGLE3-JPharmatron-7B", hf_config=EAGLE3_CONFIG, model_kwargs={}, hf_overrides={}
+                )
+                worker.vllm_config = SimpleNamespace(
+                    load_config=worker.load_config,
+                    model_config=worker.model_config,
+                    parallel_config=SimpleNamespace(
+                        data_parallel_size=3, data_parallel_rank=rank, data_parallel_rank_local=rank
+                    ),
+                )
+                model = _FakeEagle3Model()
+                model.eval = lambda: None
+                model.get_input_embeddings = lambda: "embeddings"
+                loaded = []
+                monkeypatch.setattr(
+                    "vllm_mblt.mblt_worker.AutoModelForCausalLM.from_pretrained",
+                    lambda *args, **kwargs: loaded.append(kwargs) or model,
+                )
+
+                worker.load_model()
+
+                (kwargs,) = loaded
+                assert "dev_no" not in kwargs
+                for role in ("base_", "draft_", "fc_"):
+                    assert kwargs[f"{role}dev_no"] == 0
+                    assert kwargs[f"{role}target_cores"] == ["0:0:0"]
+
     def test_single_card_dev_no_is_refused_under_data_parallel(self, monkeypatch) -> None:
         monkeypatch.delenv(QBRUNTIME_VISIBLE_DEVICES_ENV, raising=False)
         with pytest.raises(ValueError, match="same card"):
@@ -104,7 +162,7 @@ class TestCardList:
             environ=environ,
         )
         assert cards == [1, 2]
-        assert environ == {QBRUNTIME_VISIBLE_DEVICES_ENV: "1,2"}
+        assert environ == {QBRUNTIME_VISIBLE_DEVICES_ENV: "1,2", DATA_PARALLEL_CARDS_CHECKED_ENV: "1"}
 
     def test_both_env_and_dev_no_list_is_refused(self) -> None:
         with pytest.raises(ValueError, match="set only one"):
@@ -119,7 +177,24 @@ class TestCardList:
     def test_no_placement_keeps_vllm_rank_numbering(self) -> None:
         environ: dict[str, str] = {}
         assert export_card_list_for_ranks({}, local_data_parallel_size=3, environ=environ) is None
-        assert environ == {}
+        assert environ == {DATA_PARALLEL_CARDS_CHECKED_ENV: "1"}
+
+    def test_engine_process_keeps_the_card_vllm_gave_it(self) -> None:
+        # The engine process inherits the front end's marker and sees one card per rank.
+        environ = {DATA_PARALLEL_CARDS_CHECKED_ENV: "1", QBRUNTIME_VISIBLE_DEVICES_ENV: "1"}
+        assert export_card_list_for_ranks({"dev_no": [0, 1, 2]}, local_data_parallel_size=3, environ=environ) == [
+            0,
+            1,
+            2,
+        ]
+        assert export_card_list_for_ranks({}, local_data_parallel_size=3, environ=environ) is None
+        assert environ[QBRUNTIME_VISIBLE_DEVICES_ENV] == "1"
+
+    def test_a_refused_assignment_leaves_no_marker(self) -> None:
+        environ = {QBRUNTIME_VISIBLE_DEVICES_ENV: "0,1"}
+        with pytest.raises(ValueError, match="set only one"):
+            export_card_list_for_ranks({"dev_no": [0, 1]}, local_data_parallel_size=2, environ=environ)
+        assert DATA_PARALLEL_CARDS_CHECKED_ENV not in environ
 
     def test_collects_placement_kwargs_of_every_role(self) -> None:
         collected = collect_placement_kwargs(

@@ -19,6 +19,10 @@ from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 QBRUNTIME_VISIBLE_DEVICES_ENV = "QBRUNTIME_VISIBLE_DEVICES"
+# Set by the process that checked the card assignment (the front end) and inherited by the engine processes it
+# starts. vLLM sets QBRUNTIME_VISIBLE_DEVICES to one card in each engine process, and the platform config hook runs
+# there again; the marker tells that run the assignment was already checked and exported.
+DATA_PARALLEL_CARDS_CHECKED_ENV = "VLLM_MBLT_DATA_PARALLEL_CARDS_CHECKED"
 
 # The NPU role prefixes a Mobilint release can use; "" is the single-backend model.
 NPU_ROLE_PREFIXES = (
@@ -102,29 +106,34 @@ def export_card_list_for_ranks(
     """Check the ``dev_no`` lists before the engines start, and hand them to vLLM's per-rank device split.
 
     vLLM gives local rank ``r`` the ``r``-th entry of ``QBRUNTIME_VISIBLE_DEVICES``, so a ``dev_no`` list is written
-    there when the variable is unset. Setting both is refused: it is ambiguous which one names the cards.
+    there when the variable is unset. Setting both is refused: it is ambiguous which one names the cards. Only the
+    first process checks; the engine processes it starts inherit its marker and keep their per-rank variable.
     """
     environ = os.environ if environ is None else environ
     cards = data_parallel_card_list(placement_kwargs)
+    if DATA_PARALLEL_CARDS_CHECKED_ENV in environ:
+        # An engine process: its QBRUNTIME_VISIBLE_DEVICES is the one card vLLM gave this rank.
+        return cards
+    visible = environ.get(QBRUNTIME_VISIBLE_DEVICES_ENV, "")
     if cards is None:
-        visible = environ.get(QBRUNTIME_VISIBLE_DEVICES_ENV, "")
         if visible and len(visible.split(",")) < local_data_parallel_size:
             raise ValueError(
                 f"{QBRUNTIME_VISIBLE_DEVICES_ENV}={visible!r} lists fewer cards than the "
                 f"{local_data_parallel_size} local data parallel engines."
             )
-        return None
-    if len(cards) < local_data_parallel_size:
+    elif len(cards) < local_data_parallel_size:
         raise ValueError(
             f"dev_no lists {len(cards)} card(s) {cards}, fewer than the {local_data_parallel_size} local data "
             "parallel engines; each engine needs its own card."
         )
-    if environ.get(QBRUNTIME_VISIBLE_DEVICES_ENV, ""):
+    elif visible:
         raise ValueError(
-            f"Both {QBRUNTIME_VISIBLE_DEVICES_ENV}={environ[QBRUNTIME_VISIBLE_DEVICES_ENV]!r} and a dev_no list "
-            f"{cards} name the data parallel cards; set only one."
+            f"Both {QBRUNTIME_VISIBLE_DEVICES_ENV}={visible!r} and a dev_no list {cards} name the data parallel "
+            "cards; set only one."
         )
-    environ[QBRUNTIME_VISIBLE_DEVICES_ENV] = ",".join(str(card) for card in cards)
+    else:
+        environ[QBRUNTIME_VISIBLE_DEVICES_ENV] = ",".join(str(card) for card in cards)
+    environ[DATA_PARALLEL_CARDS_CHECKED_ENV] = "1"
     return cards
 
 
