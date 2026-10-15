@@ -8,6 +8,14 @@
   batch first. Worker slot `s` addresses row `(s % N, s // N)` of the `N` cache MXQs (round-robin, the layout
   mobilint/transformers-mblt#31 gives its default cache rows) instead of `divmod(s, K)`, and a new request takes a
   free slot on the card running the fewest requests. With one card nothing changes.
+- With prefix caching on, reusing a slot no longer dumps the finished request's KV that is still on it when no
+  load of that snapshot could pay. The dump moved the slot's whole KV to host memory on the engine loop (about
+  380 ms for a 224 MiB Qwen3-0.6B slot) for every new request, even with no prefix hits, and raised TTFT
+  (#40). The worker now applies the snapshot-load cost test before the slot changes hands: the snapshot is saved
+  only when a load of some prefix of it could beat recomputing that prefix, and dropped otherwise. Until a load is
+  measured, the measured dump time stands in for the load time; with no measurement, the snapshot is saved as
+  before. A request whose prefix snapshot is still on its own slot takes the cache over in place and, under the
+  same test, no longer dumps a host copy for the snapshot.
 
 ## 0.8.0
 
