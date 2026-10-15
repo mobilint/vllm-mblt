@@ -1,6 +1,6 @@
 import math
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Container
 from dataclasses import dataclass, field
 from typing import Any, Hashable
 
@@ -124,6 +124,8 @@ class MbltRuntimeCacheManager:
         self.req_to_slot: dict[str, int] = {}
         self.slot_to_req: dict[int, str] = {}
         self.free_slots: list[int] = []
+        # Which card (cache MXQ) a slot runs on; ``None`` treats every slot as one card.
+        self.slot_card: Callable[[int], int] | None = None
         self.reset_slots(max_batch_size=self.max_batch_size)
 
     @property
@@ -147,9 +149,17 @@ class MbltRuntimeCacheManager:
     def free_cache_slots(self) -> list[int]:
         return self.free_slots
 
-    def reset_slots(self, *, max_batch_size: int | None = None) -> None:
+    def reset_slots(
+        self,
+        *,
+        max_batch_size: int | None = None,
+        slot_card: Callable[[int], int] | None = None,
+    ) -> None:
+        """Free every slot. ``slot_card`` maps a slot to the card it runs on; omitted, the previous mapping stays."""
         if max_batch_size is not None:
             self.max_batch_size = max(0, int(max_batch_size))
+        if slot_card is not None:
+            self.slot_card = slot_card
         self.req_to_slot = {}
         self.slot_to_req = {}
         self.free_slots = list(range(self.max_batch_size))
@@ -190,7 +200,23 @@ class MbltRuntimeCacheManager:
             raise RuntimeError(f"No accelerator cache slot is assigned for req_id={req_id}.")
         return slot_id
 
-    def assign_slot(self, req_id: str) -> int:
+    def assign_slot(
+        self,
+        req_id: str,
+        *,
+        prefix_slot: int | None = None,
+        slot_victim_rank: Callable[[int], tuple[int, ...]] | None = None,
+    ) -> int:
+        """Give ``req_id`` a free slot and return it.
+
+        ``prefix_slot``, when free, is taken first: it still holds a finished snapshot of the request's prefix,
+        which the request then takes over in place. Otherwise the slot is the free one with the smallest
+        ``(card load, slot_victim_rank(slot), slot)``: a slot on the card running the fewest requests, then the
+        slot whose resident snapshot is the cheapest to lose (``slot_victim_rank``, lower first), then the lowest
+        slot. From empty this assigns slots 0, 1, 2, ... in order, which the round-robin slot layout spreads over
+        the cards; after releases it keeps the cards balanced instead of reusing the lowest free slot wherever
+        it is.
+        """
         existing_slot = self.req_to_slot.get(req_id)
         if existing_slot is not None:
             return existing_slot
@@ -199,10 +225,30 @@ class MbltRuntimeCacheManager:
                 "No free accelerator cache slots remain for batch execution. "
                 f"req_id={req_id}, max_batch_size={self.max_batch_size}"
             )
-        slot_id = self.free_slots.pop(0)
+        if prefix_slot is not None and prefix_slot in self.free_slots:
+            slot_id = prefix_slot
+        else:
+            slot_id = self._choose_free_slot(slot_victim_rank)
+        self.free_slots.remove(slot_id)
         self.req_to_slot[req_id] = slot_id
         self.slot_to_req[slot_id] = req_id
         return slot_id
+
+    def _choose_free_slot(self, slot_victim_rank: Callable[[int], tuple[int, ...]] | None) -> int:
+        if self.slot_card is None and slot_victim_rank is None:
+            return self.free_slots[0]
+        card_load: dict[int, int] = {}
+        if self.slot_card is not None:
+            for slot_id in self.slot_to_req:
+                card = self.slot_card(slot_id)
+                card_load[card] = card_load.get(card, 0) + 1
+
+        def order(slot_id: int) -> tuple[int, tuple[int, ...], int]:
+            load = card_load.get(self.slot_card(slot_id), 0) if self.slot_card is not None else 0
+            rank = slot_victim_rank(slot_id) if slot_victim_rank is not None else ()
+            return load, rank, slot_id
+
+        return min(self.free_slots, key=order)
 
     def release_slot(self, req_id: str) -> None:
         slot_id = self.req_to_slot.pop(req_id, None)
@@ -316,7 +362,13 @@ class MbltRuntimeCacheManager:
         self,
         target_blocks: RuntimeCacheRequest | tuple[int, ...],
         target_tokens: int | None = None,
+        *,
+        candidate_req_ids: Container[str] | None = None,
     ) -> RuntimeCacheSnapshotMatch:
+        """The snapshot sharing the longest compatible prefix with the target, and how many tokens it covers.
+
+        ``candidate_req_ids`` limits the match to those snapshots; the matching itself is the same.
+        """
         request = target_blocks if isinstance(target_blocks, RuntimeCacheRequest) else None
         if request is not None:
             target_blocks = self._request_index_blocks(request)
@@ -339,6 +391,8 @@ class MbltRuntimeCacheManager:
                 break
 
             for req_id in tuple(node.req_ids):
+                if candidate_req_ids is not None and req_id not in candidate_req_ids:
+                    continue
                 snapshot = self.snapshots.get(req_id)
                 if snapshot is None:
                     continue
@@ -535,6 +589,18 @@ class MbltRuntimeCacheManager:
             return
         self.finished_snapshot_lru.pop(req_id, None)
         self.finished_snapshot_lru[req_id] = None
+
+    def refresh_snapshot_recency(self, req_id: str) -> None:
+        """Mark a finished snapshot as just used (a prefix hit), so LRU eviction and slot choice keep it longest."""
+        if req_id in self.finished_snapshot_lru:
+            self.finished_snapshot_lru.move_to_end(req_id)
+
+    def finished_snapshot_age(self, req_id: str) -> int:
+        """The snapshot's place in the finished LRU: 0 for the least recently finished or hit one."""
+        for age, finished_req_id in enumerate(self.finished_snapshot_lru):
+            if finished_req_id == req_id:
+                return age
+        return len(self.finished_snapshot_lru)
 
     def mark_snapshot_finished(self, req_id: str) -> list[str]:
         if not self.enable_prefix_caching:

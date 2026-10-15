@@ -40,6 +40,7 @@ from vllm_mblt.runtime_cache import (
     RuntimeCacheLoadResult,
     RuntimeCacheRequest,
     RuntimeCacheSnapshot,
+    RuntimeCacheSnapshotMatch,
     append_block_ids,
     first_seq_blocks,
     normalize_block_ids,
@@ -280,8 +281,24 @@ def _resolve_prefix_cache_max_host_mib(config: object) -> int:
         return DEFAULT_PREFIX_CACHE_MAX_HOST_MIB
 
 
+def _resolve_prefix_cache_host_offload(config: object) -> bool:
+    """Whether finished prefix snapshots may be saved to host memory: ``VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD``.
+
+    Off by default: a finished snapshot is reused only while its KV is still on its NPU slot, and a slot that
+    changes hands drops it without a dump, as a GPU prefix cache drops evicted blocks (issue #40).
+    """
+    value = os.getenv("VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD")
+    if value is None:
+        value = _prefix_cache_config_value(config, "prefix_cache_host_offload")
+    if value is None or value == "":
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class PrefixCacheCostModel:
-    """Worker-side policy for deciding if a matched runtime snapshot is worth loading."""
+    """Worker-side policy for deciding if a matched runtime snapshot is worth loading, and worth saving."""
 
     DEFAULT_MARGIN = 0.9
     DEFAULT_EWMA_ALPHA = 0.3
@@ -294,8 +311,11 @@ class PrefixCacheCostModel:
         manual_min_hit_tokens: Optional[int] = None,
         margin: float = DEFAULT_MARGIN,
         ewma_alpha: float = DEFAULT_EWMA_ALPHA,
+        host_offload: bool = False,
     ) -> None:
         self.block_size = max(1, int(block_size))
+        # Opt-in: save a finished snapshot to host memory when its slot is reused (and the cost test passes).
+        self.host_offload = bool(host_offload)
         self.auto_threshold_enabled = bool(auto_threshold_enabled)
         self.manual_min_hit_tokens = max(0, int(manual_min_hit_tokens)) if manual_min_hit_tokens is not None else None
         self.margin = float(margin)
@@ -334,6 +354,7 @@ class PrefixCacheCostModel:
             auto_threshold_enabled=auto_enabled,
             manual_min_hit_tokens=manual_min_hit_tokens,
             margin=margin,
+            host_offload=_resolve_prefix_cache_host_offload(config),
         )
 
     def observe_prefill(self, num_tokens: int, elapsed_ms: float) -> None:
@@ -366,6 +387,60 @@ class PrefixCacheCostModel:
             return True
         return load_ms < prefill_ms * self.margin
 
+    def should_take_over(self, *, matched_tokens: int) -> bool:
+        """Whether a request should continue on a snapshot still on its own slot: it costs no load or dump.
+
+        Only the manual minimum applies; the measured cost test has nothing to weigh.
+        """
+        matched_tokens = max(0, int(matched_tokens))
+        if matched_tokens <= 0:
+            return False
+        return self.manual_min_hit_tokens is None or matched_tokens >= self.manual_min_hit_tokens
+
+    def should_save_snapshot(self, *, num_tokens: int, cache_id: int | None = None) -> bool:
+        """Whether a finished snapshot about to lose its slot is saved to host memory instead of dropped.
+
+        Only with host offload on, and then only when :meth:`should_keep_snapshot` expects a load could pay.
+        """
+        return self.host_offload and self.should_keep_snapshot(num_tokens=num_tokens, cache_id=cache_id)
+
+    def should_keep_snapshot(self, *, num_tokens: int, cache_id: int | None = None) -> bool:
+        """Whether a snapshot of ``num_tokens`` tokens is worth saving to host memory for a later load.
+
+        A later load uses at most the snapshot's ``num_tokens`` tokens, and :meth:`should_load` refuses a load
+        that does not beat recomputing the tokens it brings. When the estimates say every such load would be
+        refused, saving the snapshot only costs the dump (issue #40). Before any load has been measured, a
+        measured dump stands in for it: both move the slot's whole KV buffers. Without either measurement, or
+        without a prefill measurement, the snapshot is kept.
+        """
+        num_tokens = max(0, int(num_tokens))
+        if num_tokens <= 0:
+            return False
+        if self.manual_min_hit_tokens is not None and num_tokens < self.manual_min_hit_tokens:
+            return False
+        if not self.auto_threshold_enabled:
+            return True
+        transfer_ms = self.load_ms(cache_id)
+        if transfer_ms is None:
+            transfer_ms = self._cache_io_ms(self.dump_ms_by_cache_id, cache_id)
+        prefill_ms = self.max_prefill_ms(num_tokens)
+        if transfer_ms is None or prefill_ms is None:
+            return True
+        return transfer_ms < prefill_ms * self.margin
+
+    def max_prefill_ms(self, num_tokens: int) -> Optional[float]:
+        """The highest :meth:`prefill_ms` estimate for any prefix of up to ``num_tokens`` tokens.
+
+        The estimate scales each measured bucket down linearly, so a shorter prefix can be estimated above a
+        longer one that falls in the next bucket: the maximum is the estimate at ``num_tokens`` or a measured
+        bucket at or below it.
+        """
+        estimate = self.prefill_ms(num_tokens)
+        if estimate is None:
+            return None
+        num_tokens = max(1, int(num_tokens))
+        return max([estimate] + [ms for tokens, ms in self.prefill_ms_by_tokens.items() if tokens <= num_tokens])
+
     def prefill_ms(self, matched_tokens: int) -> Optional[float]:
         if not self.prefill_ms_by_tokens:
             return None
@@ -378,13 +453,17 @@ class PrefixCacheCostModel:
         return elapsed_ms * (matched_tokens / tokens)
 
     def load_ms(self, cache_id: int | None = None) -> Optional[float]:
-        if cache_id in self.load_ms_by_cache_id:
-            return self.load_ms_by_cache_id[cache_id]
-        if None in self.load_ms_by_cache_id:
-            return self.load_ms_by_cache_id[None]
-        if not self.load_ms_by_cache_id:
+        return self._cache_io_ms(self.load_ms_by_cache_id, cache_id)
+
+    @staticmethod
+    def _cache_io_ms(values: dict[int | None, float], cache_id: int | None) -> Optional[float]:
+        if cache_id in values:
+            return values[cache_id]
+        if None in values:
+            return values[None]
+        if not values:
             return None
-        return statistics.median(self.load_ms_by_cache_id.values())
+        return statistics.median(values.values())
 
     def _observe_cache_io(self, values: dict[int | None, float], cache_id: int | None, elapsed_ms: float) -> None:
         elapsed_ms = max(0.0, float(elapsed_ms))
@@ -481,25 +560,35 @@ class MbltWorker(WorkerBase):
             self.request_caches = RequestCacheSlots(models, k_per_model, cache_cls=cache_cls, cache_kwargs=cache_kwargs)
         self._slot_caches = {}
         self.runtime_cache.enable_prefix_caching = self._prefix_caching_enabled()
-        self.runtime_cache.reset_slots(max_batch_size=self.max_batch_size)
+        self.runtime_cache.reset_slots(
+            max_batch_size=self.max_batch_size,
+            # New requests are balanced over the cards their slots run on.
+            slot_card=self.request_caches.slot_model_index if self._is_batch_model() else None,
+        )
         self.runtime_cache.max_finished_snapshots = self._finished_snapshot_cap()
 
     def _finished_snapshot_cap(self) -> int:
         """How many finished-request prefix snapshots fit the host memory budget, up to the count cap.
 
-        Every snapshot ends up holding one slot's KV in host memory (256 MiB for a 4K-token Llama-3 slot,
-        48 x 4 MiB for Qwen3-30B-A3B), so the budget divided by that size bounds how many can be kept.
+        A saved snapshot holds one slot's KV in host memory (256 MiB for a 4K-token Llama-3 slot, 48 x 4 MiB for
+        Qwen3-30B-A3B), so the budget divided by that size bounds how many can be kept. Without host offload a
+        batch model's finished snapshots only stay on their free slots and take no host memory, so up to one per
+        slot is kept.
         """
         cap = self.MAX_FINISHED_CACHE_SNAPSHOTS
         budget_mib = _resolve_prefix_cache_max_host_mib(self.vllm_config)
         per_snapshot = self.request_caches.kv_nbytes_per_cache()
         if per_snapshot:
             cap = min(cap, budget_mib * 2**20 // per_snapshot)
+        host_offload = self._ensure_prefix_cache_cost_model().host_offload
+        if self._is_batch_model() and not host_offload:
+            cap = max(cap, self.max_batch_size)
         logger.info(
-            "MBLT keeps up to %d finished prefix snapshots (%s MiB each, budget %d MiB).",
+            "MBLT keeps up to %d finished prefix snapshots (%s MiB each, budget %d MiB, host offload %s).",
             cap,
             "unknown" if not per_snapshot else f"{per_snapshot / 2**20:.0f}",
             budget_mib,
+            "on" if host_offload else "off",
         )
         return cap
 
@@ -818,8 +907,98 @@ class MbltWorker(WorkerBase):
     def _get_cache_slot(self, req_id: str) -> int:
         return self.runtime_cache.get_slot(req_id)
 
-    def _assign_cache_slot(self, req_id: str) -> int:
-        return self.runtime_cache.assign_slot(req_id)
+    def _assign_cache_slot(self, req_id: str, req_state: Optional[RequestState] = None) -> int:
+        """Give a batch request a free slot: one still holding a snapshot of its prefix first (issue #40).
+
+        A request whose prefix matches a finished snapshot still on a free slot takes that slot and continues on
+        the snapshot's KV in place, with no load or dump. Otherwise the slot comes from the card running the
+        fewest requests, and on it: a slot holding no snapshot, then one whose snapshot would not be worth saving
+        (:meth:`PrefixCacheCostModel.should_keep_snapshot`), then the least recently used snapshot, then the
+        lowest slot.
+        """
+        resident = self._resident_finished_snapshots(self.runtime_cache.free_slots)
+        prefix_slot = None
+        if req_state is not None and resident:
+            prefix_slot = self._prefix_matching_slot(req_id, req_state, resident)
+        cost_model = self._ensure_prefix_cache_cost_model()
+
+        def slot_victim_rank(slot_id: int) -> tuple[int, ...]:
+            snapshot_req_id = resident.get(slot_id)
+            if snapshot_req_id is None:
+                return (0, 0)
+            snapshot = self.runtime_cache.snapshots[snapshot_req_id]
+            worth_keeping = cost_model.should_keep_snapshot(num_tokens=snapshot.num_tokens, cache_id=slot_id)
+            return (2 if worth_keeping else 1, self.runtime_cache.finished_snapshot_age(snapshot_req_id))
+
+        return self.runtime_cache.assign_slot(req_id, prefix_slot=prefix_slot, slot_victim_rank=slot_victim_rank)
+
+    def _resident_finished_snapshots(self, slot_ids: Sequence[Optional[int]]) -> dict[Optional[int], str]:
+        """Map each of ``slot_ids`` still holding a finished request's prefix snapshot to that request.
+
+        Only snapshots in the index whose KV the slot holds right now count: a dropped or saved-out snapshot is
+        not resident, and a live request's cache is never a candidate.
+        """
+        if self.request_caches is None or not self.runtime_cache.snapshots:
+            return {}
+        resident: dict[Optional[int], str] = {}
+        for req_id, snapshot in self.runtime_cache.snapshots.items():
+            if snapshot.blobs is None or req_id in self.req_states or snapshot.num_tokens <= 0:
+                continue
+            for slot_id in slot_ids:
+                if slot_id not in resident and self.request_caches.holds_slot(snapshot.blobs, self._slot_key(slot_id)):
+                    resident[slot_id] = req_id
+                    break
+        return resident
+
+    def _match_resident_snapshot(
+        self,
+        request: RuntimeCacheRequest,
+        resident: dict[Optional[int], str],
+    ) -> tuple[Optional[int], RuntimeCacheSnapshotMatch]:
+        """The longest prefix match among the resident snapshots, with the slot that holds it.
+
+        Uses the same index and compatibility checks as a snapshot load (block hashes, token ids, multimodal and
+        prompt-embedding identity).
+        """
+        slot_by_req = {req_id: slot_id for slot_id, req_id in resident.items()}
+        match = self.runtime_cache.choose_prefix_snapshot(request, candidate_req_ids=slot_by_req)
+        match = self.runtime_cache.verify_prompt_embed_match(request, match)
+        if match.snapshot is None or match.req_id not in slot_by_req:
+            return None, RuntimeCacheSnapshotMatch(snapshot=None, matched_tokens=0)
+        return slot_by_req[match.req_id], match
+
+    def _prefix_matching_slot(
+        self,
+        req_id: str,
+        req_state: RequestState,
+        resident: dict[Optional[int], str],
+    ) -> Optional[int]:
+        """The free slot holding a finished snapshot of the request's prefix, if any."""
+        if not self.runtime_cache.enable_prefix_caching or req_state.num_computed_tokens <= 0:
+            return None
+        if self._should_recompute_prompt_logprobs_from_start(req_state):
+            return None
+        slot_id, match = self._match_resident_snapshot(self._runtime_cache_request(req_id, req_state, None), resident)
+        if not self._ensure_prefix_cache_cost_model().should_take_over(matched_tokens=match.matched_tokens):
+            return None
+        return slot_id
+
+    def _runtime_cache_request(
+        self, req_id: str, req_state: RequestState, slot_id: Optional[int]
+    ) -> RuntimeCacheRequest:
+        """The request's prefix as the snapshot index matches it."""
+        target_tokens = req_state.num_computed_tokens
+        return RuntimeCacheRequest(
+            req_id=req_id,
+            block_ids=req_state.block_ids,
+            first_seq_blocks=req_state.first_seq_blocks,
+            num_computed_tokens=target_tokens,
+            first_seq_block_hashes=req_state.first_seq_block_hashes,
+            cache_slot_id=slot_id,
+            cache_token_ids=self._cache_token_ids(req_state, target_tokens),
+            multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
+            prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
+        )
 
     def _release_cache_slot(self, req_id: str) -> None:
         self.runtime_cache.release_slot(req_id)
@@ -2538,27 +2717,14 @@ class MbltWorker(WorkerBase):
                 print(f"[cache] req={req_id}{slot_label} bypass-prefix-cache-for-prompt-logprobs")
             matched_tokens = 0
         else:
-            result = self._load_request_prefix(
-                RuntimeCacheRequest(
-                    req_id=req_id,
-                    block_ids=req_state.block_ids,
-                    first_seq_blocks=req_state.first_seq_blocks,
-                    num_computed_tokens=target_tokens,
-                    first_seq_block_hashes=req_state.first_seq_block_hashes,
-                    cache_slot_id=slot_id,
-                    cache_token_ids=self._cache_token_ids(req_state, target_tokens),
-                    multimodal_cache_identity=self._cache_multimodal_identity(req_state, target_tokens),
-                    prompt_embed_cache_identity=self._make_prompt_embed_cache_identity(req_state),
-                ),
-                req_state,
-            )
+            result = self._load_request_prefix(self._runtime_cache_request(req_id, req_state, slot_id), req_state)
             matched_tokens = result.matched_tokens
             if print_debug:
                 if result.action == "skip-empty":
                     print(f"[cache] req={req_id}{slot_label} skip-load target_tokens=0")
                 elif result.action == "reuse-live":
                     print(f"[cache] req={req_id}{slot_label} reuse-live-cache matched={target_tokens}/{target_tokens}")
-                elif result.action in ("load-own", "load-shared", "skip-cost"):
+                elif result.action in ("load-own", "load-shared", "take-over", "skip-cost"):
                     action = "skip-load-cost" if result.action == "skip-cost" else result.action
                     print(f"[cache] req={req_id}{slot_label} {action} matched={matched_tokens}/{target_tokens}")
                 elif result.action == "live-prefix-incomplete":
@@ -2579,6 +2745,10 @@ class MbltWorker(WorkerBase):
         slot_id: Optional[int] = None,
     ) -> None:
         """Make this step's infers on the request's slot run on its cache, from ``cache_size`` tokens."""
+        active = self._slot_caches.get(self._slot_key(slot_id))
+        if active is None or active[1] is not req_state.kv_cache:
+            # The slot changes hands: settle the finished snapshot it may still hold before the bind evicts it.
+            self._settle_snapshot_on_slot(slot_id)
         self._activate_request_cache(req_id, req_state, slot_id)
         self._prepare_slot(slot_id, cache_size)
 
@@ -2624,24 +2794,54 @@ class MbltWorker(WorkerBase):
 
         cost_model = self._ensure_prefix_cache_cost_model()
         match = self.runtime_cache.choose_snapshot(request)
+        # A finished snapshot still on the request's own slot costs no load or dump: the request continues on it
+        # unless another snapshot covers more of the prefix and passes the load test.
+        _, on_slot = self._match_resident_snapshot(request, self._resident_finished_snapshots([slot_id]))
+        if not (
+            on_slot.snapshot is not None
+            and on_slot.matched_tokens > own_tokens
+            and cost_model.should_take_over(matched_tokens=on_slot.matched_tokens)
+        ):
+            on_slot = None
+
+        def take_over_or(result: RuntimeCacheLoadResult) -> RuntimeCacheLoadResult:
+            if on_slot is None:
+                return result
+            self.runtime_cache.refresh_snapshot_recency(on_slot.req_id)
+            self._restore_snapshot(req_state, slot_id, on_slot.snapshot, on_slot.matched_tokens)
+            return RuntimeCacheLoadResult(
+                matched_tokens=on_slot.matched_tokens,
+                loaded=True,
+                loaded_snapshot_req_id=on_slot.req_id,
+                action="take-over",
+                snapshot_req_id=on_slot.req_id,
+                live_prefix_incomplete=own_tokens > 0,
+            )
+
+        if on_slot is not None and on_slot.matched_tokens >= match.matched_tokens:
+            return take_over_or(fallback)
         if match.snapshot is None or match.matched_tokens <= own_tokens:
-            return fallback
+            return take_over_or(fallback)
         if not cost_model.should_load(matched_tokens=match.matched_tokens, cache_id=slot_id):
             fallback.action = "skip-cost"
             fallback.loaded_snapshot_req_id = match.req_id
             fallback.is_own_snapshot = match.is_own_snapshot
             fallback.snapshot_req_id = match.req_id
-            return fallback
+            return take_over_or(fallback)
         match = self.runtime_cache.verify_prompt_embed_match(request, match)
         if match.snapshot is None or match.matched_tokens <= own_tokens:
-            return fallback
+            return take_over_or(fallback)
+        if on_slot is not None and on_slot.matched_tokens >= match.matched_tokens:
+            return take_over_or(fallback)
         if not cost_model.should_load(matched_tokens=match.matched_tokens, cache_id=slot_id):
             fallback.action = "skip-cost"
             fallback.loaded_snapshot_req_id = match.req_id
             fallback.is_own_snapshot = match.is_own_snapshot
             fallback.snapshot_req_id = match.req_id
-            return fallback
+            return take_over_or(fallback)
 
+        if match.req_id is not None:
+            self.runtime_cache.refresh_snapshot_recency(match.req_id)
         self._restore_snapshot(req_state, slot_id, match.snapshot, match.matched_tokens)
         return RuntimeCacheLoadResult(
             matched_tokens=match.matched_tokens,
@@ -2666,16 +2866,70 @@ class MbltWorker(WorkerBase):
         start = time.perf_counter()
         if self.request_caches.holds_slot(snapshot_cache, slot_key):
             # The finished request that left this snapshot ran on this slot and nothing has used it since: the
-            # request takes over that cache, KV in place, and the snapshot keeps a host copy instead.
-            snapshot.blobs = snapshot_cache.copy()
+            # request takes over that cache, KV in place. The snapshot keeps a host copy only with host offload on
+            # and when a later load of it could beat recomputing; otherwise it is dropped from the index, and the
+            # copy's dump is skipped (issue #40).
+            cost_model = self._ensure_prefix_cache_cost_model()
+            snapshot_req_id = self._snapshot_req_id(snapshot)
+            if cost_model.should_save_snapshot(num_tokens=snapshot.num_tokens, cache_id=slot_id):
+                snapshot.blobs = snapshot_cache.copy()
+                cost_model.observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
+            else:
+                if snapshot_req_id is not None:
+                    self.runtime_cache.remove_snapshot(snapshot_req_id)
+                snapshot.blobs = None  # the cache is the request's now
             snapshot_cache.set_seq_length(int(num_tokens))
             req_state.kv_cache = snapshot_cache
-            self._ensure_prefix_cache_cost_model().observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
             return
+        self._settle_snapshot_on_slot(slot_id)
         cache = self.request_caches.relocate(snapshot_cache, slot_key, num_tokens)
         self.request_caches.prepare(cache, slot_key, num_tokens)
         req_state.kv_cache = cache
         self._ensure_prefix_cache_cost_model().observe_load(slot_id, (time.perf_counter() - start) * 1000.0)
+
+    def _snapshot_req_id(self, snapshot: RuntimeCacheSnapshot) -> Optional[str]:
+        for req_id, stored in self.runtime_cache.snapshots.items():
+            if stored is snapshot:
+                return req_id
+        return None
+
+    def _settle_snapshot_on_slot(self, slot_id: Optional[int]) -> None:
+        """Before another cache takes ``slot_id``, drop the prefix snapshot it still holds, or save it if opted in.
+
+        A finished request's cache stays on its slot as its snapshot, so the next cache bound to the slot would
+        dump the slot's whole KV to host memory. That dump runs on the engine loop (issue #40). By default the
+        snapshot is dropped from the index and emptied, so the bind that follows overwrites the slot without
+        saving anything. With host offload on, it is saved instead when a later load of it could beat
+        recomputing it. Live requests are never touched: a snapshot that holds a slot is a finished request's
+        cache, which no request runs on.
+        """
+        if self.request_caches is None:
+            return
+        slot_key = self._slot_key(slot_id)
+        cost_model = self._ensure_prefix_cache_cost_model()
+        print_debug = getattr(self, "print_debug", False)
+        resident = [
+            (req_id, snapshot)
+            for req_id, snapshot in self.runtime_cache.snapshots.items()
+            if snapshot.blobs is not None and self.request_caches.holds_slot(snapshot.blobs, slot_key)
+        ]
+        for req_id, snapshot in resident:
+            if req_id in self.req_states:
+                continue
+            if cost_model.should_save_snapshot(num_tokens=snapshot.num_tokens, cache_id=slot_id):
+                start = time.perf_counter()
+                snapshot.blobs.offload()
+                cost_model.observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
+                if print_debug:
+                    print(f"[cache] req={req_id} slot={slot_id} save-snapshot tokens={snapshot.num_tokens}")
+                continue
+            self.runtime_cache.remove_snapshot(req_id)
+            # Emptied, the cache has nothing to save when the next bind evicts it from the slot.
+            snapshot.blobs.reset()
+            snapshot.blobs = None
+            if print_debug:
+                reason = "cost" if cost_model.host_offload else "device-only"
+                print(f"[cache] req={req_id} slot={slot_id} drop-snapshot tokens={snapshot.num_tokens} reason={reason}")
 
     def _snapshot_switched_out_request(self, req_id: str, *, next_req_id: str, print_debug: bool = False) -> None:
         """Keep the prefix of a request that is about to lose the non-batch slot, so other requests can start from it.
@@ -3215,9 +3469,7 @@ class MbltWorker(WorkerBase):
                 new_req.mm_features,
                 int(prompt_embeds_np.shape[0]),
             )
-            cache_slot_id = self._assign_cache_slot(new_req.req_id) if self._is_batch_model() else None
-
-            self.req_states[new_req.req_id] = RequestState(
+            new_req_state = RequestState(
                 is_prefill=True,
                 output_token_ids=[],
                 sampling_params=sampling_params,
@@ -3239,7 +3491,7 @@ class MbltWorker(WorkerBase):
                 is_multimodal=bool(new_req.mm_features),
                 prompt_len=int(prompt_embeds_np.shape[0]),
                 prompt_token_ids=new_req.prompt_token_ids or [],
-                cache_slot_id=cache_slot_id,
+                cache_slot_id=None,
                 vlm_session_id=vlm_session_id,
                 multimodal_cache_identity=self._build_vlm_multimodal_cache_identity(
                     vlm_session_id,
@@ -3247,6 +3499,9 @@ class MbltWorker(WorkerBase):
                 ),
                 explicit_prompt_embeds=new_req.prompt_embeds is not None,
             )
+            if self._is_batch_model():
+                new_req_state.cache_slot_id = self._assign_cache_slot(new_req.req_id, new_req_state)
+            self.req_states[new_req.req_id] = new_req_state
 
         # Continue cached requests
         for i, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
@@ -3335,7 +3590,7 @@ class MbltWorker(WorkerBase):
                 req_state = self.req_states[req_id]
                 slot_id = req_state.cache_slot_id
                 if slot_id is None:
-                    slot_id = self._assign_cache_slot(req_id)
+                    slot_id = self._assign_cache_slot(req_id, req_state)
                     req_state.cache_slot_id = slot_id
 
                 self._ensure_batch_vlm_supported(req_state)

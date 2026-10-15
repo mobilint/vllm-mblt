@@ -5,7 +5,7 @@ import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
 
-from vllm_mblt.mblt_worker import MbltWorker, RequestState
+from vllm_mblt.mblt_worker import MbltWorker, PrefixCacheCostModel, RequestState
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager
 
 from .kv_slot_fakes import FakeKVSlotModel, attach_request_caches, make_snapshot_cache
@@ -228,7 +228,26 @@ class TestKvCacheSwapBehavior:
 
         assert _run(worker, "new", new_state, 9) == 8
 
-        # The request continues on the finished cache's KV in place; the snapshot keeps a host copy.
+        # The request continues on the finished cache's KV in place; without host offload nothing is saved.
+        assert new_state.kv_cache is done_cache
+        assert worker.cache_model.dumps == []
+        assert worker.cache_model.loads == []
+        assert worker.runtime_cache.get_snapshot("done") is None
+
+    def test_batch_shared_prefix_taken_over_keeps_a_host_copy_with_host_offload(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=4, host_offload=True)
+        done_state = _make_request_state(worker, block_ids=([1, 2],), prompt_len=8, cache_slot_id=0)
+        _run(worker, "done", done_state, 8)
+        done_cache = done_state.kv_cache
+        worker._finalize_finished_request("done")
+        new_state = _make_request_state(
+            worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8, cache_slot_id=0
+        )
+
+        assert _run(worker, "new", new_state, 9) == 8
+
+        # With nothing measured the snapshot is worth saving: it keeps a host copy.
         assert new_state.kv_cache is done_cache
         assert worker.cache_model.dumps == [0]
         assert worker.cache_model.loads == []
@@ -349,6 +368,450 @@ class TestKvCacheSwapWithoutPrefixCaching:
 
         assert worker._load_snapshot_if_needed("new", new_state) == 8
         assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]
+
+
+def _set_costs(
+    worker: MbltWorker, *, prefill_ms_per_block: float, dump_ms: float | None, host_offload: bool = False
+) -> PrefixCacheCostModel:
+    """Give the worker measured costs: a prefill linear in 4-token blocks, and one slot dump."""
+    cost_model = PrefixCacheCostModel(block_size=4, host_offload=host_offload)
+    for blocks in (1, 2):
+        cost_model.observe_prefill(4 * blocks, prefill_ms_per_block * blocks)
+    if dump_ms is not None:
+        cost_model.observe_dump(0, dump_ms)
+    worker.prefix_cache_cost_model = cost_model
+    return cost_model
+
+
+def _take_slot(worker: MbltWorker, req_id: str, slot_id: int) -> int:
+    """Put ``req_id`` on the free slot ``slot_id``, whatever the slot choice would pick."""
+    return worker.runtime_cache.assign_slot(req_id, prefix_slot=slot_id)
+
+
+def _finish_on_slot(
+    worker: MbltWorker,
+    req_id: str,
+    *,
+    slot_id: int | None,
+    blocks: list[int],
+    kv: str,
+    model: FakeKVSlotModel | None = None,
+) -> None:
+    """Run ``req_id`` over its ``blocks`` (4 tokens each) on ``slot_id``, label the KV it wrote there, and finish it."""
+    if slot_id is not None:
+        assert _take_slot(worker, req_id, slot_id) == slot_id
+    num_tokens = 4 * len(blocks)
+    state = _make_request_state(worker, block_ids=(blocks,), prompt_len=num_tokens, cache_slot_id=slot_id)
+    _run(worker, req_id, state, num_tokens)
+    model = model if model is not None else worker.cache_model
+    model.slots[state.kv_cache.slot_of(0)[1]] = kv
+    worker._finalize_finished_request(req_id)
+
+
+def _new_request(
+    worker: MbltWorker, req_id: str, *, blocks: list[int], computed: int, assign: bool = True
+) -> RequestState:
+    """A new request over ``blocks``, of which the scheduler reports ``computed`` tokens; assigned a slot."""
+    state = _make_request_state(worker, block_ids=(blocks,), num_computed_tokens=computed, prompt_len=4 * len(blocks))
+    if assign:
+        state.cache_slot_id = worker._assign_cache_slot(req_id, state)
+    return state
+
+
+class TestFinishedSnapshotOnSlotReuse:
+    """A finished snapshot still on its slot is dropped when the slot changes hands, or saved if opted in (#40)."""
+
+    def test_slot_reuse_without_hit_drops_snapshot_without_dumping(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1.0, dump_ms=100.0)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+        worker._assign_cache_slot("busy")  # takes the empty slot 1, so slot 0 is the only free one
+        slot_id = worker._assign_cache_slot("new")
+        new_state = _make_request_state(worker, block_ids=([3, 4],), prompt_len=8, cache_slot_id=slot_id)
+
+        assert slot_id == 0
+        assert _run(worker, "new", new_state, 8) == 0
+
+        assert worker.cache_model.dumps == []
+        assert worker.runtime_cache.get_snapshot("done") is None
+        assert list(worker.runtime_cache.finished_snapshot_lru) == []
+        assert new_state.kv_cache.is_resident
+
+    def test_non_batch_slot_reuse_without_hit_drops_snapshot_without_dumping(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1.0, dump_ms=100.0)
+        _finish_on_slot(worker, "done", slot_id=None, blocks=[1, 2], kv="done-kv")
+
+        assert _run(worker, "new", _make_request_state(worker, block_ids=([3, 4],), prompt_len=8), 8) == 0
+
+        assert worker.cache_model.dumps == []
+        assert worker.runtime_cache.snapshot_count() == 0
+
+    def test_dropped_snapshot_is_never_loaded_and_its_prefix_is_recomputed(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1.0, dump_ms=100.0)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+        _run(worker, "other", _make_request_state(worker, block_ids=([3],), cache_slot_id=0), 4)
+        # A later request with done's prefix on another slot: the scheduler reports it computed.
+        late_state = _make_request_state(
+            worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8, cache_slot_id=1
+        )
+
+        assert _run(worker, "late", late_state, 9) == 0
+
+        assert worker.cache_model.dumps == []
+        assert worker.cache_model.loads == []
+
+    def test_snapshot_worth_loading_is_saved_once_and_restores_its_kv_on_another_slot(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1000.0, dump_ms=10.0, host_offload=True)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+        _run(worker, "other", _make_request_state(worker, block_ids=([3],), cache_slot_id=0), 4)
+
+        # Slot 0 changed hands: done's KV was saved once, before other overwrote the slot.
+        assert worker.cache_model.dumps == [0]
+        assert worker.runtime_cache.get_snapshot("done") is not None
+        worker.cache_model.slots[0] = "other-kv"
+
+        late_state = _make_request_state(
+            worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8, cache_slot_id=1
+        )
+        assert _run(worker, "late", late_state, 9) == 8
+
+        assert worker.cache_model.dumps == [0]
+        assert [cache_id for cache_id, _ in worker.cache_model.loads] == [1]
+        assert worker.cache_model.slots == {0: "other-kv", 1: "done-kv"}
+
+    def test_snapshot_is_kept_until_costs_are_measured(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1.0, dump_ms=None, host_offload=True)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+
+        _run(worker, "other", _make_request_state(worker, block_ids=([3],), cache_slot_id=0), 4)
+
+        # Without a measured transfer the snapshot is saved as before, and that dump is measured.
+        assert worker.cache_model.dumps == [0]
+        assert worker.runtime_cache.get_snapshot("done") is not None
+        assert 0 in worker.prefix_cache_cost_model.dump_ms_by_cache_id
+
+    def test_hit_on_the_request_slot_takes_the_cache_over_without_dumping(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1.0, dump_ms=100.0)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+        done_cache = worker.runtime_cache.get_snapshot("done").blobs
+        new_state = _new_request(worker, "new", blocks=[1, 2], computed=8)
+
+        assert new_state.cache_slot_id == 0
+        assert _run(worker, "new", new_state, 9) == 8
+
+        # The request continues on done's KV in place; no host copy is kept for a load that could not pay.
+        assert new_state.kv_cache is done_cache
+        assert new_state.kv_cache.get_seq_length() == 9
+        assert worker.cache_model.dumps == []
+        assert worker.cache_model.loads == []
+        assert worker.cache_model.slots[0] == "done-kv"
+        assert worker.runtime_cache.get_snapshot("done") is None
+
+    def test_loading_another_snapshot_drops_the_one_on_the_slot_without_dumping(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1.0, dump_ms=100.0)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+        shared = make_snapshot_cache(worker, 8, slot_id=1)
+        shared.layers[0]._host_kv = [("kv", "mxq", 1, "shared-kv")]
+        worker.runtime_cache.store_snapshot(
+            req_id="shared",
+            blobs=shared,
+            block_ids=([5, 6],),
+            first_seq_blocks=(5, 6),
+            num_tokens=8,
+            cache_token_ids=tuple(range(8)),
+        )
+        worker.runtime_cache.touch_finished_snapshot("shared")
+        slot_id = _take_slot(worker, "new", 0)
+        new_state = _make_request_state(
+            worker, block_ids=([5, 6],), num_computed_tokens=8, prompt_len=8, cache_slot_id=slot_id
+        )
+        # No load has been measured, so should_load lets this one through.
+        worker.prefix_cache_cost_model.dump_ms_by_cache_id.clear()
+        worker.prefix_cache_cost_model.observe_dump(1, 100.0)
+
+        assert _run(worker, "new", new_state, 9) == 8
+
+        assert worker.cache_model.dumps == []
+        assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]
+        assert worker.cache_model.slots[0] == "shared-kv"
+        assert worker.runtime_cache.get_snapshot("done") is None
+        assert worker.runtime_cache.get_snapshot("shared") is not None
+
+
+def _make_two_card_worker() -> tuple[MbltWorker, list[FakeKVSlotModel]]:
+    """A batch worker on two cards with two rows each: slot ``s`` runs on card ``s % 2``, row ``s // 2``."""
+    worker = _make_worker(max_batch_size=4, block_size=4, enable_prefix_caching=True)
+    models = attach_request_caches(worker, k_per_model=2, models=[FakeKVSlotModel("card0"), FakeKVSlotModel("card1")])
+    worker.cache_model = models[0]
+    worker.runtime_cache.reset_slots(max_batch_size=4, slot_card=worker.request_caches.slot_model_index)
+    return worker, models
+
+
+class TestPrefixAffineSlotChoice:
+    """Device-only prefix reuse (#40): a new request takes the free slot holding its prefix, in place."""
+
+    def test_new_request_takes_the_free_slot_holding_its_prefix_without_dump_or_load(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1.0, dump_ms=100.0)
+        _finish_on_slot(worker, "done", slot_id=1, blocks=[1, 2], kv="done-kv")
+        done_cache = worker.runtime_cache.get_snapshot("done").blobs
+
+        # Without the prefix match the empty slot 0 would come first, and done's KV would move there.
+        new_state = _new_request(worker, "new", blocks=[1, 2], computed=8)
+        assert new_state.cache_slot_id == 1
+        assert _run(worker, "new", new_state, 9) == 8
+
+        assert new_state.kv_cache is done_cache
+        assert worker.cache_model.dumps == []
+        assert worker.cache_model.loads == []
+        assert worker.cache_model.slots[1] == "done-kv"
+        # Taken over, the snapshot leaves the index: nothing can load it again.
+        assert worker.runtime_cache.get_snapshot("done") is None
+
+    def test_take_over_does_not_need_the_load_cost_test(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        cost_model = _set_costs(worker, prefill_ms_per_block=1.0, dump_ms=100.0)
+        cost_model.observe_load(0, 100.0)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+        new_state = _new_request(worker, "new", blocks=[1, 2], computed=8)
+        assert not cost_model.should_load(matched_tokens=8, cache_id=0)
+
+        assert _run(worker, "new", new_state, 9) == 8
+
+        assert worker.cache_model.dumps == []
+        assert worker.cache_model.loads == []
+
+    def test_take_over_respects_the_manual_minimum(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=4, manual_min_hit_tokens=12)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+        new_state = _new_request(worker, "new", blocks=[1, 2], computed=8)
+
+        assert new_state.cache_slot_id == 1
+        assert _run(worker, "new", new_state, 9) == 0
+
+    def test_snapshot_no_longer_on_its_slot_does_not_attract_the_request(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _finish_on_slot(worker, "done", slot_id=1, blocks=[1, 2], kv="done-kv")
+        worker.runtime_cache.get_snapshot("done").blobs.offload()  # saved out: slot 1 no longer holds it
+
+        new_state = _new_request(worker, "new", blocks=[1, 2], computed=8)
+
+        assert new_state.cache_slot_id == 0
+
+    def test_live_request_cache_is_never_a_prefix_slot(self) -> None:
+        worker = _make_worker(max_batch_size=3, block_size=4, enable_prefix_caching=True)
+        live = _new_request(worker, "live", blocks=[1, 2], computed=0)
+        _run(worker, "live", live, 8)
+        worker._store_snapshot("live", live, live.kv_cache, 8)  # indexed, and its KV is on slot 0
+        worker.runtime_cache.release_slot("live")
+
+        assert worker._resident_finished_snapshots([0, 1, 2]) == {}
+
+    def test_other_slot_reuse_drops_the_snapshot_without_dumping_even_when_a_load_could_pay(self) -> None:
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        cost_model = _set_costs(worker, prefill_ms_per_block=1000.0, dump_ms=10.0)
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+        assert cost_model.should_keep_snapshot(num_tokens=8, cache_id=0)
+        worker._assign_cache_slot("busy")  # slot 1
+        other = _new_request(worker, "other", blocks=[3, 4], computed=0)
+
+        assert other.cache_slot_id == 0
+        _run(worker, "other", other, 8)
+
+        assert worker.cache_model.dumps == []
+        assert worker.runtime_cache.get_snapshot("done") is None
+        # A later request with done's prefix recomputes it.
+        late = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8, cache_slot_id=1)
+        assert _run(worker, "late", late, 9) == 0
+        assert worker.cache_model.loads == []
+
+    def test_victim_order_is_empty_then_not_worth_keeping_then_least_recently_used(self) -> None:
+        worker = _make_worker(max_batch_size=4, block_size=4, enable_prefix_caching=True)
+        cost_model = PrefixCacheCostModel(block_size=4)
+        cost_model.observe_prefill(4, 1.0)
+        cost_model.observe_prefill(8, 1000.0)
+        cost_model.observe_dump(0, 100.0)
+        worker.prefix_cache_cost_model = cost_model
+        _finish_on_slot(worker, "old", slot_id=0, blocks=[1, 2], kv="old-kv")
+        _finish_on_slot(worker, "recent", slot_id=1, blocks=[3, 4], kv="recent-kv")
+        _finish_on_slot(worker, "short", slot_id=2, blocks=[5], kv="short-kv")  # newest, but too short to save
+        assert not cost_model.should_keep_snapshot(num_tokens=4, cache_id=2)
+
+        order = [worker._assign_cache_slot(f"r{i}") for i in range(4)]
+
+        assert order == [3, 2, 0, 1]
+
+    def test_hit_refreshes_recency_so_the_slot_choice_spares_that_snapshot(self) -> None:
+        worker = _make_worker(max_batch_size=4, block_size=4, enable_prefix_caching=True)
+        _finish_on_slot(worker, "a", slot_id=0, blocks=[1, 2], kv="a-kv")
+        _finish_on_slot(worker, "b", slot_id=1, blocks=[3, 4], kv="b-kv")
+        # A request already on slot 2 hits a's prefix: a is loaded from slot 0.
+        hit = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+        hit.cache_slot_id = _take_slot(worker, "hit", 2)
+        assert _run(worker, "hit", hit, 9) == 8
+
+        assert list(worker.runtime_cache.finished_snapshot_lru) == ["b", "a"]
+        assert [worker._assign_cache_slot(req_id) for req_id in ("x", "y")] == [3, 1]
+
+    def test_prefix_slot_wins_over_card_balance_and_the_rest_balance_cards(self) -> None:
+        worker, models = _make_two_card_worker()
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv", model=models[0])
+        _take_slot(worker, "busy", 2)  # card 0 runs a request, card 1 none
+
+        matching = _new_request(worker, "matching", blocks=[1, 2], computed=8)
+        assert matching.cache_slot_id == 0  # on the busier card, but it holds the prefix
+        assert _run(worker, "matching", matching, 9) == 8
+        assert [model.dumps for model in models] == [[], []]
+        assert [model.loads for model in models] == [[], []]
+
+        # Card 0 now runs two requests: the next ones go to card 1.
+        assert [worker._assign_cache_slot(req_id) for req_id in ("x", "y")] == [1, 3]
+
+    def test_card_balance_comes_before_the_victim_order(self) -> None:
+        worker, models = _make_two_card_worker()
+        _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv", model=models[0])
+        _take_slot(worker, "busy", 1)  # card 1 runs a request
+
+        # Card 0 is idle: its free slots come first, the empty one (2) before the snapshot's (0).
+        assert [worker._assign_cache_slot(req_id) for req_id in ("x", "y")] == [2, 3]
+        assert worker._assign_cache_slot("z") == 0
+
+
+class TestHostOffloadOptIn:
+    """``prefix_cache_host_offload`` turns on saving finished snapshots to host memory, under the cost test."""
+
+    def test_defaults_to_off(self, monkeypatch) -> None:
+        monkeypatch.delenv("VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD", raising=False)
+        config = SimpleNamespace(load_config=SimpleNamespace(model_loader_extra_config={}))
+
+        assert not PrefixCacheCostModel.from_config(config, block_size=4).host_offload
+
+    def test_comes_from_the_environment_or_extra_config(self, monkeypatch) -> None:
+        config = SimpleNamespace(load_config=SimpleNamespace(model_loader_extra_config={}))
+        monkeypatch.setenv("VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD", "1")
+        assert PrefixCacheCostModel.from_config(config, block_size=4).host_offload
+        monkeypatch.setenv("VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD", "0")
+        assert not PrefixCacheCostModel.from_config(config, block_size=4).host_offload
+        monkeypatch.delenv("VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD")
+        config.load_config.model_loader_extra_config["prefix_cache_host_offload"] = True
+        assert PrefixCacheCostModel.from_config(config, block_size=4).host_offload
+
+    def test_slot_reuse_saves_only_when_a_load_could_pay(self) -> None:
+        for prefill_ms_per_block, dump_ms, expected_dumps in ((1000.0, 10.0, [0]), (1.0, 100.0, [])):
+            worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+            _set_costs(worker, prefill_ms_per_block=prefill_ms_per_block, dump_ms=dump_ms, host_offload=True)
+            _finish_on_slot(worker, "done", slot_id=0, blocks=[1, 2], kv="done-kv")
+            worker._assign_cache_slot("busy")
+            other = _new_request(worker, "other", blocks=[3, 4], computed=0)
+            _run(worker, "other", other, 8)
+
+            assert worker.cache_model.dumps == expected_dumps
+            assert (worker.runtime_cache.get_snapshot("done") is not None) == bool(expected_dumps)
+
+    def test_batch_worker_keeps_one_snapshot_per_slot_without_host_offload(self) -> None:
+        worker = _make_worker(max_batch_size=32)
+        attach_request_caches(worker, k_per_model=32, models=[FakeKVSlotModel(kv_nbytes=1024 * 2**20)])
+        worker.vllm_config.load_config = SimpleNamespace(model_loader_extra_config={})
+
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=4)
+        assert worker._finished_snapshot_cap() == 32
+        worker.prefix_cache_cost_model = PrefixCacheCostModel(block_size=4, host_offload=True)
+        assert worker._finished_snapshot_cap() == 4
+
+
+class TestNonBatchDeviceOnly:
+    """A non-batch model has one slot: without host offload a finished prefix is reused only by the next request."""
+
+    def test_next_request_with_the_prefix_takes_it_over(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=True)
+        _finish_on_slot(worker, "done", slot_id=None, blocks=[1, 2], kv="done-kv")
+        state = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+
+        assert _run(worker, "new", state, 9) == 8
+        assert worker.cache_model.dumps == []
+        assert worker.cache_model.loads == []
+
+    def test_another_request_in_between_loses_the_prefix(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1000.0, dump_ms=10.0)
+        _finish_on_slot(worker, "done", slot_id=None, blocks=[1, 2], kv="done-kv")
+        _run(worker, "other", _make_request_state(worker, block_ids=([3],), prompt_len=4), 4)
+        worker._finalize_finished_request("other")
+        late = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+
+        assert _run(worker, "late", late, 9) == 0
+        assert worker.cache_model.dumps == []
+        assert worker.cache_model.loads == []
+
+    def test_host_offload_keeps_the_prefix_past_another_request(self) -> None:
+        worker = _make_worker(block_size=4, enable_prefix_caching=True)
+        _set_costs(worker, prefill_ms_per_block=1000.0, dump_ms=10.0, host_offload=True)
+        _finish_on_slot(worker, "done", slot_id=None, blocks=[1, 2], kv="done-kv")
+        _run(worker, "other", _make_request_state(worker, block_ids=([3],), prompt_len=4), 4)
+        worker.cache_model.slots[0] = "other-kv"
+        worker._finalize_finished_request("other")
+        late = _make_request_state(worker, block_ids=([1, 2],), num_computed_tokens=8, prompt_len=8)
+
+        assert _run(worker, "late", late, 9) == 8
+        assert worker.cache_model.dumps[0] == 0
+        assert [cache_id for cache_id, _ in worker.cache_model.loads] == [0]
+        assert worker.cache_model.slots[0] == "done-kv"
+
+
+class TestPrefixCacheKeepSnapshot:
+    """PrefixCacheCostModel.should_keep_snapshot: keep a snapshot only if some load of it could be accepted."""
+
+    def test_keeps_without_measurements(self) -> None:
+        assert PrefixCacheCostModel(block_size=4).should_keep_snapshot(num_tokens=8)
+        cost_model = PrefixCacheCostModel(block_size=4)
+        cost_model.observe_dump(0, 100.0)
+        assert cost_model.should_keep_snapshot(num_tokens=8, cache_id=0)
+
+    def test_measured_dump_stands_in_for_an_unmeasured_load(self) -> None:
+        cost_model = PrefixCacheCostModel(block_size=4)
+        cost_model.observe_prefill(8, 10.0)
+        cost_model.observe_dump(0, 100.0)
+        assert not cost_model.should_keep_snapshot(num_tokens=8, cache_id=0)
+        # Any measured slot stands in for an unmeasured one.
+        assert not cost_model.should_keep_snapshot(num_tokens=8, cache_id=3)
+        cost_model.observe_load(0, 1.0)
+        assert cost_model.should_keep_snapshot(num_tokens=8, cache_id=0)
+
+    def test_agrees_with_should_load_for_the_snapshot_length(self) -> None:
+        cost_model = PrefixCacheCostModel(block_size=4)
+        cost_model.observe_prefill(4, 10.0)
+        cost_model.observe_load(0, 8.0)
+        assert cost_model.should_load(matched_tokens=4, cache_id=0)
+        assert cost_model.should_keep_snapshot(num_tokens=4, cache_id=0)
+        cost_model.observe_load(0, 100.0)
+        assert not cost_model.should_load(matched_tokens=4, cache_id=0)
+        assert not cost_model.should_keep_snapshot(num_tokens=4, cache_id=0)
+
+    def test_keeps_when_a_shorter_prefix_load_would_be_accepted(self) -> None:
+        # prefill_ms scales buckets down linearly: 5 tokens are estimated at 100 * 5/8 = 62.5 ms, below the
+        # 4-token bucket's 80 ms. A load of the snapshot's first 4 tokens would still be accepted.
+        cost_model = PrefixCacheCostModel(block_size=4, margin=1.0)
+        cost_model.observe_prefill(4, 80.0)
+        cost_model.observe_prefill(8, 100.0)
+        cost_model.observe_load(0, 70.0)
+        assert not cost_model.should_load(matched_tokens=5, cache_id=0)
+        assert cost_model.should_load(matched_tokens=4, cache_id=0)
+        assert cost_model.should_keep_snapshot(num_tokens=5, cache_id=0)
+
+    def test_manual_minimum_hit_tokens_rejects_short_snapshots(self) -> None:
+        cost_model = PrefixCacheCostModel(block_size=4, auto_threshold_enabled=False, manual_min_hit_tokens=8)
+        assert not cost_model.should_keep_snapshot(num_tokens=7)
+        assert cost_model.should_keep_snapshot(num_tokens=8)
+
+    def test_empty_snapshot_is_not_kept(self) -> None:
+        assert not PrefixCacheCostModel(block_size=4).should_keep_snapshot(num_tokens=0)
 
 
 class TestFinishedSnapshotHostBudget:

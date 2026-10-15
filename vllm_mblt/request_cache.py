@@ -16,6 +16,26 @@ from transformers_mblt.utils.cache_residency import bind_cacheless
 from transformers_mblt.utils.cache_utils import MobilintCache
 
 
+def slot_row(slot_id: int, n_models: int, k_per_model: int) -> tuple[int, int]:
+    """Return the ``(model_idx, cache_id)`` that worker slot ``slot_id`` addresses on ``n_models`` x ``k_per_model``.
+
+    Slots go round-robin over the cache MXQs: slot ``s`` is ``(s % N, s // N)``, the layout
+    mobilint/transformers-mblt#31 gives the default ``MobilintCache`` rows (``default_row_slot``); this can call that
+    helper once a release ships it. Consecutive slots therefore land on different cards, and a server with fewer
+    requests than ``N * K`` runs them on every card instead of filling card 0 first. With one MXQ slot ``s`` is
+    ``(0, s)``.
+    """
+    n = max(1, int(n_models))
+    k = max(1, int(k_per_model))
+    slot = int(slot_id)
+    if not 0 <= slot < n * k:
+        raise RuntimeError(
+            "Mobilint cache slot exceeds the loaded multi-card capacity: "
+            f"cache_id={slot_id}, models={n}, k_per_model={k}."
+        )
+    return slot % n, slot // n
+
+
 def join_request_caches(caches: Sequence[Any]) -> Any:
     """The batch cache a forward over these requests runs on: their own rows, joined without copying."""
     return MobilintCache.from_rows(caches)
@@ -24,9 +44,9 @@ def join_request_caches(caches: Sequence[Any]) -> Any:
 class RequestCacheSlots:
     """Builds request caches on the worker's NPU slots and binds them around each infer.
 
-    Slot ``s`` is row ``divmod(s, k_per_model)`` of the cache MXQs, as in the worker's batch ``cache_id``; a
-    non-batch worker has the one slot ``None`` on ``(models[0], 0)``. A Mixture-of-Experts model keeps its KV in
-    every shared MXQ and binds its cache inside its own forward: ``moe`` is the worker's
+    Slot ``s`` is row ``(s % N, s // N)`` of the ``N`` cache MXQs (:func:`slot_row`), as in the worker's batch
+    ``cache_id``; a non-batch worker has the one slot ``None`` on ``(models[0], 0)``. A Mixture-of-Experts model
+    keeps its KV in every shared MXQ and binds its cache inside its own forward: ``moe`` is the worker's
     :class:`~vllm_mblt.moe_runtime.MbltMoECacheModel`, which builds its caches.
     """
 
@@ -51,13 +71,11 @@ class RequestCacheSlots:
     def _row_slot(self, slot_id: Optional[int]) -> tuple[int, int]:
         if slot_id is None:
             return (0, 0)
-        model_idx, cache_id = divmod(int(slot_id), self.k_per_model)
-        if model_idx >= len(self.models):
-            raise RuntimeError(
-                "Mobilint cache slot exceeds the loaded multi-card capacity: "
-                f"cache_id={slot_id}, models={len(self.models)}, k_per_model={self.k_per_model}."
-            )
-        return model_idx, cache_id
+        return slot_row(slot_id, len(self.models), self.k_per_model)
+
+    def slot_model_index(self, slot_id: int) -> int:
+        """The cache MXQ (card) worker slot ``slot_id`` runs on; what the slot assignment balances over."""
+        return self._row_slot(slot_id)[0]
 
     def new_cache(self, slot_id: Optional[int]) -> Any:
         """Return an empty cache for the request on ``slot_id``."""

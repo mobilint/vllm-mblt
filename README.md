@@ -332,7 +332,10 @@ vllm serve mobilint/Llama-3.2-1B-Instruct \
 If one MXQ model instance has compiled batch capacity `K`, the backend loads
 `ceil(max_batch_size / K)` model instances. `max_batch_size` is therefore the aggregate serving capacity across
 all loaded instances, not a per-card value. KV-cache rows, including prefix-cache snapshots, remain bound to the
-model instance and local cache ID that own them.
+model instance and local cache ID that own them. A new request takes a free slot on the model instance running
+the fewest requests, so concurrent requests spread over every loaded instance instead of filling the first
+instance's `K` rows before the next one gets any. The one exception is a free slot still holding a prefix snapshot
+of the request, which it takes on any instance (see [Cache Behavior](#cache-behavior)).
 
 For explicit core or cluster placement across multiple cards, use canonical device-qualified target strings such
 as `"0:0:0"` / `"1:0:0"` for `target_cores` or `"0:0"` / `"1:0"` for `target_clusters`.
@@ -487,25 +490,56 @@ cache's KV each slot holds and saves it to host memory when another cache takes
 the slot, so a request that loses its slot resumes from its own KV. On top of
 that, `MbltWorker` reuses KV prefixes across requests with these policies:
 
-- A finished request's cache becomes its prefix snapshot, without a dump. Its KV
-  is saved only when another cache takes the slot.
+- A finished request's cache becomes its prefix snapshot, without a dump, and
+  its KV stays on its slot. By default the prefix cache lives on the NPU only,
+  as vLLM's GPU prefix cache keeps evicted blocks nowhere: a snapshot is
+  reusable while its slot still holds it, and when another cache takes the
+  slot the snapshot is dropped and the slot is overwritten without a dump.
+- A new request on a batch model takes a free slot that still holds a snapshot
+  of its prefix, if there is one, and continues on that KV in place: no load,
+  no dump, and no cost test (only `prefix_cache_min_hit_tokens` applies).
+  The match uses the same block hashes, token ids and multimodal and
+  prompt-embedding checks as a snapshot load. Otherwise the request takes a
+  free slot on the card running the fewest requests and, on that card, a slot
+  holding no snapshot, then one whose snapshot would not be worth saving under
+  the cost test below, then the least recently finished or hit snapshot; the
+  lowest slot breaks the remaining ties. A prefix hit marks its snapshot as
+  recently used.
+- A non-batch model has one slot, so by default a finished prefix is reused
+  only by the next request that runs; any other request in between drops it.
+- `VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD=1` / `prefix_cache_host_offload: true`
+  (off by default) also saves a finished snapshot to host memory when its slot
+  changes hands, but only if a later load of it could beat recomputing it
+  under the cost test below. Saving dumps the slot's whole KV synchronously on
+  the engine loop (about 380 ms for a 224 MiB Qwen3-0.6B slot), so turn it on
+  only for workloads whose prefixes repeat after their slot is reused.
 - On a non-batch model, a request that loses the slot to another one is also
   kept as a snapshot, so the next request can start from its prefix.
 - Finished snapshots are evicted LRU-first beyond 16, or beyond what fits the
   host memory budget, whichever is fewer. Each snapshot holds one slot's
   compiled KV buffers in host memory once saved (256 MiB for a 4K-token
   Llama-3 slot); the budget is `VLLM_MBLT_PREFIX_CACHE_MAX_HOST_MIB` /
-  `prefix_cache_max_host_mib`, 4096 MiB by default. The startup log reports
+  `prefix_cache_max_host_mib`, 4096 MiB by default. Without host offload a
+  batch model's finished snapshots stay on their slots and take no host
+  memory, so it keeps up to one per slot instead. The startup log reports
   the resulting cap.
-- Matched snapshots are loaded only when the worker-side cost model expects the
-  one-cache-id load to beat recomputing the matched prefix.
+- Matched snapshots on another slot or in host memory are loaded only when the
+  worker-side cost model expects the one-cache-id load to beat recomputing the
+  matched prefix.
 
 The prefix-cache load threshold is enabled by default. During model warmup the
 worker tries to measure optimistic one-cache-id prefill costs for 1, 2, 4, and
 8 KV blocks; for batch MXQs this still submits exactly one active `cache_id`.
 Real snapshot loads and dumps update per-`cache_id` EWMA timings. A snapshot is
 loaded only when `load_ms < prefill_ms * 0.9`; otherwise the snapshot remains
-stored and the prompt is recomputed. The policy can be adjusted with environment
+stored and the prompt is recomputed. With host offload on, the same test
+decides whether a finished snapshot is saved when its slot is reused: it is
+saved only when a load of some prefix of it could pass. Until a load has been
+measured, the measured dump time stands in for `load_ms`, since both move the
+slot's whole KV buffers; with no measurement at all, the snapshot is saved.
+Saving a snapshot dumps the slot's whole KV synchronously, so with host offload
+on a workload whose prefixes are long enough to pass the test pays that dump on
+every slot reuse, hit or not. The policy can be adjusted with environment
 variables or equivalent model loader extra config keys:
 
 - `VLLM_MBLT_PREFIX_CACHE_AUTO_THRESHOLD` / `prefix_cache_auto_threshold`
@@ -514,6 +548,8 @@ variables or equivalent model loader extra config keys:
   sets a manual minimum matched-token count before any snapshot load.
 - `VLLM_MBLT_PREFIX_CACHE_LOAD_MARGIN` / `prefix_cache_load_margin` defaults
   to `0.9`.
+- `VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD` / `prefix_cache_host_offload` defaults
+  to off. Set `1` to save finished snapshots to host memory as described above.
 - `VLLM_MBLT_PREFIX_CACHE_CALIBRATE` defaults to enabled. Set `0` to skip
   startup prefill calibration.
 

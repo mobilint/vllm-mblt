@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The prefix cache is device-only by default, as vLLM's GPU prefix cache is (#40). A finished request's snapshot is
+  reused while its NPU slot still holds it; when another cache takes the slot, the snapshot is dropped without a
+  dump, whether or not a load of it could pay. `VLLM_MBLT_PREFIX_CACHE_HOST_OFFLOAD=1` /
+  `prefix_cache_host_offload` (off by default) saves it to host memory instead, under the cost test that decided it
+  before. On a non-batch model, a finished prefix is therefore reused only by the next request unless host offload is
+  on. Without host offload a batch model keeps up to one finished snapshot per slot, as they take no host memory.
+- A new request takes a free slot that still holds a snapshot of its prefix and continues on it in place, with no
+  load or dump and no cost test (only `prefix_cache_min_hit_tokens` applies). Otherwise it takes a slot on the
+  least-loaded card and, on it, an empty slot first, then one whose snapshot would not be worth saving, then the
+  least recently used snapshot. A prefix hit now marks its snapshot as recently used; before, only finishing did.
+
+### Fixed
+
+- With prefix caching on, reusing a slot no longer dumps the finished request's KV that is still on it when no
+  load of that snapshot could pay. The dump moved the slot's whole KV to host memory on the engine loop (about
+  380 ms for a 224 MiB Qwen3-0.6B slot) for every new request, even with no prefix hits, and raised TTFT
+  (#40). The worker now applies the snapshot-load cost test before the slot changes hands: the snapshot is saved
+  only when a load of some prefix of it could beat recomputing that prefix, and dropped otherwise. Until a load is
+  measured, the measured dump time stands in for the load time; with no measurement, the snapshot is saved as
+  before. A request whose prefix snapshot is still on its own slot takes the cache over in place and, under the
+  same test, no longer dumps a host copy for the snapshot.
+- With `dev_no` listing several cards, concurrent requests now spread over every card instead of filling card 0's
+  batch first. Worker slot `s` addresses row `(s % N, s // N)` of the `N` cache MXQs (round-robin, the layout
+  mobilint/transformers-mblt#31 gives its default cache rows) instead of `divmod(s, K)`, and a new request takes a
+  free slot on the card running the fewest requests. With one card nothing changes.
+
 ## 0.8.0
 
 ### Added
