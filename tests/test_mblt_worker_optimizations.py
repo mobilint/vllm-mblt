@@ -3310,6 +3310,7 @@ class TestMbltWorkerOptimizations:
                 ("mobilint/test-model",),
                 {
                     "trust_remote_code": True,
+                    "dtype": torch.float32,
                     "dev_no": 2,
                     "mxq_path": "/tmp/model.mxq",
                     "max_batch_size": 8,
@@ -3379,6 +3380,7 @@ class TestMbltWorkerOptimizations:
                 ("mobilint/Qwen3-VL-2B-Instruct",),
                 {
                     "trust_remote_code": True,
+                    "dtype": torch.float32,
                     "vision_dev_no": 0,
                     "text_dev_no": 0,
                     "vision_max_batch_size": 4,

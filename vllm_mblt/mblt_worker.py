@@ -3230,6 +3230,12 @@ class MbltWorker(WorkerBase):
 
         hf_config = getattr(self.model_config, "hf_config", None)
         model_kwargs = _normalize_model_kwargs_for_hf_config(model_kwargs, hf_config)
+        if "dtype" not in model_kwargs and "torch_dtype" not in model_kwargs:
+            # transformers 5 loads in the config's dtype (bfloat16 for most releases) where transformers 4 loaded
+            # float32. The host-side weights (embeddings, vision projections) of some releases are stored in
+            # float32, and rounding them to bfloat16 changes what the NPU receives and the greedy output. Keep
+            # transformers 4's float32 unless the loader config names a dtype.
+            model_kwargs["dtype"] = torch.float32
         model_kwargs = self._place_on_data_parallel_card(model_kwargs, hf_config)
 
         start = time.perf_counter()
