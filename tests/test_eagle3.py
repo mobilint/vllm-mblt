@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm import ModelRegistry
+from vllm.exceptions import VLLMValidationError
 
 from tests.test_mblt_platform_prefill import _make_vllm_config
 from vllm_mblt import register_model
@@ -328,9 +329,9 @@ def test_platform_refuses_sampling_options_eagle3_rounds_cannot_honor() -> None:
         MbltPlatform.validate_request({"type": "token"}, SamplingParams(temperature=0.6, top_p=0.9, top_k=20))
         # vLLM fans n > 1 out into child requests with their own ids, so each candidate gets its own cache.
         MbltPlatform.validate_request({"type": "token"}, SamplingParams(n=3, temperature=0.8))
-        with pytest.raises(ValueError, match="unsupported here: logprobs, repetition_penalty, seed"):
+        with pytest.raises(VLLMValidationError, match="unsupported here: logprobs, repetition_penalty, seed"):
             MbltPlatform.validate_request({"type": "token"}, SamplingParams(logprobs=1, repetition_penalty=1.1, seed=3))
-        with pytest.raises(ValueError, match="token prompts only"):
+        with pytest.raises(VLLMValidationError, match="token prompts only"):
             MbltPlatform.validate_request({"type": "embeds"}, SamplingParams())
     finally:
         MbltPlatform.check_and_update_config(_make_vllm_config(128))
@@ -356,7 +357,7 @@ def test_validation_follows_the_engine_that_processes_the_request() -> None:
     for configured_last in (_eagle3_vllm_config(), _make_vllm_config(128)):
         MbltPlatform.check_and_update_config(configured_last)
         dense.process_inputs(penalized)
-        with pytest.raises(ValueError, match="repetition_penalty"):
+        with pytest.raises(VLLMValidationError, match="repetition_penalty"):
             eagle3.process_inputs(penalized)
     MbltPlatform.check_and_update_config(_make_vllm_config(128))
 

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from vllm.config import CacheConfig, ParallelConfig, SchedulerConfig, VllmConfig
 
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -410,19 +411,25 @@ class MbltPlatform(Platform):
 
     @classmethod
     def validate_request(cls, processed_inputs: object, params: object) -> None:
-        """Refuse requests an EAGLE-3 model cannot serve, with the options to drop (an HTTP 400 for the client)."""
+        """Refuse requests an EAGLE-3 model cannot serve, with the options to drop (an HTTP 400 for the client).
+
+        vLLM 0.32 maps only its VLLMClientError family to 4xx; a plain ValueError here reaches the client as a 500.
+        """
         if not cls._validating_for_eagle3():
             return
         unsupported = _unsupported_eagle3_sampling(params)
         if unsupported:
-            raise ValueError(
+            raise VLLMValidationError(
                 "EAGLE-3 models sample with temperature, top_k and top_p only; unsupported here: "
                 + ", ".join(unsupported)
-                + "."
+                + ".",
+                parameter=unsupported[0],
             )
         inputs = processed_inputs if isinstance(processed_inputs, dict) else {}
         if inputs.get("type") in ("embeds", "multimodal"):
-            raise ValueError("EAGLE-3 models take token prompts only, without prompt embeddings or multimodal data.")
+            raise VLLMValidationError(
+                "EAGLE-3 models take token prompts only, without prompt embeddings or multimodal data."
+            )
 
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
