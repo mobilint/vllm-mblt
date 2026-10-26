@@ -340,6 +340,11 @@ of the request, which it takes on any instance (see [Cache Behavior](#cache-beha
 For explicit core or cluster placement across multiple cards, use canonical device-qualified target strings such
 as `"0:0:0"` / `"1:0:0"` for `target_cores` or `"0:0"` / `"1:0"` for `target_clusters`.
 
+A `dev_no` list still runs every card from one engine: each step waits for the slowest card, and the host work for
+all rows runs between NPU calls. To scale throughput with the number of cards, run one engine per card instead,
+with [Data Parallel](#data-parallel) or one `vllm serve` process per card (see
+[Host CPU Threads](#host-cpu-threads)).
+
 ### Data Parallel
 
 `--data-parallel-size N` serves one model from one `vllm serve` with N EngineCores, one per NPU card. vLLM's
@@ -374,6 +379,37 @@ vllm serve mobilint/Qwen3-0.6B \
   gloo group every 32 steps. An idle engine waits about one of its recent model steps per wave step instead of
   running the model, so it neither spins a CPU core nor blocks early at that all-reduce.
 - `--data-parallel-size 1` (the default) serves exactly as before.
+
+### Host CPU Threads
+
+Each engine sizes its torch CPU thread pool for its share of the host when it starts: the CPUs the process may use
+(its affinity mask, lowered to a cgroup CPU quota) divided by the number of local data parallel engines, clamped
+to 2–8 threads and never above PyTorch's default. The engine logs the count under `[mblt-init] host threads`.
+`OMP_NUM_THREADS` or `MKL_NUM_THREADS`, when set, is kept as is.
+
+Engines started as separate `vllm serve` processes, for example one per card pinned with `dev_no` and listening
+on its own port, do not know about each other: each one counts itself as the only engine and takes up to 8
+threads. Set `OMP_NUM_THREADS` for each of them, and keep the total thread budget of all engines and clients on
+the host within the cores they are allowed to use (cpuset, container CPU limit). Start each process in its own
+terminal or under a process manager; `vllm serve` stays in the foreground.
+
+Reference measurements (Qwen3-0.6B, MXQ `global8`, runtime batch 16; three MLA100 cards with one ARIES each on
+one host with a 16-core reservation; random prompts of 128 tokens with 64 output tokens and `--ignore-eos`;
+vLLM 0.11.2, mobilint-qb-runtime 1.5.0). They were taken on vllm-mblt 0.8.0 and the data parallel branch, before
+the prefix cache became device-only and before engines sized their own threads, so treat them as relative:
+
+| Setup | Throughput |
+|---|---|
+| One engine, `dev_no: [0, 1, 2]`, concurrency 48 | 392–411 tok/s |
+| `--data-parallel-size 3`, `OMP_NUM_THREADS=2`, prefix caching off, concurrency 48 | 508 tok/s |
+| One `vllm serve` per card, `OMP_NUM_THREADS=2` | 557–580 tok/s total |
+| One `vllm serve` per card, default threads, with three clients | 194–216 tok/s total (reservation saturated at 12.5–13.7 cores) |
+
+On one card at concurrency 16, a default-thread engine used 2.8–2.9 cores and 45 threads; with
+`OMP_NUM_THREADS=2` it used 0.9 cores at the same throughput (180–182 vs 181 tok/s). The cost is CPU-side
+sampling: a 48-row sampling step took 9.5 ms with 2 threads instead of 1.6 ms, so give an engine more threads
+when it has a large host to itself. These numbers depend on the host and model; measure on your own target
+before choosing a value.
 
 ## Benchmarking
 

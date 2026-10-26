@@ -47,6 +47,13 @@
   before. A request whose prefix snapshot is still on its own slot takes the cache over in place and, under the
   same test, no longer dumps a host copy for the snapshot.
 
+### Documentation
+
+- README: a `dev_no` list runs every card from one engine, so scaling with the number of cards needs one engine
+  per card (data parallel, or one `vllm serve` per card). A new "Host CPU Threads" section explains how each
+  engine sizes its torch thread pool, why separate `vllm serve` processes need `OMP_NUM_THREADS`, and gives
+  reference measurements (#42, #44).
+
 ## 0.8.0
 
 ### Added
