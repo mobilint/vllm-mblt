@@ -245,9 +245,7 @@ def _resolve_model_config_positive_int(
         # through to the generic default would silently shrink the prefill
         # chunk size instead.
         usable_entries = {
-            str(key): value
-            for key, value in raw_value.items()
-            if _coerce_positive_int(value) is not None
+            str(key): value for key, value in raw_value.items() if _coerce_positive_int(value) is not None
         }
         if len(usable_entries) == 1:
             only_key, only_value = next(iter(usable_entries.items()))
@@ -397,7 +395,7 @@ class MbltPlatform(Platform):
         """Whether the engine validating this request serves EAGLE-3.
 
         vLLM passes ``validate_request`` no engine, so a process with several engines (several ``LLM`` objects) cannot
-        tell them apart from its arguments. Its caller, vLLM 0.11.2's ``Processor.process_inputs``, holds the engine's
+        tell them apart from its arguments. Its caller, vLLM 0.32's ``InputProcessor`` method, holds the engine's
         ``model_config``; without it, the engine configured last decides.
         """
         caller = sys._getframe(2).f_locals.get("self")
@@ -408,9 +406,8 @@ class MbltPlatform(Platform):
         return _is_eagle3_hf_config(hf_config)
 
     @classmethod
-    def validate_request(cls, prompt: object, params: object, processed_inputs: object) -> None:
+    def validate_request(cls, processed_inputs: object, params: object) -> None:
         """Refuse requests an EAGLE-3 model cannot serve, with the options to drop (an HTTP 400 for the client)."""
-        del prompt
         if not cls._validating_for_eagle3():
             return
         unsupported = _unsupported_eagle3_sampling(params)
@@ -423,6 +420,15 @@ class MbltPlatform(Platform):
         inputs = processed_inputs if isinstance(processed_inputs, dict) else {}
         if inputs.get("type") in ("embeds", "multimodal"):
             raise ValueError("EAGLE-3 models take token prompts only, without prompt embeddings or multimodal data.")
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        """Seed the device RNGs; the NPU has none.
+
+        vLLM's ``set_random_seed`` has already seeded Python, NumPy and torch's CPU generator, which is where this
+        platform samples.
+        """
+        del seed
 
     @classmethod
     def _prepare_data_parallel(cls, vllm_config: "VllmConfig") -> None:
@@ -572,8 +578,7 @@ class MbltPlatform(Platform):
                     setattr(scheduler_config, attr_name, effective_max_num_seqs)
             if print_debug:
                 logger.info(
-                    "Using per-sequence chunk size %d across %d scheduler sequences "
-                    "(max_num_batched_tokens=%d).",
+                    "Using per-sequence chunk size %d across %d scheduler sequences (max_num_batched_tokens=%d).",
                     resolved_chunk_size,
                     effective_max_num_seqs,
                     scheduler_config.max_num_batched_tokens,

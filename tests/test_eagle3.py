@@ -325,19 +325,17 @@ def test_platform_refuses_sampling_options_eagle3_rounds_cannot_honor() -> None:
 
     MbltPlatform.check_and_update_config(_eagle3_vllm_config())
     try:
-        MbltPlatform.validate_request("p", SamplingParams(temperature=0.6, top_p=0.9, top_k=20), {"type": "token"})
+        MbltPlatform.validate_request({"type": "token"}, SamplingParams(temperature=0.6, top_p=0.9, top_k=20))
         # vLLM fans n > 1 out into child requests with their own ids, so each candidate gets its own cache.
-        MbltPlatform.validate_request("p", SamplingParams(n=3, temperature=0.8), {"type": "token"})
+        MbltPlatform.validate_request({"type": "token"}, SamplingParams(n=3, temperature=0.8))
         with pytest.raises(ValueError, match="unsupported here: logprobs, repetition_penalty, seed"):
-            MbltPlatform.validate_request(
-                "p", SamplingParams(logprobs=1, repetition_penalty=1.1, seed=3), {"type": "token"}
-            )
+            MbltPlatform.validate_request({"type": "token"}, SamplingParams(logprobs=1, repetition_penalty=1.1, seed=3))
         with pytest.raises(ValueError, match="token prompts only"):
-            MbltPlatform.validate_request("p", SamplingParams(), {"type": "embeds"})
+            MbltPlatform.validate_request({"type": "embeds"}, SamplingParams())
     finally:
         MbltPlatform.check_and_update_config(_make_vllm_config(128))
     # Other models keep every option.
-    MbltPlatform.validate_request("p", SamplingParams(logprobs=1, seed=3), {"type": "token"})
+    MbltPlatform.validate_request({"type": "token"}, SamplingParams(logprobs=1, seed=3))
 
 
 class _Processor:
@@ -347,7 +345,7 @@ class _Processor:
         self.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
 
     def process_inputs(self, params) -> None:
-        MbltPlatform.validate_request(prompt="p", params=params, processed_inputs={"type": "token"})
+        MbltPlatform.validate_request(processed_inputs={"type": "token"}, params=params)
 
 
 def test_validation_follows_the_engine_that_processes_the_request() -> None:

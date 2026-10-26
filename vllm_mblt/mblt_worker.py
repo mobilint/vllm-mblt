@@ -26,7 +26,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunner
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_mblt.data_parallel import (
     IdleStepPacer,
@@ -451,8 +451,7 @@ class PrefixCacheCostModel:
         num_tokens = max(1, int(num_tokens))
         min_tokens = self.manual_min_hit_tokens or 1
         return max(
-            [estimate]
-            + [ms for tokens, ms in self.prefill_ms_by_tokens.items() if min_tokens <= tokens <= num_tokens]
+            [estimate] + [ms for tokens, ms in self.prefill_ms_by_tokens.items() if min_tokens <= tokens <= num_tokens]
         )
 
     def prefill_ms(self, matched_tokens: int) -> Optional[float]:
@@ -3168,7 +3167,9 @@ class MbltWorker(WorkerBase):
         pacer = self._idle_step_pacer or IdleStepPacer()
         time.sleep(pacer.idle_seconds())
 
-    def load_model(self) -> None:
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        if load_dummy_weights:
+            raise NotImplementedError("Mobilint models load compiled MXQ weights; dummy weights are not supported.")
         self._log_init_stage("load_model:start", model=self.model_config.model)
         model_kwargs: Dict[str, object] = {}
 
@@ -3250,8 +3251,7 @@ class MbltWorker(WorkerBase):
             # forward; the adapter only presents it as one single-slot cache model.
             if self._is_batch_model():
                 raise RuntimeError(
-                    "Mixture-of-Experts models support only non-batch serving: "
-                    f"max_batch_size={self.max_batch_size}."
+                    f"Mixture-of-Experts models support only non-batch serving: max_batch_size={self.max_batch_size}."
                 )
             self.cache_model = MbltMoECacheModel(self.model)
             self.cache_backend = None
@@ -3386,9 +3386,10 @@ class MbltWorker(WorkerBase):
             num_groups=len(getattr(kv_cache_config, "groups", {}) or {}),
         )
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Nothing to compile: the MXQs are compiled ahead of time. vLLM 0.32 reads the times this returns."""
         self._log_init_stage("compile_or_warm_up_model")
-        pass
+        return CompilationTimes(language_model=0.0, encoder=0.0)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Advertise transcription from the model class, not the HF model_type.
