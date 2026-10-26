@@ -52,10 +52,10 @@ Home = "https://www.mobilint.com/"
 Repository = "https://github.com/mobilint/vllm-mblt"
 
 [project.optional-dependencies]
-# Serving mobilint/Qwen3-ASR-1.7B. Needs the mblt-model-zoo release whose Qwen3-ASR composite exposes
-# get_input_embeddings and get_audio_features on its outer class.
+# Serving mobilint/Qwen3-ASR-1.7B. transformers-mblt vendors the Qwen3-ASR backend from 0.7.0, which runs on
+# transformers 5; the qwen-asr package it replaces pins transformers 4.57.
 qwen-asr = [
-    "mblt-model-zoo[qwen-asr]>2.10.0",
+    "transformers-mblt>=0.7.0",
 ]
 # Serving mobilint/Qwen3-30B-A3B (Mixture-of-Experts). The base requirements now cover it; the extra is kept so
 # existing install commands keep working.

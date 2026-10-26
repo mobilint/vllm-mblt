@@ -1,6 +1,6 @@
 """vLLM wrapper for Mobilint's NPU Qwen3-ASR.
 
-The model zoo already implements Qwen3-ASR on the NPU: an audio encoder MXQ
+transformers-mblt already implements Qwen3-ASR on the NPU: an audio encoder MXQ
 produces embeddings which are spliced into a decoder-only causal LM at
 ``<|audio_pad|>`` positions. That is structurally the same arrangement as
 Qwen3-VL, so this file supplies the vLLM side: multimodal processing and the
@@ -8,20 +8,19 @@ transcription interface.
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal
+from typing import Literal
 
-import numpy as np
 import torch
-from mblt_model_zoo.hf_transformers.models.qwen3_asr.modeling_qwen3_asr import (
+from transformers import BatchFeature
+from transformers_mblt.models.qwen3_asr import MobilintQwen3ASRProcessor as Qwen3ASRProcessor
+from transformers_mblt.models.qwen3_asr._upstream.processing_qwen3_asr import _get_feat_extract_output_lengths
+from transformers_mblt.models.qwen3_asr.modeling_qwen3_asr import (
     MobilintQwen3ASRForConditionalGeneration as OriginalMobilintQwen3ASRForConditionalGeneration,
 )
-from qwen_asr.core.transformers_backend.processing_qwen3_asr import (
-    Qwen3ASRProcessor,
-    _get_feat_extract_output_lengths,
-)
-from transformers import BatchFeature
 from vllm.config import ModelConfig, SpeechToTextConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.config.speech_to_text import SpeechToTextParams
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs.llm import MultiModalDataDict
 from vllm.model_executor.models import VllmModelForTextGeneration
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsTranscription
@@ -57,6 +56,14 @@ class MobilintQwen3ASRProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": _MAX_AUDIOS_PER_REQUEST}
 
+    def get_data_parser(self) -> MultiModalDataParser:
+        # Resample each clip to the rate the feature extractor expects.
+        return MultiModalDataParser(
+            target_sr=self.get_feature_extractor().sampling_rate,
+            expected_hidden_size=self._get_expected_hidden_size(),
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
+        )
+
 
 class MobilintQwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[MobilintQwen3ASRProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -85,40 +92,29 @@ def _qwen3_asr_field_config(hf_inputs: Mapping[str, torch.Tensor]):
 
 
 class MobilintQwen3ASRMultiModalProcessor(BaseMultiModalProcessor[MobilintQwen3ASRProcessingInfo]):
-    def _get_data_parser(self) -> MultiModalDataParser:
-        feature_extractor = self.info.get_feature_extractor()
-        return MultiModalDataParser(target_sr=feature_extractor.sampling_rate)
+    def _get_hf_mm_text(self, mm_counts: Mapping[str, int]) -> str:
+        # The processor expands one <|audio_pad|> per clip, so it needs that text next to the audio. vLLM has
+        # already tokenized the real prompt.
+        return self.dummy_inputs.get_dummy_text(mm_counts)
 
     def _call_hf_processor(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, Any],
-        tok_kwargs: Mapping[str, object],
+        hf_data: Mapping[str, object],
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        if mm_kwargs:
+        # vLLM adds truncation=False next to the dummy text; anything else came with the request.
+        overrides = sorted(key for key in hf_kwargs if key != "truncation")
+        if overrides:
             # Overrides such as feature_size change the features the compiled encoder receives.
             # Refuse them here, so the caller gets a 400.
-            raise ValueError(f"Qwen3-ASR does not accept processor overrides; got {sorted(mm_kwargs)}.")
-        # vLLM passes audio as "audios"; the Qwen3-ASR processor takes "audio".
-        mm_data = dict(mm_data)
-        audios = mm_data.pop("audios", None)
-        if audios:
-            mm_data["audio"] = audios
-        # vLLM's text-only pass keeps the audio placeholder but sends no clip, which the
-        # processor cannot expand; tokenize directly.
-        if not mm_data.get("audio", []):
-            prompt_ids = self.info.get_tokenizer().encode(prompt)
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
-            return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
-
-        mm_kwargs = {"sampling_rate": self.info.get_feature_extractor().sampling_rate}
-        outputs = super()._call_hf_processor(prompt=prompt, mm_data=mm_data, mm_kwargs=mm_kwargs, tok_kwargs=tok_kwargs)
+            raise VLLMValidationError(f"Qwen3-ASR does not accept processor overrides; got {overrides}.")
+        hf_kwargs = {**hf_kwargs, "sampling_rate": self.info.get_feature_extractor().sampling_rate}
+        outputs = super()._call_hf_processor(hf_data, hf_kwargs)
         # Samples far outside [-1, 1] overflow the log-mel features; refuse them rather than
         # hand inf or NaN to the NPU encoder.
         input_features = outputs.get("input_features")
         if input_features is not None and not torch.isfinite(torch.as_tensor(input_features)).all():
-            raise ValueError("The audio's samples are out of range: its features are not finite.")
+            raise VLLMValidationError("The audio's samples are out of range: its features are not finite.")
         return outputs
 
     def _get_mm_fields_config(
@@ -150,7 +146,7 @@ class MobilintQwen3ASRMultiModalProcessor(BaseMultiModalProcessor[MobilintQwen3A
             if item_idx >= len(audio_output_lengths):
                 # Reached when the processor produced no audio fields, which
                 # otherwise surfaces as an opaque IndexError.
-                raise ValueError(
+                raise VLLMValidationError(
                     f"No audio feature length for item {item_idx}; "
                     f"got {len(audio_output_lengths)} length(s) from the processor."
                 )
@@ -165,7 +161,8 @@ class MobilintQwen3ASRMultiModalProcessor(BaseMultiModalProcessor[MobilintQwen3A
         return [
             PromptReplacement(
                 modality="audio",
-                target=processor.audio_token,
+                # A token target: vLLM 0.32 falls back to matching decoded text for a string one.
+                target=[audio_token_id],
                 replacement=get_replacement,
             )
         ]
@@ -176,7 +173,7 @@ class MobilintQwen3ASRMultiModalProcessor(BaseMultiModalProcessor[MobilintQwen3A
         # is admitted with no room to generate and never finishes.
         max_model_len = self.info.ctx.model_config.max_model_len
         if len(out["prompt_token_ids"]) >= max_model_len:
-            raise ValueError(
+            raise VLLMValidationError(
                 f"The prompt is {len(out['prompt_token_ids'])} tokens, which leaves no room to generate within "
                 f"max_model_len={max_model_len}. Shorten the prompt or the audio."
             )
@@ -188,7 +185,7 @@ class MobilintQwen3ASRMultiModalProcessor(BaseMultiModalProcessor[MobilintQwen3A
         num_pads = out["prompt_token_ids"].count(audio_token_id)
         num_slots = sum(p.get_num_embeds() for p in out["mm_placeholders"].get("audio", []))
         if num_pads != num_slots:
-            raise ValueError(
+            raise VLLMValidationError(
                 f"The prompt has {num_pads} audio placeholder tokens but its audio fills {num_slots}. "
                 "Keep <|audio_pad|> out of message text, and send audio that has samples."
             )
@@ -209,7 +206,7 @@ class MobilintQwen3ASRForConditionalGeneration(
     merge_by_field_config = True
 
     # The artifact separates its language preface from the transcription with
-    # this marker. The zoo carries the matching token id as
+    # this marker. transformers-mblt carries the matching token id as
     # ``MobilintQwen3ASRThinkerConfig.asr_text_token_id`` (a constructor default, not a
     # field of the published config.json).
     ASR_TEXT_MARKER = "<asr_text>"
@@ -250,7 +247,7 @@ class MobilintQwen3ASRForConditionalGeneration(
         """
         if language is None or language in cls.supported_languages:
             return language
-        raise ValueError(
+        raise VLLMValidationError(
             f"Qwen3-ASR does not support language {language!r}. Must be one of {sorted(cls.supported_languages)}."
         )
 
@@ -275,23 +272,13 @@ class MobilintQwen3ASRForConditionalGeneration(
         )
 
     @classmethod
-    def get_generation_prompt(
-        cls,
-        audio: np.ndarray,
-        stt_config,
-        model_config,
-        language: str | None,
-        task_type: Literal["transcribe", "translate"],
-        request_prompt: str,
-        to_language: str | None,
-    ):
+    def get_generation_prompt(cls, stt_params: SpeechToTextParams):
         """Build the chat prompt the artifact expects for a transcription.
 
         The model answers in its native ``language <Lang><asr_text><text>``
         form. When the caller names a language the model supports, we pre-fill
-        that preface so the model continues with the transcription alone: the
-        API contract is plain text and vLLM 0.11.2 offers no hook to strip a
-        prefix afterwards.
+        that preface so the model continues with the transcription alone, as
+        the API contract is plain text.
 
         Without a language the model auto-detects, and the preface is returned
         as part of the text, once per chunk. A language outside
@@ -301,17 +288,21 @@ class MobilintQwen3ASRForConditionalGeneration(
         A caller-supplied ``prompt`` becomes the system message, the slot the
         model reads context from; empty by default.
         """
+        audio = stt_params.audio
+        language = stt_params.language
+        task_type = stt_params.task_type
+        request_prompt = stt_params.request_prompt
         if task_type != "transcribe":
             # vLLM serves /v1/audio/translations through a handler built from the same
             # capability flag as transcription ("transcription" in supported_tasks), but
             # Qwen3-ASR cannot translate. Refuse here so the endpoint returns a client
             # error rather than a source-language transcript labelled as a translation.
-            raise ValueError(f"Qwen3-ASR supports task_type='transcribe' only, got {task_type!r}.")
-        if to_language:
-            raise ValueError("Qwen3-ASR does not support translation; `to_language` must be unset.")
+            raise VLLMValidationError(f"Qwen3-ASR supports task_type='transcribe' only, got {task_type!r}.")
+        if stt_params.to_language:
+            raise VLLMValidationError("Qwen3-ASR does not support translation; `to_language` must be unset.")
 
         if audio.size == 0:
-            raise ValueError("The audio has no samples.")
+            raise VLLMValidationError("The audio has no samples.")
 
         refused_tokens = (*cls.AUDIO_TOKENS, cls.AUDIO_PLACEHOLDER_MARKER)
         if any(token in request_prompt for token in refused_tokens):
@@ -319,7 +310,7 @@ class MobilintQwen3ASRForConditionalGeneration(
             # marker, into audio slots for the one clip. In the caller's text they would
             # move the audio into the system message or leave the processor short of
             # clips, so refuse them up front.
-            raise ValueError(f"`prompt` must not contain the audio placeholder tokens {refused_tokens}.")
+            raise VLLMValidationError(f"`prompt` must not contain the audio placeholder tokens {refused_tokens}.")
 
         prefix = ""
         name = cls.supported_languages.get(language) if language else None
@@ -327,7 +318,7 @@ class MobilintQwen3ASRForConditionalGeneration(
             prefix = f"language {name.capitalize()}{cls.ASR_TEXT_MARKER}"
         # The OpenAI `prompt` field carries optional context -- names, jargon, the
         # topic. Qwen3-ASR takes it as the system message, exactly as the model's own
-        # qwen_asr.inference.qwen3_asr._build_messages does, and vLLM passes the same
+        # qwen-asr's qwen_asr.inference.qwen3_asr._build_messages does, and vLLM passes the same
         # string for every chunk of a long file, so each piece is decoded with it.
         return {
             "prompt": (
@@ -335,7 +326,7 @@ class MobilintQwen3ASRForConditionalGeneration(
                 "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
                 "<|im_start|>assistant\n" + prefix
             ),
-            "multi_modal_data": {"audio": (audio, stt_config.sample_rate)},
+            "multi_modal_data": {"audio": (audio, stt_params.stt_config.sample_rate)},
         }
 
     @classmethod
@@ -355,12 +346,12 @@ class MobilintQwen3ASRForConditionalGeneration(
         """Declare a vLLM-shaped forward so the model is recognised as generative.
 
         ``interfaces_base._check_vllm_model_forward`` requires ``input_ids`` and
-        ``positions`` on ``forward``; the zoo class inherits only
+        ``positions`` on ``forward``; the transformers-mblt class inherits only
         ``nn.Module._forward_unimplemented``, so without this signature vLLM
         refuses the ``generate`` runner. The body is never reached: MbltWorker
-        replaces the model runner and drives the zoo object directly, so this
+        replaces the model runner and drives the transformers-mblt object directly, so this
         class is only ever inspected, never instantiated.
         """
         raise NotImplementedError(
-            "MbltWorker drives the mblt-model-zoo class directly; this signature exists for vLLM's capability check."
+            "MbltWorker drives the transformers-mblt class directly; this signature exists for vLLM's capability check."
         )
