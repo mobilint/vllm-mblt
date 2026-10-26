@@ -72,3 +72,21 @@ def test_top_k_top_p_runs_on_host_logits_without_triton() -> None:
     logits = torch.tensor([[1.0, 3.0, 2.0, 0.5]])
     out = topk_topp_sampler.apply_top_k_top_p(logits.clone(), torch.tensor([2]), torch.tensor([0.9]))
     assert torch.isinf(out[0, 0]) and torch.isinf(out[0, 3]) and not torch.isinf(out[0, 1])
+
+
+def test_transformers_5_vision_outputs_unpack_to_embeddings_and_deepstack() -> None:
+    # transformers 5's Qwen3-VL get_image_features returns this ModelOutput where 4.x returned
+    # ((per-image embeddings...), [deepstack per layer]).
+    import torch
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import BaseModelOutputWithDeepstackFeatures
+
+    first, second = torch.ones(2, 4), torch.full((3, 4), 2.0)
+    deepstack = [torch.zeros(5, 4), torch.ones(5, 4)]
+    output = BaseModelOutputWithDeepstackFeatures(pooler_output=(first, second), deepstack_features=deepstack)
+
+    embeds = MbltWorker._normalize_multimodal_embeddings(output)
+    assert embeds.shape == (5, 4) and embeds[2:].eq(2.0).all()
+    assert MbltWorker._extract_deepstack_embeddings(output) == deepstack
+    plain = BaseModelOutputWithDeepstackFeatures(pooler_output=(first,))
+    assert MbltWorker._normalize_multimodal_embeddings(plain) is first
+    assert MbltWorker._extract_deepstack_embeddings(plain) is None

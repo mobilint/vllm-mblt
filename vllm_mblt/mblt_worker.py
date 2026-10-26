@@ -1200,6 +1200,13 @@ class MbltWorker(WorkerBase):
         pooler_output = getattr(embeddings, "pooler_output", None)
         if isinstance(pooler_output, torch.Tensor):
             return pooler_output
+        # transformers 5 returns a ModelOutput whose pooler_output holds one tensor per image or video.
+        if isinstance(pooler_output, (list, tuple)) and pooler_output:
+            if not all(isinstance(item, torch.Tensor) for item in pooler_output):
+                raise RuntimeError(
+                    f"Unsupported multimodal pooler_output: {[type(item).__name__ for item in pooler_output]!r}"
+                )
+            return pooler_output[0] if len(pooler_output) == 1 else torch.cat(tuple(pooler_output), dim=0)
         if isinstance(embeddings, (list, tuple)) and embeddings:
             first = embeddings[0]
             if isinstance(first, torch.Tensor):
@@ -1216,12 +1223,16 @@ class MbltWorker(WorkerBase):
 
     @staticmethod
     def _extract_deepstack_embeddings(embeddings: object) -> Optional[list[torch.Tensor]]:
-        if not isinstance(embeddings, (list, tuple)) or len(embeddings) < 2:
-            return None
-        first = embeddings[0]
-        deepstack = embeddings[1]
-        if not isinstance(first, (list, tuple)):
-            return None
+        if hasattr(embeddings, "pooler_output"):
+            # transformers 5: Qwen3-VL's ModelOutput carries one tensor per deepstack layer (all items joined).
+            deepstack = getattr(embeddings, "deepstack_features", None)
+        else:
+            if not isinstance(embeddings, (list, tuple)) or len(embeddings) < 2:
+                return None
+            first = embeddings[0]
+            deepstack = embeddings[1]
+            if not isinstance(first, (list, tuple)):
+                return None
         if deepstack is None:
             return None
         if not isinstance(deepstack, (list, tuple)):
