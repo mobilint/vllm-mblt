@@ -366,12 +366,13 @@ class PrefixCacheCostModel:
             return True
         return load_ms < prefill_ms * self.margin
 
-    def should_keep_snapshot(self, *, num_tokens: int, cache_id: int | None = None) -> bool:
+    def should_keep_snapshot(self, *, num_tokens: int) -> bool:
         """Whether a snapshot of ``num_tokens`` tokens is worth saving to host memory for a later load.
 
         A later load uses at most the snapshot's ``num_tokens`` tokens, and :meth:`should_load` refuses a load
         that does not beat recomputing the tokens it brings. When the estimates say every such load would be
-        refused, saving the snapshot only costs the dump (issue #40). Before any load has been measured, a
+        refused, saving the snapshot only costs the dump (issue #40). The load can go to any slot, so the
+        cheapest measured slot is used, not the slot the snapshot sits on. Before any load has been measured, a
         measured dump stands in for it: both move the slot's whole KV buffers. Without either measurement, or
         without a prefill measurement, the snapshot is kept.
         """
@@ -382,26 +383,31 @@ class PrefixCacheCostModel:
             return False
         if not self.auto_threshold_enabled:
             return True
-        transfer_ms = self.load_ms(cache_id)
+        transfer_ms = self._min_cache_io_ms(self.load_ms_by_cache_id)
         if transfer_ms is None:
-            transfer_ms = self._cache_io_ms(self.dump_ms_by_cache_id, cache_id)
+            transfer_ms = self._min_cache_io_ms(self.dump_ms_by_cache_id)
         prefill_ms = self.max_prefill_ms(num_tokens)
         if transfer_ms is None or prefill_ms is None:
             return True
         return transfer_ms < prefill_ms * self.margin
 
     def max_prefill_ms(self, num_tokens: int) -> Optional[float]:
-        """The highest :meth:`prefill_ms` estimate for any prefix of up to ``num_tokens`` tokens.
+        """The highest :meth:`prefill_ms` estimate for any prefix of up to ``num_tokens`` tokens that may load.
 
         The estimate scales each measured bucket down linearly, so a shorter prefix can be estimated above a
         longer one that falls in the next bucket: the maximum is the estimate at ``num_tokens`` or a measured
-        bucket at or below it.
+        bucket at or below it. Buckets below the manual minimum hit length are skipped, as :meth:`should_load`
+        refuses those prefixes.
         """
         estimate = self.prefill_ms(num_tokens)
         if estimate is None:
             return None
         num_tokens = max(1, int(num_tokens))
-        return max([estimate] + [ms for tokens, ms in self.prefill_ms_by_tokens.items() if tokens <= num_tokens])
+        min_tokens = self.manual_min_hit_tokens or 1
+        return max(
+            [estimate]
+            + [ms for tokens, ms in self.prefill_ms_by_tokens.items() if min_tokens <= tokens <= num_tokens]
+        )
 
     def prefill_ms(self, matched_tokens: int) -> Optional[float]:
         if not self.prefill_ms_by_tokens:
@@ -426,6 +432,10 @@ class PrefixCacheCostModel:
         if not values:
             return None
         return statistics.median(values.values())
+
+    @staticmethod
+    def _min_cache_io_ms(values: dict[int | None, float]) -> Optional[float]:
+        return min(values.values()) if values else None
 
     def _observe_cache_io(self, values: dict[int | None, float], cache_id: int | None, elapsed_ms: float) -> None:
         elapsed_ms = max(0.0, float(elapsed_ms))
@@ -2719,7 +2729,7 @@ class MbltWorker(WorkerBase):
             # of it could beat recomputing; otherwise it is dropped, and the copy's dump is skipped (issue #40).
             cost_model = self._ensure_prefix_cache_cost_model()
             snapshot_req_id = self._snapshot_req_id(snapshot)
-            if cost_model.should_keep_snapshot(num_tokens=snapshot.num_tokens, cache_id=slot_id):
+            if cost_model.should_keep_snapshot(num_tokens=snapshot.num_tokens):
                 snapshot.blobs = snapshot_cache.copy()
                 cost_model.observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
             else:
@@ -2763,7 +2773,7 @@ class MbltWorker(WorkerBase):
         for req_id, snapshot in resident:
             if req_id in self.req_states:
                 continue
-            if cost_model.should_keep_snapshot(num_tokens=snapshot.num_tokens, cache_id=slot_id):
+            if cost_model.should_keep_snapshot(num_tokens=snapshot.num_tokens):
                 start = time.perf_counter()
                 snapshot.blobs.offload()
                 cost_model.observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)

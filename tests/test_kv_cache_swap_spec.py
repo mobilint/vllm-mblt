@@ -506,27 +506,25 @@ class TestPrefixCacheKeepSnapshot:
         assert PrefixCacheCostModel(block_size=4).should_keep_snapshot(num_tokens=8)
         cost_model = PrefixCacheCostModel(block_size=4)
         cost_model.observe_dump(0, 100.0)
-        assert cost_model.should_keep_snapshot(num_tokens=8, cache_id=0)
+        assert cost_model.should_keep_snapshot(num_tokens=8)
 
     def test_measured_dump_stands_in_for_an_unmeasured_load(self) -> None:
         cost_model = PrefixCacheCostModel(block_size=4)
         cost_model.observe_prefill(8, 10.0)
         cost_model.observe_dump(0, 100.0)
-        assert not cost_model.should_keep_snapshot(num_tokens=8, cache_id=0)
-        # Any measured slot stands in for an unmeasured one.
-        assert not cost_model.should_keep_snapshot(num_tokens=8, cache_id=3)
+        assert not cost_model.should_keep_snapshot(num_tokens=8)
         cost_model.observe_load(0, 1.0)
-        assert cost_model.should_keep_snapshot(num_tokens=8, cache_id=0)
+        assert cost_model.should_keep_snapshot(num_tokens=8)
 
     def test_agrees_with_should_load_for_the_snapshot_length(self) -> None:
         cost_model = PrefixCacheCostModel(block_size=4)
         cost_model.observe_prefill(4, 10.0)
         cost_model.observe_load(0, 8.0)
         assert cost_model.should_load(matched_tokens=4, cache_id=0)
-        assert cost_model.should_keep_snapshot(num_tokens=4, cache_id=0)
+        assert cost_model.should_keep_snapshot(num_tokens=4)
         cost_model.observe_load(0, 100.0)
         assert not cost_model.should_load(matched_tokens=4, cache_id=0)
-        assert not cost_model.should_keep_snapshot(num_tokens=4, cache_id=0)
+        assert not cost_model.should_keep_snapshot(num_tokens=4)
 
     def test_keeps_when_a_shorter_prefix_load_would_be_accepted(self) -> None:
         # prefill_ms scales buckets down linearly: 5 tokens are estimated at 100 * 5/8 = 62.5 ms, below the
@@ -537,7 +535,28 @@ class TestPrefixCacheKeepSnapshot:
         cost_model.observe_load(0, 70.0)
         assert not cost_model.should_load(matched_tokens=5, cache_id=0)
         assert cost_model.should_load(matched_tokens=4, cache_id=0)
-        assert cost_model.should_keep_snapshot(num_tokens=5, cache_id=0)
+        assert cost_model.should_keep_snapshot(num_tokens=5)
+
+    def test_keeps_when_a_load_into_another_slot_would_be_accepted(self) -> None:
+        # The snapshot sits on slot 0, whose loads are slow, but a later hit can load it into slot 1.
+        cost_model = PrefixCacheCostModel(block_size=4)
+        cost_model.observe_prefill(8, 10.0)
+        cost_model.observe_load(0, 100.0)
+        cost_model.observe_load(1, 1.0)
+        assert not cost_model.should_load(matched_tokens=8, cache_id=0)
+        assert cost_model.should_load(matched_tokens=8, cache_id=1)
+        assert cost_model.should_keep_snapshot(num_tokens=8)
+
+    def test_prefixes_below_the_manual_minimum_do_not_keep_a_snapshot(self) -> None:
+        # The 4-token bucket is expensive, but should_load refuses a 4-token prefix under a minimum of 8, and
+        # every prefix it allows costs less to recompute than to load.
+        cost_model = PrefixCacheCostModel(block_size=4, manual_min_hit_tokens=8)
+        cost_model.observe_prefill(4, 100.0)
+        cost_model.observe_prefill(8, 1.0)
+        cost_model.observe_load(0, 50.0)
+        assert not cost_model.should_load(matched_tokens=4, cache_id=0)
+        assert not cost_model.should_load(matched_tokens=8, cache_id=0)
+        assert not cost_model.should_keep_snapshot(num_tokens=8)
 
     def test_manual_minimum_hit_tokens_rejects_short_snapshots(self) -> None:
         cost_model = PrefixCacheCostModel(block_size=4, auto_threshold_enabled=False, manual_min_hit_tokens=8)
