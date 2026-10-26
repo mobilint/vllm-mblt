@@ -13,6 +13,7 @@ import torch.nn as nn
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+import vllm.v1.core.sched.output as _sched_output
 import vllm.v1.sample.ops.topk_topp_sampler as _topk_topp_sampler
 from mblt_model_zoo.hf_transformers.utils.generation_utils import MobilintGenerationMixin
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
@@ -65,6 +66,20 @@ logger = init_logger(__name__)
 # not implemented for the current platform") on hosts where a GPU driver, or an empty CUDA_VISIBLE_DEVICES, makes
 # Triton look available. Sample with vLLM's PyTorch implementation, as vLLM 0.11 always did.
 _topk_topp_sampler.HAS_TRITON = False
+
+
+def _keep_covered_mm_data(
+    mm_features: list[MultiModalFeatureSpec], num_computed_tokens: int, uses_mrope: bool = False
+) -> list[MultiModalFeatureSpec]:
+    del num_computed_tokens, uses_mrope
+    return mm_features
+
+
+# vLLM 0.32's scheduler drops the tensor data of a new request's multimodal items that its prefix cache covers,
+# because a GPU worker never re-encodes them. This worker keeps its own, smaller set of prefix snapshots and rebuilds
+# the whole prompt's embeddings for every new request, recomputing a prefix it does not hold; a repeated image or
+# audio clip then arrived without its data. Send the items whole, as vLLM 0.11 did.
+_sched_output.strip_covered_mm_data = _keep_covered_mm_data
 
 
 _TRUE_ENV_VALUES = frozenset({"1", "true", "TRUE", "True"})
@@ -1412,7 +1427,7 @@ class MbltWorker(WorkerBase):
                     raise RuntimeError("Audio multimodal feature is missing input_features.")
                 feature_attention_mask = self._extract_multimodal_value(feature, "feature_attention_mask")
                 if feature_attention_mask is None:
-                    # qwen_asr's get_audio_features() falls back to feature_attention_mask.sum(-1) when the
+                    # Qwen3-ASR's get_audio_features() falls back to feature_attention_mask.sum(-1) when the
                     # mask is None, so a missing mask would surface as an AttributeError.
                     raise RuntimeError(
                         "Audio multimodal feature is missing feature_attention_mask; the feature "

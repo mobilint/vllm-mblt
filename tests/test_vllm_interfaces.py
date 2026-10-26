@@ -102,3 +102,20 @@ def test_single_worker_engines_run_in_process(world_size, backend, expected) -> 
     MbltPlatform.check_and_update_config(config)
 
     assert config.parallel_config.distributed_executor_backend == expected
+
+
+def test_new_requests_keep_the_data_of_prefix_cached_multimodal_items() -> None:
+    """vLLM 0.32 strips covered items for GPU workers; this worker re-embeds the whole prompt, so it keeps them."""
+    import vllm.v1.core.sched.output as sched_output
+    from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+
+    import vllm_mblt.mblt_worker  # noqa: F401
+
+    feature = MultiModalFeatureSpec(
+        data={"input_features": object()},
+        modality="audio",
+        identifier="clip",
+        mm_position=PlaceholderRange(offset=1, length=4),
+    )
+
+    assert sched_output.strip_covered_mm_data([feature], num_computed_tokens=16) == [feature]
