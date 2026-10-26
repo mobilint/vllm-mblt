@@ -7,6 +7,7 @@ import pytest
 from vllm.platforms.interface import Platform
 from vllm.v1.worker.worker_base import CompilationTimes
 
+from tests.test_mblt_platform_prefill import _make_vllm_config
 from vllm_mblt.mblt_platform import MbltPlatform
 from vllm_mblt.mblt_worker import MbltWorker
 
@@ -44,3 +45,14 @@ def test_supported_kv_cache_layouts_need_no_attention_backend() -> None:
     layouts = worker.get_supported_kv_cache_layouts()
 
     assert layouts and all(isinstance(name, str) for name in layouts)
+
+
+def test_async_scheduling_is_turned_off() -> None:
+    # vLLM 0.32 enables it by default; the engine would then call sample_tokens(), which this worker leaves
+    # unimplemented because execute_model() already samples.
+    config = _make_vllm_config(64)
+    config.scheduler_config.async_scheduling = True
+
+    MbltPlatform.check_and_update_config(config)
+
+    assert config.scheduler_config.async_scheduling is False

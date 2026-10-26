@@ -459,6 +459,13 @@ class MbltPlatform(Platform):
         cls._serving_eagle3 = _is_eagle3_hf_config(_get_hf_config(vllm_config))
         cls._prepare_data_parallel(vllm_config)
 
+        # vLLM 0.32 turns async scheduling on by default. The engine then takes each step's result from a separate
+        # sample_tokens() call, while this worker samples inside execute_model() and returns the whole output there.
+        scheduler_config = vllm_config.scheduler_config
+        if getattr(scheduler_config, "async_scheduling", False):
+            logger.info("Disabling async scheduling: the MBLT worker samples inside execute_model().")
+            scheduler_config.async_scheduling = False
+
         cache_config: CacheConfig = vllm_config.cache_config
         # Keep user-provided value if present. Otherwise, use a smaller block
         # so prefix cache can hit on realistic system prompts.
