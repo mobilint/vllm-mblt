@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.logprobs import Logprob
 from vllm.model_executor import model_loader
 from vllm.sampling_params import SamplingParams

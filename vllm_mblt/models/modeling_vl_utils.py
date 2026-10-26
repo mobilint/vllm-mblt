@@ -1,85 +1,11 @@
-from collections.abc import Mapping
-from typing import Any, cast
-
-from vllm.multimodal.inputs import MultiModalKwargsItems, MultiModalUUIDDict
-from vllm.multimodal.parse import MultiModalDataItems
-from vllm.multimodal.processing import MultiModalProcessingInfo
+import vllm.model_executor.models.interfaces as _vllm_interfaces
+from vllm.multimodal.registry import _ProcessorFactories
 
 QWEN3_VL_MAX_VISION_TOKENS = 4096
 
-
-class MobilintVLCachedProcessorMixin:
-    """Shared Mobilint VL workaround for full multimodal cache hits.
-
-    vLLM's Qwen2-VL/Qwen3-VL cached processor path processes only
-    cache-missing multimodal items. When every image/video item is already
-    cached, the missing-item set is empty and the generated dummy text can be
-    empty. Mobilint VL processors expect a valid prompt, so on a full cache hit
-    we tokenize the real prompt only and merge cached multimodal kwargs/prompt
-    updates without invoking the HF processor on empty multimodal data.
-    """
-
-    def _cached_apply_hf_processor(
-        self,
-        prompt: str | list[int],
-        mm_data_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-        *,
-        mm_uuids: MultiModalUUIDDict | None = None,
-    ) -> tuple[list[int], MultiModalProcessingInfo, bool]:
-        processor = cast(Any, self)
-        cache = processor.cache
-
-        _, passthrough_data = processor._get_hf_mm_data(mm_data_items)
-        if cache is None or passthrough_data:
-            return processor._apply_hf_processor(
-                prompt=prompt,
-                mm_data_items=mm_data_items,
-                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-                tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
-            )
-
-        mm_hashes = processor._hash_mm_items(
-            mm_data_items,
-            hf_processor_mm_kwargs,
-            tokenization_kwargs,
-            mm_uuids=mm_uuids,
-        )
-        mm_missing_data_items = processor._get_cache_missing_items(
-            cache=cache,
-            mm_data_items=mm_data_items,
-            mm_hashes=mm_hashes,
-        )
-
-        if not any(mm_missing_data_items.get_all_counts().values()):
-            if isinstance(prompt, str):
-                prompt_ids = processor._apply_hf_processor_text_only(
-                    prompt,
-                    tokenization_kwargs,
-                )
-            else:
-                prompt_ids = processor._apply_hf_processor_tokens_only(prompt)
-
-            mm_kwargs, mm_prompt_updates = processor._merge_mm_kwargs(
-                cache,
-                mm_hashes=mm_hashes,
-                mm_missing_kwargs=MultiModalKwargsItems({}),
-                mm_missing_prompt_updates={},
-            )
-            mm_info = MultiModalProcessingInfo(
-                kwargs=mm_kwargs,
-                hashes=mm_hashes,
-                prompt_updates=mm_prompt_updates,
-            )
-
-            return prompt_ids, mm_info, False
-
-        return cast(Any, super())._cached_apply_hf_processor(
-            prompt=prompt,
-            mm_data_items=mm_data_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-            mm_uuids=mm_uuids,
-        )
+# transformers 5 evaluates every class annotation with get_type_hints when a PreTrainedModel subclass is created.
+# Our multimodal models also inherit vLLM's SupportsMultiModal, whose `_processor_factory` annotation names
+# `_ProcessorFactories`, a type vLLM imports only under TYPE_CHECKING. Bind it in that module so the annotation
+# resolves; import this module before defining a model class that mixes in SupportsMultiModal.
+if not hasattr(_vllm_interfaces, "_ProcessorFactories"):
+    _vllm_interfaces._ProcessorFactories = _ProcessorFactories

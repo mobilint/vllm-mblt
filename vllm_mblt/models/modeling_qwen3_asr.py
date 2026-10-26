@@ -21,11 +21,12 @@ from qwen_asr.core.transformers_backend.processing_qwen3_asr import (
 )
 from transformers import BatchFeature
 from vllm.config import ModelConfig, SpeechToTextConfig
+from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs.llm import MultiModalDataDict
 from vllm.model_executor.models import VllmModelForTextGeneration
 from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsTranscription
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -37,7 +38,9 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder, BaseDummyOptions
+from vllm.multimodal.processing.dummy_inputs import BaseDummyInputsBuilder
+
+import vllm_mblt.models.modeling_vl_utils  # noqa: F401  (resolves SupportsMultiModal's annotation for transformers 5)
 
 # One clip per request: the transcription endpoint sends one per chunk, and chat requests with
 # more are refused with a 400. This is a serving choice; the worker encodes each clip on its own.

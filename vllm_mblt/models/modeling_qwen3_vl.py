@@ -15,10 +15,7 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from vllm_mblt.models.modeling_vl_utils import (
-    QWEN3_VL_MAX_VISION_TOKENS,
-    MobilintVLCachedProcessorMixin,
-)
+from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
 
 
 class MobilintQwen3VLSafeProcessor(MobilintQwen3VLProcessor):
@@ -104,15 +101,8 @@ class MobilintQwen3VLProcessingInfo(Qwen3VLProcessingInfo):
         )
 
 
-class MobilintQwen3VLMultiModalProcessor(
-    MobilintVLCachedProcessorMixin,
-    Qwen3VLMultiModalProcessor,
-):
-    pass
-
-
 @MULTIMODAL_REGISTRY.register_processor(
-    MobilintQwen3VLMultiModalProcessor,
+    Qwen3VLMultiModalProcessor,
     info=MobilintQwen3VLProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
