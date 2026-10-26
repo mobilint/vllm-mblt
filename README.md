@@ -459,13 +459,16 @@ event tracer, so you can see where time actually goes on the accelerator. It is
 wired into vLLM's standard worker profiler hook, which means the usual controls
 apply -- there is no MBLT-specific flag or endpoint.
 
-Set `VLLM_TORCH_PROFILER_DIR` to a directory before starting the server. This is
-the switch: without it the OpenAI server does not register the profile routes,
-and the worker reports that tracing is not enabled.
+Start the server with vLLM's profiler config pointing at a directory. This is
+the switch: without `--profiler-config.profiler` the OpenAI server does not
+register the profile routes, and without `torch_profiler_dir` the worker reports
+that tracing is not enabled. vLLM accepts the directory only with
+`profiler=torch`; that also turns on its own front-end CPU trace (below).
 
 ```bash
-export VLLM_TORCH_PROFILER_DIR=/tmp/mblt_traces
-vllm serve mobilint/Llama-3.2-1B-Instruct --trust-remote-code
+vllm serve mobilint/Llama-3.2-1B-Instruct --trust-remote-code \
+  --profiler-config.profiler=torch \
+  --profiler-config.torch_profiler_dir=/tmp/mblt_traces
 ```
 
 Then bracket the work you care about:
@@ -491,8 +494,8 @@ spans -- `infer`, `run npu`, `copy to npu`, `lock core`, `read device` and the
 like -- so a window shows what each inference step spent on the accelerator.
 
 vLLM writes its own front-end CPU trace (`*.async_llm.*.pt.trace.json.gz`) into
-the same directory, because `VLLM_TORCH_PROFILER_DIR` also enables the API
-server's `AsyncLLM` profiler. The two are complementary: that file covers
+the same directory, because `--profiler-config.profiler=torch` also enables the
+API server's `AsyncLLM` profiler. The two are complementary: that file covers
 CPU-side scheduling, the MBLT file covers NPU execution.
 
 Notes:

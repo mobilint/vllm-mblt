@@ -52,7 +52,7 @@ from vllm_mblt.runtime_cache import (
     first_seq_blocks,
     normalize_block_ids,
 )
-from vllm_mblt.tracing import TRACE_DIR_ENV_VAR, MbltTracer, resolve_trace_dir
+from vllm_mblt.tracing import TRACE_ENABLE_HINT, MbltTracer, resolve_trace_dir
 
 logger = init_logger(__name__)
 
@@ -3445,16 +3445,15 @@ class MbltWorker(WorkerBase):
 
     def _get_tracer(self) -> MbltTracer:
         if self._tracer is None:
-            trace_dir = resolve_trace_dir()
+            trace_dir = resolve_trace_dir(getattr(self.vllm_config, "profiler_config", None))
             if trace_dir is None:
                 raise RuntimeError(
-                    f"NPU event tracing is not enabled. Set {TRACE_DIR_ENV_VAR} to a directory "
-                    "before starting the server to enable it."
+                    f"NPU event tracing is not enabled. Start the server with {TRACE_ENABLE_HINT} to enable it."
                 )
             self._tracer = MbltTracer(trace_dir, rank=self.rank)
         return self._tracer
 
-    def profile(self, is_start: bool = True) -> None:
+    def profile(self, is_start: bool = True, profile_prefix: Optional[str] = None, **_unused: object) -> None:
         """Start or stop an NPU event trace.
 
         vLLM's `Executor.profile()` reaches every worker through
@@ -3473,6 +3472,10 @@ class MbltWorker(WorkerBase):
         be written, the caller hears about it rather than being told the
         profile succeeded and finding no trace on disk. A repeated start or a
         stop with nothing running is not a failure and only logs.
+
+        ``profile_prefix`` and vLLM 0.32's ``delay_iterations`` / ``max_iterations`` are accepted for the
+        hook's signature and not used: the trace file is named by rank and time (`tracing.trace_filename`), and
+        a qbruntime trace runs from start to stop.
         """
         tracer = self._get_tracer()
         if is_start:
