@@ -13,6 +13,7 @@ import torch.nn as nn
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+import vllm.v1.sample.ops.topk_topp_sampler as _topk_topp_sampler
 from mblt_model_zoo.hf_transformers.utils.generation_utils import MobilintGenerationMixin
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 from transformers_mblt.utils.cache_utils import MobilintCache, MobilintDeepStackCache
@@ -57,6 +58,12 @@ from vllm_mblt.runtime_cache import (
 from vllm_mblt.tracing import TRACE_ENABLE_HINT, MbltTracer, resolve_trace_dir
 
 logger = init_logger(__name__)
+
+# vLLM 0.32 applies top-k/top-p with a Triton kernel whenever Triton reports a usable driver (HAS_TRITON), whatever
+# device the logits are on. Here the logits are always host tensors, and that path fails ("num_compute_units is
+# not implemented for the current platform") on hosts where a GPU driver, or an empty CUDA_VISIBLE_DEVICES, makes
+# Triton look available. Sample with vLLM's PyTorch implementation, as vLLM 0.11 always did.
+_topk_topp_sampler.HAS_TRITON = False
 
 
 _TRUE_ENV_VALUES = frozenset({"1", "true", "TRUE", "True"})

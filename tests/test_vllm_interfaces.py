@@ -61,3 +61,14 @@ def test_async_scheduling_is_turned_off() -> None:
 def test_sampling_helpers_compile_without_a_host_toolchain() -> None:
     # vLLM's prompt-logprob rank count is torch.compile'd with this backend; inductor needs a working C++ toolchain.
     assert MbltPlatform.simple_compile_backend == "eager"
+
+
+def test_top_k_top_p_runs_on_host_logits_without_triton() -> None:
+    # The worker module turns vLLM's Triton top-k/top-p path off: the logits are host tensors.
+    import torch
+    import vllm.v1.sample.ops.topk_topp_sampler as topk_topp_sampler
+
+    assert topk_topp_sampler.HAS_TRITON is False
+    logits = torch.tensor([[1.0, 3.0, 2.0, 0.5]])
+    out = topk_topp_sampler.apply_top_k_top_p(logits.clone(), torch.tensor([2]), torch.tensor([0.9]))
+    assert torch.isinf(out[0, 0]) and torch.isinf(out[0, 3]) and not torch.isinf(out[0, 1])
