@@ -1917,9 +1917,16 @@ class MbltWorker(WorkerBase):
         results = []
         for row, length in enumerate(lengths):
             # With ``logits_to_keep=0`` the forward returns each row's own positions from column 0 (padding dropped by
-            # the mask). Copies, so what a row keeps does not hold the whole batched output alive.
+            # the mask). Copies, so what a row keeps does not hold the whole batched output alive. With
+            # ``logits_to_keep=1`` the output is one row per request, which the forward allocates for this call, so
+            # each row keeps a view of it: copying every row costs about 10 ms per 48-row step on a 152k vocabulary.
             sequence = logits[row, :length].copy() if keep_all and keep_sequence_logits[row] else None
-            last_token = sequence[-1] if sequence is not None else logits[row, length - 1 if keep_all else 0].copy()
+            if sequence is not None:
+                last_token = sequence[-1]
+            elif keep_all:
+                last_token = logits[row, length - 1].copy()
+            else:
+                last_token = logits[row, 0]
             results.append(InferenceLogits(last_token_logits=last_token, full_sequence_logits=sequence))
         return results
 
