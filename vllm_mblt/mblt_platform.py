@@ -367,9 +367,12 @@ class MbltPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_type = "cpu"
     device_name = "cpu"
-    # With --data-parallel-size N, vLLM gives each engine process its own entry of this variable (the parent's list,
-    # or 0..N-1 when unset), so every EngineCore sees one card.
+    # With --data-parallel-size N, vLLM 0.32 records each engine's entry of this variable (the parent's list, or
+    # 0..N-1 when unset) in parallel_config.assigned_physical_gpu_ids; the worker narrows the variable to it.
     device_control_env_var = QBRUNTIME_VISIBLE_DEVICES_ENV
+    # vLLM compiles small sampling helpers (e.g. the logprob rank count) with this backend. The sampling runs on the
+    # host; inductor would compile C++ at runtime and fail the engine where the host toolchain is unusable.
+    simple_compile_backend = "eager"
     # The data parallel engines all-reduce their unfinished-request state over a CPU process group.
     dist_backend = "gloo"
     # Whether the engine configured last in this process serves EAGLE-3; validate_request's fallback.

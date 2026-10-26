@@ -56,3 +56,8 @@ def test_async_scheduling_is_turned_off() -> None:
     MbltPlatform.check_and_update_config(config)
 
     assert config.scheduler_config.async_scheduling is False
+
+
+def test_sampling_helpers_compile_without_a_host_toolchain() -> None:
+    # vLLM's prompt-logprob rank count is torch.compile'd with this backend; inductor needs a working C++ toolchain.
+    assert MbltPlatform.simple_compile_backend == "eager"
