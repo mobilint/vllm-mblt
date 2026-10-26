@@ -67,6 +67,19 @@ def _coerce_dev_no_list(key: str, value: object) -> list[int] | None:
     return None
 
 
+def _visible_card_list(visible: str) -> list[int]:
+    """``QBRUNTIME_VISIBLE_DEVICES`` as distinct non-negative card numbers; reject anything else."""
+    cards = []
+    for entry in visible.split(","):
+        entry = entry.strip()
+        if not entry.isdigit():
+            raise ValueError(f"{QBRUNTIME_VISIBLE_DEVICES_ENV} must list non-negative card numbers, got {visible!r}.")
+        cards.append(int(entry))
+    if len(set(cards)) != len(cards):
+        raise ValueError(f"{QBRUNTIME_VISIBLE_DEVICES_ENV} lists a card more than once: {visible!r}.")
+    return cards
+
+
 def data_parallel_card_list(placement_kwargs: Mapping[str, object]) -> list[int] | None:
     """The cards the data parallel ranks use, from the ``dev_no`` placement kwargs.
 
@@ -116,7 +129,7 @@ def export_card_list_for_ranks(
         return cards
     visible = environ.get(QBRUNTIME_VISIBLE_DEVICES_ENV, "")
     if cards is None:
-        if visible and len(visible.split(",")) < local_data_parallel_size:
+        if visible and len(_visible_card_list(visible)) < local_data_parallel_size:
             raise ValueError(
                 f"{QBRUNTIME_VISIBLE_DEVICES_ENV}={visible!r} lists fewer cards than the "
                 f"{local_data_parallel_size} local data parallel engines."

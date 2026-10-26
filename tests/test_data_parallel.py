@@ -174,6 +174,15 @@ class TestCardList:
         with pytest.raises(ValueError, match="fewer cards"):
             export_card_list_for_ranks({}, local_data_parallel_size=3, environ={QBRUNTIME_VISIBLE_DEVICES_ENV: "0,1"})
 
+    def test_env_list_naming_a_card_twice_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="more than once"):
+            export_card_list_for_ranks({}, local_data_parallel_size=2, environ={QBRUNTIME_VISIBLE_DEVICES_ENV: "0,0"})
+
+    @pytest.mark.parametrize("visible", ["0,-1", "0,a", "0,,1"])
+    def test_env_list_with_a_non_card_entry_is_refused(self, visible: str) -> None:
+        with pytest.raises(ValueError, match="non-negative card numbers"):
+            export_card_list_for_ranks({}, local_data_parallel_size=2, environ={QBRUNTIME_VISIBLE_DEVICES_ENV: visible})
+
     def test_no_placement_keeps_vllm_rank_numbering(self) -> None:
         environ: dict[str, str] = {}
         assert export_card_list_for_ranks({}, local_data_parallel_size=3, environ=environ) is None
