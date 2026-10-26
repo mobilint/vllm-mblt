@@ -115,6 +115,19 @@ def test_per_position_logits_come_back_only_for_rows_that_ask_on_a_full_logits_m
     assert plain.last_token_logits.base is None and echo.full_sequence_logits.base is None
 
 
+def test_last_token_rows_are_views_of_the_forward_output_not_copies() -> None:
+    # One row per request is exactly what the rows keep, so copying each one only costs time.
+    worker = _make_worker(max_batch_size=4)
+    _activate(worker, "a", 0, 0)
+    _activate(worker, "b", 1, 0)
+
+    a, b = worker._infer_logits_batch([np.ones((2, 3), dtype=np.float32)] * 2, cache_sizes=[0, 0], cache_ids=[0, 1])
+
+    assert a.base is not None and np.shares_memory(a.base, b)
+    assert not np.shares_memory(a, b)
+    assert a.tolist()[:2] == [0.0, 1.0] and b.tolist()[:2] == [1.0, 1.0]
+
+
 def test_last_token_logits_only_on_a_last_logit_mxq_even_when_asked() -> None:
     worker = _make_worker(max_batch_size=1)
     _activate(worker, "echo", None, 0)
