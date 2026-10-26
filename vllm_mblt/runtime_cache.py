@@ -124,6 +124,8 @@ class MbltRuntimeCacheManager:
         self.req_to_slot: dict[str, int] = {}
         self.slot_to_req: dict[int, str] = {}
         self.free_slots: list[int] = []
+        # Which card (cache MXQ) a slot runs on; ``None`` treats every slot as one card.
+        self.slot_card: Callable[[int], int] | None = None
         self.reset_slots(max_batch_size=self.max_batch_size)
 
     @property
@@ -147,9 +149,17 @@ class MbltRuntimeCacheManager:
     def free_cache_slots(self) -> list[int]:
         return self.free_slots
 
-    def reset_slots(self, *, max_batch_size: int | None = None) -> None:
+    def reset_slots(
+        self,
+        *,
+        max_batch_size: int | None = None,
+        slot_card: Callable[[int], int] | None = None,
+    ) -> None:
+        """Free every slot. ``slot_card`` maps a slot to the card it runs on; omitted, the previous mapping stays."""
         if max_batch_size is not None:
             self.max_batch_size = max(0, int(max_batch_size))
+        if slot_card is not None:
+            self.slot_card = slot_card
         self.req_to_slot = {}
         self.slot_to_req = {}
         self.free_slots = list(range(self.max_batch_size))
@@ -191,6 +201,11 @@ class MbltRuntimeCacheManager:
         return slot_id
 
     def assign_slot(self, req_id: str) -> int:
+        """Give ``req_id`` a free slot on the card running the fewest requests, the lowest slot among ties.
+
+        From empty this assigns slots 0, 1, 2, ... in order, which the round-robin slot layout spreads over the
+        cards; after releases it keeps the cards balanced instead of reusing the lowest free slot wherever it is.
+        """
         existing_slot = self.req_to_slot.get(req_id)
         if existing_slot is not None:
             return existing_slot
@@ -199,10 +214,20 @@ class MbltRuntimeCacheManager:
                 "No free accelerator cache slots remain for batch execution. "
                 f"req_id={req_id}, max_batch_size={self.max_batch_size}"
             )
-        slot_id = self.free_slots.pop(0)
+        slot_id = self._least_loaded_free_slot()
+        self.free_slots.remove(slot_id)
         self.req_to_slot[req_id] = slot_id
         self.slot_to_req[slot_id] = req_id
         return slot_id
+
+    def _least_loaded_free_slot(self) -> int:
+        if self.slot_card is None:
+            return self.free_slots[0]
+        card_load: dict[int, int] = {}
+        for slot_id in self.slot_to_req:
+            card = self.slot_card(slot_id)
+            card_load[card] = card_load.get(card, 0) + 1
+        return min(self.free_slots, key=lambda slot_id: (card_load.get(self.slot_card(slot_id), 0), slot_id))
 
     def release_slot(self, req_id: str) -> None:
         slot_id = self.req_to_slot.pop(req_id, None)
