@@ -380,6 +380,10 @@ vllm serve mobilint/Qwen3-0.6B \
   gloo group every 32 steps. An idle engine waits about one of its recent model steps per wave step instead of
   running the model, so it neither spins a CPU core nor blocks early at that all-reduce.
 - `--data-parallel-size 1` (the default) serves exactly as before.
+- vLLM's data parallel front end exchanges requests through shared memory (`/dev/shm`). A three-engine serve
+  allocates 160 MiB there, more than a container's default 64 MiB, and engine start-up then fails with
+  "Insufficient space in /dev/shm". Give the container more, e.g. `docker run --shm-size 1g` or `--ipc=host`.
+  vLLM 0.32 also starts one API server process per engine by default (`--api-server-count`).
 
 ### Host CPU Threads
 
