@@ -23,6 +23,11 @@ QBRUNTIME_VISIBLE_DEVICES_ENV = "QBRUNTIME_VISIBLE_DEVICES"
 # starts. vLLM sets QBRUNTIME_VISIBLE_DEVICES to one card in each engine process, and the platform config hook runs
 # there again; the marker tells that run the assignment was already checked and exported.
 DATA_PARALLEL_CARDS_CHECKED_ENV = "VLLM_MBLT_DATA_PARALLEL_CARDS_CHECKED"
+# The ``additional_config`` entry where the front end records the data parallel layout for the engine processes.
+# vLLM 0.32 reconfigures each rank of a dense (non-MoE) model as an independent engine before its worker starts:
+# ``data_parallel_size`` and ``data_parallel_size_local`` become 1, and only ``data_parallel_rank_local`` and
+# ``data_parallel_index`` keep the rank. The worker reads the layout from here instead.
+DATA_PARALLEL_LAYOUT_KEY = "mblt_data_parallel"
 
 # The NPU role prefixes a Mobilint release can use; "" is the single-backend model.
 NPU_ROLE_PREFIXES = (
@@ -150,8 +155,36 @@ def export_card_list_for_ranks(
     return cards
 
 
+def record_data_parallel_layout(vllm_config: Any, *, size: int, size_local: int) -> None:
+    """Record the data parallel layout in ``vllm_config.additional_config``, which vLLM hands to every engine.
+
+    A non-dict ``additional_config`` (a user's own config object) is left alone.
+    """
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if isinstance(additional_config, dict):
+        additional_config[DATA_PARALLEL_LAYOUT_KEY] = {"size": size, "size_local": size_local}
+
+
+def data_parallel_layout(vllm_config: Any) -> tuple[int, int]:
+    """The data parallel size and the number of engines on this host, as the engines were started.
+
+    The parallel config answers while it still holds the layout (in the front end, and in each rank of an MoE
+    model); otherwise the layout the front end recorded does. A single engine is ``(1, 1)``.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    size = getattr(parallel_config, "data_parallel_size", 1) or 1
+    if size > 1:
+        size_local = getattr(parallel_config, "data_parallel_size_local", None)
+        return size, size_local if isinstance(size_local, int) and size_local >= 1 else size
+    additional_config = getattr(vllm_config, "additional_config", None)
+    recorded = additional_config.get(DATA_PARALLEL_LAYOUT_KEY) if isinstance(additional_config, dict) else None
+    if isinstance(recorded, dict):
+        return int(recorded["size"]), int(recorded["size_local"])
+    return 1, 1
+
+
 def narrow_visible_devices_to_rank_card(
-    parallel_config: object,
+    vllm_config: Any,
     *,
     environ: MutableMapping[str, str] | None = None,
 ) -> int | None:
@@ -164,9 +197,9 @@ def narrow_visible_devices_to_rank_card(
     or ``None`` for a single engine or when vLLM assigned none.
     """
     environ = os.environ if environ is None else environ
-    if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
+    if data_parallel_layout(vllm_config)[0] <= 1:
         return None
-    assigned = getattr(parallel_config, "assigned_physical_gpu_ids", None)
+    assigned = getattr(getattr(vllm_config, "parallel_config", None), "assigned_physical_gpu_ids", None)
     if not assigned:
         return None
     if len(assigned) != 1:

@@ -14,6 +14,7 @@ from vllm_mblt.data_parallel import (
     QBRUNTIME_VISIBLE_DEVICES_ENV,
     collect_placement_kwargs,
     export_card_list_for_ranks,
+    record_data_parallel_layout,
 )
 
 logger = init_logger(__name__)
@@ -451,6 +452,7 @@ class MbltPlatform(Platform):
         if data_parallel_size <= 1:
             return
         local_size = _coerce_positive_int(getattr(parallel_config, "data_parallel_size_local", None))
+        record_data_parallel_layout(vllm_config, size=data_parallel_size, size_local=local_size or data_parallel_size)
         cards = export_card_list_for_ranks(
             collect_placement_kwargs(_get_model_loader_extra_config(vllm_config)),
             local_data_parallel_size=local_size or data_parallel_size,
@@ -467,9 +469,9 @@ class MbltPlatform(Platform):
         parallel_config: ParallelConfig = vllm_config.parallel_config  # type: ignore
         parallel_config.worker_cls = "vllm_mblt.mblt_worker.MbltWorker"
         # vLLM 0.32 defaults data parallel engines to the multiprocessing executor, which runs the worker in its own
-        # process and gives it OMP_NUM_THREADS = all of the host's CPUs; three engines then oversubscribed 16 cores
-        # and stepped 9x slower. Each engine here has one worker (no tensor or pipeline parallelism), so run it in
-        # the engine process as vLLM 0.11 did; vLLM then splits the host's CPUs among the local engines itself.
+        # process and gives it OMP_NUM_THREADS = all of the host's CPUs, so several engines oversubscribe the host.
+        # Each engine here has one worker (no tensor or pipeline parallelism), so run it in the engine process as
+        # vLLM 0.11 did; vLLM then splits the host's CPUs among the local engines itself.
         if (
             getattr(parallel_config, "world_size", 1) == 1
             and getattr(parallel_config, "distributed_executor_backend", None) == "mp"

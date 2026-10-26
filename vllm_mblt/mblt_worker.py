@@ -32,6 +32,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_mblt.data_parallel import (
     IdleStepPacer,
+    data_parallel_layout,
     narrow_visible_devices_to_rank_card,
     place_model_kwargs_on_card,
     resolve_rank_card,
@@ -3165,7 +3166,7 @@ class MbltWorker(WorkerBase):
 
     def init_device(self) -> None:
         self._log_init_stage("init_device")
-        narrow_visible_devices_to_rank_card(getattr(self.vllm_config, "parallel_config", None))
+        narrow_visible_devices_to_rank_card(self.vllm_config)
         apply_engine_host_thread_defaults(self.vllm_config)
         return
 
@@ -3174,9 +3175,9 @@ class MbltWorker(WorkerBase):
 
         A single engine (data parallel size 1) keeps the kwargs as given.
         """
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
+        if data_parallel_layout(self.vllm_config)[0] <= 1:
             return model_kwargs
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
         local_rank = getattr(parallel_config, "data_parallel_rank_local", None) or 0
         card = resolve_rank_card(model_kwargs, local_rank=local_rank)
         device_number = runtime_device_number(card)

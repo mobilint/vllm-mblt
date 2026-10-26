@@ -8,13 +8,16 @@ import pytest
 from vllm_mblt import data_parallel
 from vllm_mblt.data_parallel import (
     DATA_PARALLEL_CARDS_CHECKED_ENV,
+    DATA_PARALLEL_LAYOUT_KEY,
     QBRUNTIME_VISIBLE_DEVICES_ENV,
     IdleStepPacer,
     collect_placement_kwargs,
+    data_parallel_layout,
     export_card_list_for_ranks,
     narrow_visible_devices_to_rank_card,
     npu_roles,
     place_model_kwargs_on_card,
+    record_data_parallel_layout,
     resolve_rank_card,
     runtime_device_number,
 )
@@ -75,7 +78,14 @@ class TestPlatform:
                 data_parallel_size_local=data_parallel_size_local or data_parallel_size,
             ),
             load_config=SimpleNamespace(model_loader_extra_config=extra_config),
+            additional_config={},
         )
+
+    def test_front_end_records_the_layout_for_the_engines(self, monkeypatch) -> None:
+        monkeypatch.delenv(QBRUNTIME_VISIBLE_DEVICES_ENV, raising=False)
+        config = self._vllm_config({}, data_parallel_size=4, data_parallel_size_local=2)
+        MbltPlatform._prepare_data_parallel(config)
+        assert config.additional_config[DATA_PARALLEL_LAYOUT_KEY] == {"size": 4, "size_local": 2}
 
     def test_dev_no_list_becomes_the_rank_card_list(self, monkeypatch) -> None:
         monkeypatch.delenv(QBRUNTIME_VISIBLE_DEVICES_ENV, raising=False)
@@ -90,7 +100,8 @@ class TestPlatform:
     @pytest.mark.parametrize("extra_config", [{"dev_no": [0, 1, 2]}, {}], ids=["dev_no_list", "rank_numbering"])
     def test_front_end_to_engine_flow_loads_each_rank_on_dev_no_zero(self, monkeypatch, extra_config) -> None:
         """The front end checks and exports the cards; vLLM starts each engine with its card; the engine's config
-        hook runs again and its worker loads every role on dev_no 0."""
+        hook runs again; vLLM reconfigures the dense model's rank as an independent engine; and its worker loads
+        every role on dev_no 0."""
         import vllm.v1.engine.utils as engine_utils
 
         from tests.test_eagle3 import _FakeEagle3Model
@@ -126,12 +137,15 @@ class TestPlatform:
             worker.vllm_config = SimpleNamespace(
                 load_config=worker.load_config,
                 model_config=worker.model_config,
+                # reconfigure_for_independent_dp_rank() leaves only the local rank and the card assignment.
                 parallel_config=SimpleNamespace(
-                    data_parallel_size=3,
-                    data_parallel_rank=rank,
+                    data_parallel_size=1,
+                    data_parallel_size_local=1,
+                    data_parallel_rank=0,
                     data_parallel_rank_local=rank,
                     assigned_physical_gpu_ids=launch_config.parallel_config.assigned_physical_gpu_ids,
                 ),
+                additional_config=front_end_config.additional_config,
             )
             worker._log_init_stage = lambda *args, **kwargs: None
             worker.init_device()
@@ -251,9 +265,52 @@ class TestRankCard:
             resolve_rank_card({"dev_no": [0, 1]}, local_rank=2, environ={})
 
 
+class TestDataParallelLayout:
+    def test_parallel_config_answers_while_it_holds_the_layout(self) -> None:
+        config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4, data_parallel_size_local=2))
+        assert data_parallel_layout(config) == (4, 2)
+
+    def test_independent_rank_reads_the_recorded_layout(self) -> None:
+        # vLLM 0.32 reconfigures each rank of a dense model as a single engine before the worker starts.
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=3, data_parallel_size_local=3), additional_config={}
+        )
+        record_data_parallel_layout(config, size=3, size_local=3)
+        config.parallel_config.data_parallel_size = config.parallel_config.data_parallel_size_local = 1
+        assert data_parallel_layout(config) == (3, 3)
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1), additional_config={}),
+            SimpleNamespace(parallel_config=SimpleNamespace()),
+            SimpleNamespace(),
+        ],
+    )
+    def test_single_engine(self, config) -> None:
+        assert data_parallel_layout(config) == (1, 1)
+
+    def test_non_dict_additional_config_is_left_alone(self) -> None:
+        additional_config = object()
+        config = SimpleNamespace(additional_config=additional_config)
+        record_data_parallel_layout(config, size=3, size_local=3)
+        assert config.additional_config is additional_config
+
+
 class TestNarrowVisibleDevices:
     def _parallel_config(self, *, size: int, assigned):
-        return SimpleNamespace(data_parallel_size=size, assigned_physical_gpu_ids=assigned)
+        return SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=size, assigned_physical_gpu_ids=assigned)
+        )
+
+    def test_independent_rank_writes_the_assigned_card(self) -> None:
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1, assigned_physical_gpu_ids=[1]),
+            additional_config={DATA_PARALLEL_LAYOUT_KEY: {"size": 3, "size_local": 3}},
+        )
+        environ = {QBRUNTIME_VISIBLE_DEVICES_ENV: "0,1,2"}
+        assert narrow_visible_devices_to_rank_card(config, environ=environ) == 1
+        assert environ[QBRUNTIME_VISIBLE_DEVICES_ENV] == "1"
 
     def test_writes_the_assigned_card(self) -> None:
         environ = {QBRUNTIME_VISIBLE_DEVICES_ENV: "1,2,3"}
@@ -420,6 +477,13 @@ class TestWorker:
         assert placed["text_dev_no"] == placed["vision_dev_no"] == 2
         assert placed["text_target_clusters"] == ["2:0", "2:1"]
         assert placed["text_max_batch_size"] == placed["vision_max_batch_size"] == 16
+
+    def test_independent_rank_places_model_on_its_card(self, monkeypatch) -> None:
+        monkeypatch.setenv(QBRUNTIME_VISIBLE_DEVICES_ENV, "1")
+        worker = self._worker(data_parallel_size=1, local_rank=1)
+        worker.vllm_config.additional_config = {DATA_PARALLEL_LAYOUT_KEY: {"size": 3, "size_local": 3}}
+        placed = worker._place_on_data_parallel_card({"dev_no": [0, 1, 2]}, TEXT_CONFIG)
+        assert placed["dev_no"] == 0
 
     def test_rank_places_eagle3_draft_on_its_visible_card(self, monkeypatch) -> None:
         monkeypatch.setenv(QBRUNTIME_VISIBLE_DEVICES_ENV, "2")
