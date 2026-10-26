@@ -366,6 +366,49 @@ class PrefixCacheCostModel:
             return True
         return load_ms < prefill_ms * self.margin
 
+    def should_keep_snapshot(self, *, num_tokens: int) -> bool:
+        """Whether a snapshot of ``num_tokens`` tokens is worth saving to host memory for a later load.
+
+        A later load uses at most the snapshot's ``num_tokens`` tokens, and :meth:`should_load` refuses a load
+        that does not beat recomputing the tokens it brings. When the estimates say every such load would be
+        refused, saving the snapshot only costs the dump (issue #40). The load can go to any slot, so the
+        cheapest measured slot is used, not the slot the snapshot sits on. Before any load has been measured, a
+        measured dump stands in for it: both move the slot's whole KV buffers. Without either measurement, or
+        without a prefill measurement, the snapshot is kept.
+        """
+        num_tokens = max(0, int(num_tokens))
+        if num_tokens <= 0:
+            return False
+        if self.manual_min_hit_tokens is not None and num_tokens < self.manual_min_hit_tokens:
+            return False
+        if not self.auto_threshold_enabled:
+            return True
+        transfer_ms = self._min_cache_io_ms(self.load_ms_by_cache_id)
+        if transfer_ms is None:
+            transfer_ms = self._min_cache_io_ms(self.dump_ms_by_cache_id)
+        prefill_ms = self.max_prefill_ms(num_tokens)
+        if transfer_ms is None or prefill_ms is None:
+            return True
+        return transfer_ms < prefill_ms * self.margin
+
+    def max_prefill_ms(self, num_tokens: int) -> Optional[float]:
+        """The highest :meth:`prefill_ms` estimate for any prefix of up to ``num_tokens`` tokens that may load.
+
+        The estimate scales each measured bucket down linearly, so a shorter prefix can be estimated above a
+        longer one that falls in the next bucket: the maximum is the estimate at ``num_tokens`` or a measured
+        bucket at or below it. Buckets below the manual minimum hit length are skipped, as :meth:`should_load`
+        refuses those prefixes.
+        """
+        estimate = self.prefill_ms(num_tokens)
+        if estimate is None:
+            return None
+        num_tokens = max(1, int(num_tokens))
+        min_tokens = self.manual_min_hit_tokens or 1
+        return max(
+            [estimate]
+            + [ms for tokens, ms in self.prefill_ms_by_tokens.items() if min_tokens <= tokens <= num_tokens]
+        )
+
     def prefill_ms(self, matched_tokens: int) -> Optional[float]:
         if not self.prefill_ms_by_tokens:
             return None
@@ -378,13 +421,21 @@ class PrefixCacheCostModel:
         return elapsed_ms * (matched_tokens / tokens)
 
     def load_ms(self, cache_id: int | None = None) -> Optional[float]:
-        if cache_id in self.load_ms_by_cache_id:
-            return self.load_ms_by_cache_id[cache_id]
-        if None in self.load_ms_by_cache_id:
-            return self.load_ms_by_cache_id[None]
-        if not self.load_ms_by_cache_id:
+        return self._cache_io_ms(self.load_ms_by_cache_id, cache_id)
+
+    @staticmethod
+    def _cache_io_ms(values: dict[int | None, float], cache_id: int | None) -> Optional[float]:
+        if cache_id in values:
+            return values[cache_id]
+        if None in values:
+            return values[None]
+        if not values:
             return None
-        return statistics.median(self.load_ms_by_cache_id.values())
+        return statistics.median(values.values())
+
+    @staticmethod
+    def _min_cache_io_ms(values: dict[int | None, float]) -> Optional[float]:
+        return min(values.values()) if values else None
 
     def _observe_cache_io(self, values: dict[int | None, float], cache_id: int | None, elapsed_ms: float) -> None:
         elapsed_ms = max(0.0, float(elapsed_ms))
@@ -2583,6 +2634,10 @@ class MbltWorker(WorkerBase):
         slot_id: Optional[int] = None,
     ) -> None:
         """Make this step's infers on the request's slot run on its cache, from ``cache_size`` tokens."""
+        active = self._slot_caches.get(self._slot_key(slot_id))
+        if active is None or active[1] is not req_state.kv_cache:
+            # The slot changes hands: settle the finished snapshot it may still hold before the bind evicts it.
+            self._settle_snapshot_on_slot(slot_id)
         self._activate_request_cache(req_id, req_state, slot_id)
         self._prepare_slot(slot_id, cache_size)
 
@@ -2670,16 +2725,67 @@ class MbltWorker(WorkerBase):
         start = time.perf_counter()
         if self.request_caches.holds_slot(snapshot_cache, slot_key):
             # The finished request that left this snapshot ran on this slot and nothing has used it since: the
-            # request takes over that cache, KV in place, and the snapshot keeps a host copy instead.
-            snapshot.blobs = snapshot_cache.copy()
+            # request takes over that cache, KV in place. The snapshot keeps a host copy only when a later load
+            # of it could beat recomputing; otherwise it is dropped, and the copy's dump is skipped (issue #40).
+            cost_model = self._ensure_prefix_cache_cost_model()
+            snapshot_req_id = self._snapshot_req_id(snapshot)
+            if cost_model.should_keep_snapshot(num_tokens=snapshot.num_tokens):
+                snapshot.blobs = snapshot_cache.copy()
+                cost_model.observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
+            else:
+                if snapshot_req_id is not None:
+                    self.runtime_cache.remove_snapshot(snapshot_req_id)
+                snapshot.blobs = None  # the cache is the request's now
             snapshot_cache.set_seq_length(int(num_tokens))
             req_state.kv_cache = snapshot_cache
-            self._ensure_prefix_cache_cost_model().observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
             return
+        self._settle_snapshot_on_slot(slot_id)
         cache = self.request_caches.relocate(snapshot_cache, slot_key, num_tokens)
         self.request_caches.prepare(cache, slot_key, num_tokens)
         req_state.kv_cache = cache
         self._ensure_prefix_cache_cost_model().observe_load(slot_id, (time.perf_counter() - start) * 1000.0)
+
+    def _snapshot_req_id(self, snapshot: RuntimeCacheSnapshot) -> Optional[str]:
+        for req_id, stored in self.runtime_cache.snapshots.items():
+            if stored is snapshot:
+                return req_id
+        return None
+
+    def _settle_snapshot_on_slot(self, slot_id: Optional[int]) -> None:
+        """Before another cache takes ``slot_id``, save the prefix snapshot it still holds only if it is worth it.
+
+        A finished request's cache stays on its slot as its snapshot, so the next cache bound to the slot would
+        dump the slot's whole KV to host memory. That dump runs on the engine loop (issue #40). It is kept when a
+        later load of the snapshot could beat recomputing it; otherwise the snapshot is dropped and emptied, so
+        the bind that follows overwrites the slot without saving anything. Live requests are never touched: a
+        snapshot that holds a slot is a finished request's cache, which no request runs on.
+        """
+        if self.request_caches is None:
+            return
+        slot_key = self._slot_key(slot_id)
+        cost_model = self._ensure_prefix_cache_cost_model()
+        print_debug = getattr(self, "print_debug", False)
+        resident = [
+            (req_id, snapshot)
+            for req_id, snapshot in self.runtime_cache.snapshots.items()
+            if snapshot.blobs is not None and self.request_caches.holds_slot(snapshot.blobs, slot_key)
+        ]
+        for req_id, snapshot in resident:
+            if req_id in self.req_states:
+                continue
+            if cost_model.should_keep_snapshot(num_tokens=snapshot.num_tokens):
+                start = time.perf_counter()
+                snapshot.blobs.offload()
+                cost_model.observe_dump(slot_id, (time.perf_counter() - start) * 1000.0)
+                if print_debug:
+                    print(f"[cache] req={req_id} slot={slot_id} save-snapshot tokens={snapshot.num_tokens}")
+                continue
+            self.runtime_cache.remove_snapshot(req_id)
+            # Emptied, the cache has nothing to save when the next bind evicts it from the slot.
+            snapshot.blobs.reset()
+            snapshot.blobs = None
+            if print_debug:
+                print(f"[cache] req={req_id} slot={slot_id} drop-snapshot tokens={snapshot.num_tokens} reason=cost")
 
     def _snapshot_switched_out_request(self, req_id: str, *, next_req_id: str, print_debug: bool = False) -> None:
         """Keep the prefix of a request that is about to lose the non-batch slot, so other requests can start from it.
