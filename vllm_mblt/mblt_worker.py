@@ -1590,6 +1590,7 @@ class MbltWorker(WorkerBase):
             # no second_per_grid_ts input; the token offsets carry that timing.
             position_ids, mrope_delta = get_rope_index(
                 input_ids=input_ids,
+                mm_token_type_ids=self._mm_token_type_ids(input_ids),
                 image_grid_thw=torch.cat(image_grids, dim=0) if image_grids else None,
                 video_grid_thw=torch.cat(video_grids, dim=0) if video_grids else None,
             )
@@ -1603,6 +1604,20 @@ class MbltWorker(WorkerBase):
             )
 
         return torch.arange(input_ids.shape[1], dtype=torch.long).view(1, 1, -1).expand(3, 1, -1), 0
+
+    def _mm_token_type_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Per-token modality of ``input_ids`` (0 text, 1 image, 2 video), which transformers 5's get_rope_index takes.
+
+        Built the way transformers 5's processors build it (``ProcessorMixin.create_mm_token_type_ids``): by comparing
+        each token with the model's image and video placeholder token ids.
+        """
+        config = getattr(self.model, "config", None)
+        token_types = torch.zeros_like(input_ids, dtype=torch.int)
+        for type_id, attr in ((1, "image_token_id"), (2, "video_token_id")):
+            token_id = getattr(config, attr, None)
+            if token_id is not None:
+                token_types[input_ids == int(token_id)] = type_id
+        return token_types
 
     @staticmethod
     def _row_position_ids(req_state: Optional[RequestState], start: int, end: int) -> torch.Tensor:

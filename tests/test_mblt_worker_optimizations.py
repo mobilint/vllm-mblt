@@ -2841,7 +2841,7 @@ class TestMbltWorkerOptimizations:
             return position_ids, torch.tensor([[7]], dtype=torch.long)
 
         worker.model = SimpleNamespace(
-            config=SimpleNamespace(model_type="mobilint-qwen3_vl"),
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", image_token_id=3, video_token_id=4),
             model=SimpleNamespace(get_rope_index=get_rope_index),
         )
         feature = self._make_mm_feature(
@@ -2857,6 +2857,8 @@ class TestMbltWorkerOptimizations:
         assert tuple(captured["rope_kwargs"]["image_grid_thw"].shape) == (1, 3)
         assert captured["rope_kwargs"]["video_grid_thw"] is None
         assert captured["rope_kwargs"]["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
+        # transformers 5's get_rope_index takes per-token modalities: 1 image, 2 video, 0 text.
+        assert captured["rope_kwargs"]["mm_token_type_ids"].tolist() == [[0, 0, 1, 2, 0]]
 
     def test_build_prompt_position_ids_uses_qwen3_vl_rope_index_and_video_grid(self) -> None:
         worker = self._make_worker()
@@ -2874,7 +2876,7 @@ class TestMbltWorkerOptimizations:
             return torch.arange(5).view(1, 1, -1).expand(3, 1, -1), torch.tensor([[3]])
 
         worker.model = SimpleNamespace(
-            config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True, video_token_id=4),
             model=SimpleNamespace(get_rope_index=get_rope_index),
         )
         feature = self._make_mm_feature(
@@ -2889,6 +2891,7 @@ class TestMbltWorkerOptimizations:
         assert captured["image_grid_thw"] is None
         assert captured["video_grid_thw"].tolist() == [[16, 12, 20]]
         assert "second_per_grid_ts" not in captured
+        assert captured["mm_token_type_ids"].tolist() == [[0, 0, 0, 2, 0]]
 
     def test_build_prompt_position_ids_rejects_multimodal_without_mrope_helper(self) -> None:
         worker = self._make_worker()
