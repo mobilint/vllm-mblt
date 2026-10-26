@@ -466,6 +466,16 @@ class MbltPlatform(Platform):
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config: ParallelConfig = vllm_config.parallel_config  # type: ignore
         parallel_config.worker_cls = "vllm_mblt.mblt_worker.MbltWorker"
+        # vLLM 0.32 defaults data parallel engines to the multiprocessing executor, which runs the worker in its own
+        # process and gives it OMP_NUM_THREADS = all of the host's CPUs; three engines then oversubscribed 16 cores
+        # and stepped 9x slower. Each engine here has one worker (no tensor or pipeline parallelism), so run it in
+        # the engine process as vLLM 0.11 did; vLLM then splits the host's CPUs among the local engines itself.
+        if (
+            getattr(parallel_config, "world_size", 1) == 1
+            and getattr(parallel_config, "distributed_executor_backend", None) == "mp"
+        ):
+            logger.info("Running each engine's single worker in-process (distributed_executor_backend=uni).")
+            parallel_config.distributed_executor_backend = "uni"
         cls._serving_eagle3 = _is_eagle3_hf_config(_get_hf_config(vllm_config))
         cls._prepare_data_parallel(vllm_config)
 

@@ -90,3 +90,15 @@ def test_transformers_5_vision_outputs_unpack_to_embeddings_and_deepstack() -> N
     plain = BaseModelOutputWithDeepstackFeatures(pooler_output=(first,))
     assert MbltWorker._normalize_multimodal_embeddings(plain) is first
     assert MbltWorker._extract_deepstack_embeddings(plain) is None
+
+
+@pytest.mark.parametrize(("world_size", "backend", "expected"), [(1, "mp", "uni"), (1, "uni", "uni"), (2, "mp", "mp")])
+def test_single_worker_engines_run_in_process(world_size, backend, expected) -> None:
+    # vLLM 0.32 picks the multiprocessing executor for data parallel engines.
+    config = _make_vllm_config(64)
+    config.parallel_config.world_size = world_size
+    config.parallel_config.distributed_executor_backend = backend
+
+    MbltPlatform.check_and_update_config(config)
+
+    assert config.parallel_config.distributed_executor_backend == expected
