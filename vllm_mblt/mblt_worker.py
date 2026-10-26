@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
+from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MLAAttentionSpec
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
@@ -3372,6 +3373,14 @@ class MbltWorker(WorkerBase):
             if token_ids.numel() > 0:
                 prompt_token_ids[row, : token_ids.numel()] = token_ids
         return prompt_token_ids
+
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        """vLLM's default layout preference: the NPU keeps KV in its own MXQ slots, not in vLLM's cache.
+
+        The base implementation asks the platform for the current attention backends, which this platform has none
+        of ("Invalid attention backend for cpu" at engine start-up).
+        """
+        return [layout.name for layout in get_supported_kv_cache_layouts(())]
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {

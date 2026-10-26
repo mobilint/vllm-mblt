@@ -35,3 +35,12 @@ def test_load_model_refuses_dummy_weights() -> None:
 def test_validate_request_takes_vllm_032_arguments() -> None:
     expected = list(inspect.signature(Platform.validate_request).parameters)
     assert list(inspect.signature(MbltPlatform.validate_request).parameters) == expected
+
+
+def test_supported_kv_cache_layouts_need_no_attention_backend() -> None:
+    # The base implementation looks up attention backends, which this platform has none of.
+    worker = MbltWorker.__new__(MbltWorker)
+
+    layouts = worker.get_supported_kv_cache_layouts()
+
+    assert layouts and all(isinstance(name, str) for name in layouts)
