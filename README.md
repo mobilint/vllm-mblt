@@ -361,9 +361,10 @@ vllm serve mobilint/Qwen3-0.6B \
   (for example `QBRUNTIME_VISIBLE_DEVICES=1,2,3`) or pass a `dev_no` list in `--model-loader-extra-config`
   (`'{"dev_no": [1, 2, 3]}'`); engine `r` takes the `r`-th card. Set only one of them. A single `dev_no` card
   is refused, as it would put every engine on one card, and so is a list shorter than the number of engines.
-- vLLM starts each engine with `QBRUNTIME_VISIBLE_DEVICES` set to that engine's card. qbruntime renumbers the
-  listed cards from 0, as `CUDA_VISIBLE_DEVICES` does, and cannot open the others (verified on qbruntime 1.5.0
-  with 3 cards), so every engine opens its card as `dev_no` 0.
+- vLLM records each engine's card in its config (`assigned_physical_gpu_ids`), and the worker narrows
+  `QBRUNTIME_VISIBLE_DEVICES` to that card before it opens the NPU. qbruntime renumbers the listed cards from 0,
+  as `CUDA_VISIBLE_DEVICES` does, and cannot open the others (verified on qbruntime 1.5.0 with 3 cards), so every
+  engine opens its card as `dev_no` 0.
 - Every NPU role of the model runs on the engine's card: the vision and text MXQs of a VLM, the base, draft and
   FC MXQs of an EAGLE-3 release, the encoder and decoder of Qwen3-ASR, and the shared, expert and `lm_head` MXQs
   of a Mixture-of-Experts model. Each role keeps the cores or clusters the release (or a prefixed `*_target_cores`

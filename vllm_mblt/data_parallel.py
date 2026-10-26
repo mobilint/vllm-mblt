@@ -150,6 +150,32 @@ def export_card_list_for_ranks(
     return cards
 
 
+def narrow_visible_devices_to_rank_card(
+    parallel_config: object,
+    *,
+    environ: MutableMapping[str, str] | None = None,
+) -> int | None:
+    """Show this data parallel engine only its own card, before qbruntime opens a device.
+
+    vLLM 0.32 no longer narrows the device control variable for each engine process on platforms other than
+    CUDA and XPU. It records the rank's physical cards in ``parallel_config.assigned_physical_gpu_ids`` instead,
+    computed from ``QBRUNTIME_VISIBLE_DEVICES`` (or ``0..N-1``). Writing that card back to the variable restores
+    the 0.11 layout the rest of this module expects: one visible card, opened as ``dev_no`` 0. Returns the card,
+    or ``None`` for a single engine or when vLLM assigned none.
+    """
+    environ = os.environ if environ is None else environ
+    if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
+        return None
+    assigned = getattr(parallel_config, "assigned_physical_gpu_ids", None)
+    if not assigned:
+        return None
+    if len(assigned) != 1:
+        raise ValueError(f"A data parallel engine runs on one card, but vLLM assigned cards {list(assigned)}.")
+    card = int(assigned[0])
+    environ[QBRUNTIME_VISIBLE_DEVICES_ENV] = str(card)
+    return card
+
+
 def resolve_rank_card(
     placement_kwargs: Mapping[str, object],
     *,

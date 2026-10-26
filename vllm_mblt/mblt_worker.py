@@ -30,6 +30,7 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_mblt.data_parallel import (
     IdleStepPacer,
+    narrow_visible_devices_to_rank_card,
     place_model_kwargs_on_card,
     resolve_rank_card,
     runtime_device_number,
@@ -3131,6 +3132,7 @@ class MbltWorker(WorkerBase):
 
     def init_device(self) -> None:
         self._log_init_stage("init_device")
+        narrow_visible_devices_to_rank_card(getattr(self.vllm_config, "parallel_config", None))
         apply_engine_host_thread_defaults(self.vllm_config)
         return
 
