@@ -53,7 +53,8 @@ Repository = "https://github.com/mobilint/vllm-mblt"
 
 [project.optional-dependencies]
 # Serving mobilint/Qwen3-ASR-1.7B. transformers-mblt vendors the Qwen3-ASR backend from 0.7.0, which runs on
-# transformers 5; the qwen-asr package it replaces pins transformers 4.57.
+# transformers 5; the qwen-asr package it replaces pins transformers 4.57. Until transformers-mblt 0.7.0 is
+# released this extra cannot be installed, and Qwen3-ASR is not yet supported.
 qwen-asr = [
     "transformers-mblt>=0.7.0",
 ]

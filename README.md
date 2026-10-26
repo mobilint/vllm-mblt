@@ -38,7 +38,8 @@ artifacts can be served through familiar vLLM commands and OpenAI-compatible API
 - Python 3.11+
 - `vllm==0.32.0`
 - `transformers-mblt >= 0.6.1` and `mblt-model-zoo[transformers] >= 2.11.0`
-- For Qwen3-ASR, the `qwen-asr` extra (`transformers-mblt >= 0.7.0`): `pip install "vllm-mblt[qwen-asr]"`
+- Qwen3-ASR is not yet supported on this release. Support will come with the transformers-mblt 0.7.0 release,
+  through the `qwen-asr` extra (see [Serve a Speech-to-Text Model](#4-serve-a-speech-to-text-model)).
 - For Qwen3-MoE (`mobilint/Qwen3-30B-A3B`), the `qwen3-moe` extra: `pip install "vllm-mblt[qwen3-moe]"`
 - A Mobilint NPU environment. If you are not yet a Mobilint customer, please contact
   [tech-support@mobilint.com](mailto:tech-support@mobilint.com).
@@ -120,8 +121,9 @@ Current Mobilint Qwen2/3-VL notes:
 
 ### 4. Serve a Speech-to-Text Model
 
-Qwen3-ASR needs the optional `qwen-asr` extra, which installs transformers-mblt 0.7.0 or later (its vendored
-Qwen3-ASR backend runs on transformers 5):
+> **Not yet supported.** Qwen3-ASR will be supported once transformers-mblt 0.7.0 is released. vLLM 0.32 needs
+> transformers 5, and the `qwen-asr` package that Qwen3-ASR used pins transformers 4.57. transformers-mblt 0.7.0
+> vendors that backend, and the `qwen-asr` extra below requires it, so it cannot be installed until then.
 
 ```bash
 pip install "vllm-mblt[qwen-asr]"
