@@ -3880,7 +3880,9 @@ class MbltWorker(WorkerBase):
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
 
-        sampled_token_ids: list[np.ndarray] = [np.empty(0, dtype=np.int64) for _ in req_ids]
+        # vLLM 0.32 takes plain token lists here and tests them for truth, which a NumPy array of more than one
+        # token cannot answer.
+        sampled_token_ids: list[list[int]] = [[] for _ in req_ids]
         logprobs = None
 
         if logits_batch:
@@ -3892,10 +3894,7 @@ class MbltWorker(WorkerBase):
             for i, req_id in enumerate(sampling_req_ids):
                 self.req_states[req_id].output_token_ids.extend(sampled_token_ids_int[i])
                 generated_lengths_by_req_id[req_id] = len(sampled_token_ids_int[i])
-                sampled_token_ids[req_id_to_index[req_id]] = np.asarray(
-                    sampled_token_ids_int[i],
-                    dtype=np.int64,
-                )
+                sampled_token_ids[req_id_to_index[req_id]] = sampled_token_ids_int[i]
 
             if sampler_output.logprobs_tensors is not None:
                 cu_num_generated_tokens = [0]

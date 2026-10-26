@@ -875,7 +875,9 @@ class TestMbltWorkerOptimizations:
             num_prompt_logprobs=1,
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors)
+            SimpleNamespace(
+                new_logprobs=None, prompt_token_id_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors
+            )
         )
         assert processor.prompt_logprobs is not None
         assert len(processor.prompt_logprobs) == len(prompt_token_ids)
@@ -926,7 +928,9 @@ class TestMbltWorkerOptimizations:
             num_prompt_logprobs=1,
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors)
+            SimpleNamespace(
+                new_logprobs=None, prompt_token_id_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors
+            )
         )
 
         assert processor.prompt_logprobs is not None
@@ -967,13 +971,15 @@ class TestMbltWorkerOptimizations:
         processor = LogprobsProcessor(
             tokenizer=None,
             logprobs=[],
-            prompt_logprobs=create_prompt_logprobs(),
+            prompt_logprobs=create_prompt_logprobs(False),
             cumulative_logprob=0.0,
             num_logprobs=1,
             num_prompt_logprobs=1,
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors)
+            SimpleNamespace(
+                new_logprobs=None, prompt_token_id_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors
+            )
         )
         assert processor.prompt_logprobs == [None]
 
@@ -1032,10 +1038,18 @@ class TestMbltWorkerOptimizations:
             num_prompt_logprobs=1,
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=first_chunk_prompt_logprobs)
+            SimpleNamespace(
+                new_logprobs=None,
+                prompt_token_id_logprobs=None,
+                new_prompt_logprobs_tensors=first_chunk_prompt_logprobs,
+            )
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=second_chunk_prompt_logprobs)
+            SimpleNamespace(
+                new_logprobs=None,
+                prompt_token_id_logprobs=None,
+                new_prompt_logprobs_tensors=second_chunk_prompt_logprobs,
+            )
         )
 
         assert processor.prompt_logprobs is not None
@@ -1092,7 +1106,9 @@ class TestMbltWorkerOptimizations:
             num_prompt_logprobs=1,
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=completed_prompt_logprobs)
+            SimpleNamespace(
+                new_logprobs=None, prompt_token_id_logprobs=None, new_prompt_logprobs_tensors=completed_prompt_logprobs
+            )
         )
 
         assert processor.prompt_logprobs is not None
@@ -1181,10 +1197,16 @@ class TestMbltWorkerOptimizations:
             num_prompt_logprobs=1,
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=first_chunk_prompt_logprobs)
+            SimpleNamespace(
+                new_logprobs=None,
+                prompt_token_id_logprobs=None,
+                new_prompt_logprobs_tensors=first_chunk_prompt_logprobs,
+            )
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=replay_prompt_logprobs)
+            SimpleNamespace(
+                new_logprobs=None, prompt_token_id_logprobs=None, new_prompt_logprobs_tensors=replay_prompt_logprobs
+            )
         )
 
         assert processor.prompt_logprobs is not None
@@ -1229,7 +1251,9 @@ class TestMbltWorkerOptimizations:
             num_prompt_logprobs=1,
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors)
+            SimpleNamespace(
+                new_logprobs=None, prompt_token_id_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors
+            )
         )
 
         assert processor.prompt_logprobs is not None
@@ -1319,7 +1343,9 @@ class TestMbltWorkerOptimizations:
             num_prompt_logprobs=1,
         )
         processor.update_from_output(
-            SimpleNamespace(new_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors)
+            SimpleNamespace(
+                new_logprobs=None, prompt_token_id_logprobs=None, new_prompt_logprobs_tensors=prompt_logprobs_tensors
+            )
         )
         assert processor.prompt_logprobs is not None
         assert len(processor.prompt_logprobs) == len(prompt_token_ids)
@@ -1677,7 +1703,7 @@ class TestMbltWorkerOptimizations:
         assert calls == [((128, 0, 0),), ((128, 128, 0),), ((44, 256, 0),)]
         assert max(sequence_length for call in calls for sequence_length, _cache_size, _cache_id in call) <= 128
         assert req_state.num_computed_tokens == 300
-        assert output.sampled_token_ids[output.req_id_to_index["long"]].tolist() == [9]
+        assert output.sampled_token_ids[output.req_id_to_index["long"]] == [9]
 
     def test_multiple_normal_long_prefills_are_grouped_per_chunk(self) -> None:
         worker = self._make_worker()
@@ -1732,8 +1758,8 @@ class TestMbltWorkerOptimizations:
         ]
         assert req_a_state.num_computed_tokens == 260
         assert req_b_state.num_computed_tokens == 260
-        assert output.sampled_token_ids[output.req_id_to_index["req-a"]].tolist() == [7]
-        assert output.sampled_token_ids[output.req_id_to_index["req-b"]].tolist() == [8]
+        assert output.sampled_token_ids[output.req_id_to_index["req-a"]] == [7]
+        assert output.sampled_token_ids[output.req_id_to_index["req-b"]] == [8]
 
     def test_mixed_batch_keeps_normal_chunks_and_microsteps_prompt_logprobs_in_order(self) -> None:
         worker = self._make_worker()
@@ -1813,8 +1839,8 @@ class TestMbltWorkerOptimizations:
         assert prompt_state.num_computed_tokens == 3
         assert "prompt" in output.prompt_logprobs_dict
         assert output.req_ids == ["normal", "prompt"]
-        assert output.sampled_token_ids[output.req_id_to_index["normal"]].tolist() == [7]
-        assert output.sampled_token_ids[output.req_id_to_index["prompt"]].tolist() == [8]
+        assert output.sampled_token_ids[output.req_id_to_index["normal"]] == [7]
+        assert output.sampled_token_ids[output.req_id_to_index["prompt"]] == [8]
 
     def test_mixed_batch_logprobs_align_with_full_req_ids(self) -> None:
         worker = self._make_worker()
@@ -1873,9 +1899,10 @@ class TestMbltWorkerOptimizations:
         assert output.req_ids == ["prefill", "sample-a", "sample-b"]
         assert output.logprobs is not None
         assert output.logprobs.cu_num_generated_tokens == [0, 0, 1, 2]
-        assert output.logprobs.slice(0, 1).logprob_token_ids.shape[0] == 0
-        assert output.logprobs.slice(1, 2).logprob_token_ids.tolist() == [[12, 1]]
-        assert output.logprobs.slice(2, 3).logprob_token_ids.tolist() == [[13, 2]]
+        # The scheduler reads each request's rows as slice_request(index, number of generated tokens).
+        assert output.logprobs.slice_request(0, 0).logprob_token_ids.shape[0] == 0
+        assert output.logprobs.slice_request(1, 1).logprob_token_ids.tolist() == [[12, 1]]
+        assert output.logprobs.slice_request(2, 1).logprob_token_ids.tolist() == [[13, 2]]
 
     def test_last_logit_prompt_logprob_microstep_warning_emitted_once(self, caplog) -> None:
         worker = self._make_worker()
@@ -1983,7 +2010,7 @@ class TestMbltWorkerOptimizations:
         assert output is not None
         assert infer_calls == [(1, pos) for pos in range(len(prompt_token_ids))]
         assert all(sequence_length == 1 for sequence_length, _cache_size in infer_calls)
-        assert output.sampled_token_ids[output.req_id_to_index["france"]].tolist() == [generated_token_id]
+        assert output.sampled_token_ids[output.req_id_to_index["france"]] == [generated_token_id]
         assert output.logprobs is not None
         assert output.prompt_logprobs_dict.keys() == {"france"}
 
@@ -2088,7 +2115,7 @@ class TestMbltWorkerOptimizations:
 
         assert output is not None
         assert infer_calls == [(1, pos) for pos in range(len(prompt_token_ids))]
-        assert output.sampled_token_ids[output.req_id_to_index[name]].tolist() == [generated_token_id]
+        assert output.sampled_token_ids[output.req_id_to_index[name]] == [generated_token_id]
         assert output.logprobs is not None
         assert output.logprobs.logprob_token_ids.tolist()[0][0] == generated_token_id
         assert output.prompt_logprobs_dict.keys() == {name}
@@ -2291,8 +2318,8 @@ class TestMbltWorkerOptimizations:
         assert output.prompt_logprobs_dict.keys() == {"scored"}
         prompt_logprobs_tensors = output.prompt_logprobs_dict["scored"]
         assert prompt_logprobs_tensors.logprob_token_ids[:, 0].tolist() == scored_prompt[1:]
-        assert output.sampled_token_ids[output.req_id_to_index["scored"]].tolist() == [41]
-        assert output.sampled_token_ids[output.req_id_to_index["plain"]].tolist() == [42]
+        assert output.sampled_token_ids[output.req_id_to_index["scored"]] == [41]
+        assert output.sampled_token_ids[output.req_id_to_index["plain"]] == [42]
         # Only the prompt-logprob row keeps its per-position logits.
         assert len(chunked_results) == 1
         scored_logits = chunked_results[0][output.req_id_to_index["scored"]]
@@ -2369,7 +2396,7 @@ class TestMbltWorkerOptimizations:
         assert infer_calls == [((1, pos, 0),) for pos in range(len(scored_prompt))]
         prompt_logprobs_tensors = output.prompt_logprobs_dict["scored"]
         assert prompt_logprobs_tensors.logprob_token_ids[:, 0].tolist() == scored_prompt[1:]
-        assert output.sampled_token_ids[output.req_id_to_index["scored"]].tolist() == [41]
+        assert output.sampled_token_ids[output.req_id_to_index["scored"]] == [41]
 
     @pytest.mark.parametrize("full_logits", [True, False])
     def test_batch_mixed_decode_and_prefill_sample_each_request_last_logits(self, full_logits: bool) -> None:
@@ -2404,9 +2431,9 @@ class TestMbltWorkerOptimizations:
 
         assert output is not None
         assert infer_calls == [((1, 3, 0), (1, 2, 1), (4, 0, 2))]
-        assert output.sampled_token_ids[output.req_id_to_index["decode-a"]].tolist() == [50]
-        assert output.sampled_token_ids[output.req_id_to_index["decode-b"]].tolist() == [51]
-        assert output.sampled_token_ids[output.req_id_to_index["prefill"]].tolist() == [52]
+        assert output.sampled_token_ids[output.req_id_to_index["decode-a"]] == [50]
+        assert output.sampled_token_ids[output.req_id_to_index["decode-b"]] == [51]
+        assert output.sampled_token_ids[output.req_id_to_index["prefill"]] == [52]
 
     @pytest.mark.parametrize("full_logits", [True, False])
     def test_batch_all_decode_step_rows_coincide_for_full_and_last_logits(self, full_logits: bool) -> None:
@@ -2435,7 +2462,7 @@ class TestMbltWorkerOptimizations:
         assert output is not None
         assert infer_calls == [((1, 2, 0), (1, 2, 1), (1, 2, 2))]
         for slot in range(3):
-            assert output.sampled_token_ids[output.req_id_to_index[f"req-{slot}"]].tolist() == [20 + slot]
+            assert output.sampled_token_ids[output.req_id_to_index[f"req-{slot}"]] == [20 + slot]
 
     def test_sampling_penalties_can_be_forced_off_for_non_cuda_runtime(self) -> None:
         worker = self._make_worker()
@@ -3159,7 +3186,7 @@ class TestMbltWorkerOptimizations:
         output = worker.execute_model(self._make_scheduler_output({"text": 5}))
 
         assert output is not None
-        assert output.sampled_token_ids[output.req_id_to_index["text"]].tolist() == [9]
+        assert output.sampled_token_ids[output.req_id_to_index["text"]] == [9]
         assert forward.calls == [((5, 0, 0),)]
 
     def test_init_uses_text_runtime_max_batch_size_for_cache_slots(self, monkeypatch) -> None:
