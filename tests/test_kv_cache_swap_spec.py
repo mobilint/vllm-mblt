@@ -632,6 +632,21 @@ class TestPrefixAffineSlotChoice:
         assert _run(worker, "late", late, 9) == 0
         assert worker.cache_model.loads == []
 
+    def test_snapshot_found_stale_while_matching_counts_as_an_empty_slot(self) -> None:
+        # vLLM 0.11.2 has no block hashes: the new request reuses done's physical blocks 1 and 2 for other tokens.
+        # Matching finds done stale and drops it from the index while its KV is still on slot 1.
+        worker = _make_worker(max_batch_size=2, block_size=4, enable_prefix_caching=True)
+        _finish_on_slot(worker, "done", slot_id=1, blocks=[1, 2], kv="done-kv")
+        new_state = _new_request(worker, "new", blocks=[1, 2], computed=8, assign=False)
+        new_state.prompt_token_ids = list(range(100, 108))
+        worker.runtime_cache.observe_request_blocks("new", new_state.block_ids)
+
+        new_state.cache_slot_id = worker._assign_cache_slot("new", new_state)
+
+        assert new_state.cache_slot_id == 0
+        assert worker.runtime_cache.get_snapshot("done") is None
+        assert _run(worker, "new", new_state, 9) == 0
+
     def test_victim_order_is_empty_then_not_worth_keeping_then_least_recently_used(self) -> None:
         worker = _make_worker(max_batch_size=4, block_size=4, enable_prefix_caching=True)
         cost_model = PrefixCacheCostModel(block_size=4)

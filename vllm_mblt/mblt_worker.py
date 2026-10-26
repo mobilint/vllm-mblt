@@ -931,6 +931,8 @@ class MbltWorker(WorkerBase):
         prefix_slot = None
         if req_state is not None and resident:
             prefix_slot = self._prefix_matching_slot(req_id, req_state, resident)
+            # Matching drops snapshots it finds stale from the index; their slots count as empty.
+            resident = {slot_id: req for slot_id, req in resident.items() if req in self.runtime_cache.snapshots}
         cost_model = self._ensure_prefix_cache_cost_model()
 
         def slot_victim_rank(slot_id: int) -> tuple[int, ...]:
