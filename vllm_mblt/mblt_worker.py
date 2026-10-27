@@ -57,6 +57,7 @@ from vllm_mblt.runtime_cache import (
     first_seq_blocks,
     normalize_block_ids,
 )
+from vllm_mblt.sampling import HostTopKTopPSampler
 from vllm_mblt.tracing import TRACE_ENABLE_HINT, MbltTracer, resolve_trace_dir
 
 logger = init_logger(__name__)
@@ -558,6 +559,7 @@ class MbltWorker(WorkerBase):
             block_size=self._kv_block_size(),
         )
         self.sampler = Sampler(logprobs_mode="raw_logits")
+        self.sampler.topk_topp_sampler = HostTopKTopPSampler(logprobs_mode="raw_logits")
         self.empty_logits_processors = LogitsProcessors(None)
         self.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
         self.enable_chunked_prefill = self.vllm_config.scheduler_config.enable_chunked_prefill
