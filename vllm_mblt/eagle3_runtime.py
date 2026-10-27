@@ -14,7 +14,6 @@ scheduled all of it; chunks before that only advance vLLM's count.
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import numpy as np
 import torch
 from transformers_mblt.utils.cache_utils import MobilintEagle3Cache
 from transformers_mblt.utils.eagle3.decoding import prepare_logits_processor
@@ -148,7 +147,7 @@ class Eagle3Runner:
                 req.exhausted = False
 
         req_ids: list[str] = []
-        sampled_token_ids: list[np.ndarray] = []
+        sampled_token_ids: list[list[int]] = []
         for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
             req = self.requests[req_id]
             scheduled_end = req.num_computed_tokens + int(num_scheduled)
@@ -160,7 +159,7 @@ class Eagle3Runner:
                 req.token_ids.extend(tokens)
             req.num_computed_tokens = scheduled_end
             req_ids.append(req_id)
-            sampled_token_ids.append(np.asarray(tokens, dtype=np.int64))
+            sampled_token_ids.append([int(token) for token in tokens])
 
         return ModelRunnerOutput(
             req_ids=req_ids,

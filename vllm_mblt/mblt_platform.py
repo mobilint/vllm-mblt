@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from vllm.config import CacheConfig, ParallelConfig, SchedulerConfig, VllmConfig
 
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -13,6 +14,7 @@ from vllm_mblt.data_parallel import (
     QBRUNTIME_VISIBLE_DEVICES_ENV,
     collect_placement_kwargs,
     export_card_list_for_ranks,
+    record_data_parallel_layout,
 )
 
 logger = init_logger(__name__)
@@ -245,9 +247,7 @@ def _resolve_model_config_positive_int(
         # through to the generic default would silently shrink the prefill
         # chunk size instead.
         usable_entries = {
-            str(key): value
-            for key, value in raw_value.items()
-            if _coerce_positive_int(value) is not None
+            str(key): value for key, value in raw_value.items() if _coerce_positive_int(value) is not None
         }
         if len(usable_entries) == 1:
             only_key, only_value = next(iter(usable_entries.items()))
@@ -369,9 +369,12 @@ class MbltPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_type = "cpu"
     device_name = "cpu"
-    # With --data-parallel-size N, vLLM gives each engine process its own entry of this variable (the parent's list,
-    # or 0..N-1 when unset), so every EngineCore sees one card.
+    # With --data-parallel-size N, vLLM 0.32 records each engine's entry of this variable (the parent's list, or
+    # 0..N-1 when unset) in parallel_config.assigned_physical_gpu_ids; the worker narrows the variable to it.
     device_control_env_var = QBRUNTIME_VISIBLE_DEVICES_ENV
+    # vLLM compiles small sampling helpers (e.g. the logprob rank count) with this backend. The sampling runs on the
+    # host; inductor would compile C++ at runtime and fail the engine where the host toolchain is unusable.
+    simple_compile_backend = "eager"
     # The data parallel engines all-reduce their unfinished-request state over a CPU process group.
     dist_backend = "gloo"
     # Whether the engine configured last in this process serves EAGLE-3; validate_request's fallback.
@@ -397,7 +400,7 @@ class MbltPlatform(Platform):
         """Whether the engine validating this request serves EAGLE-3.
 
         vLLM passes ``validate_request`` no engine, so a process with several engines (several ``LLM`` objects) cannot
-        tell them apart from its arguments. Its caller, vLLM 0.11.2's ``Processor.process_inputs``, holds the engine's
+        tell them apart from its arguments. Its caller, vLLM 0.32's ``InputProcessor`` method, holds the engine's
         ``model_config``; without it, the engine configured last decides.
         """
         caller = sys._getframe(2).f_locals.get("self")
@@ -408,21 +411,35 @@ class MbltPlatform(Platform):
         return _is_eagle3_hf_config(hf_config)
 
     @classmethod
-    def validate_request(cls, prompt: object, params: object, processed_inputs: object) -> None:
-        """Refuse requests an EAGLE-3 model cannot serve, with the options to drop (an HTTP 400 for the client)."""
-        del prompt
+    def validate_request(cls, processed_inputs: object, params: object) -> None:
+        """Refuse requests an EAGLE-3 model cannot serve, with the options to drop (an HTTP 400 for the client).
+
+        vLLM 0.32 maps only its VLLMClientError family to 4xx; a plain ValueError here reaches the client as a 500.
+        """
         if not cls._validating_for_eagle3():
             return
         unsupported = _unsupported_eagle3_sampling(params)
         if unsupported:
-            raise ValueError(
+            raise VLLMValidationError(
                 "EAGLE-3 models sample with temperature, top_k and top_p only; unsupported here: "
                 + ", ".join(unsupported)
-                + "."
+                + ".",
+                parameter=unsupported[0],
             )
         inputs = processed_inputs if isinstance(processed_inputs, dict) else {}
         if inputs.get("type") in ("embeds", "multimodal"):
-            raise ValueError("EAGLE-3 models take token prompts only, without prompt embeddings or multimodal data.")
+            raise VLLMValidationError(
+                "EAGLE-3 models take token prompts only, without prompt embeddings or multimodal data."
+            )
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        """Seed the device RNGs; the NPU has none.
+
+        vLLM's ``set_random_seed`` has already seeded Python, NumPy and torch's CPU generator, which is where this
+        platform samples.
+        """
+        del seed
 
     @classmethod
     def _prepare_data_parallel(cls, vllm_config: "VllmConfig") -> None:
@@ -435,6 +452,7 @@ class MbltPlatform(Platform):
         if data_parallel_size <= 1:
             return
         local_size = _coerce_positive_int(getattr(parallel_config, "data_parallel_size_local", None))
+        record_data_parallel_layout(vllm_config, size=data_parallel_size, size_local=local_size or data_parallel_size)
         cards = export_card_list_for_ranks(
             collect_placement_kwargs(_get_model_loader_extra_config(vllm_config)),
             local_data_parallel_size=local_size or data_parallel_size,
@@ -450,8 +468,25 @@ class MbltPlatform(Platform):
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         parallel_config: ParallelConfig = vllm_config.parallel_config  # type: ignore
         parallel_config.worker_cls = "vllm_mblt.mblt_worker.MbltWorker"
+        # vLLM 0.32 defaults data parallel engines to the multiprocessing executor, which runs the worker in its own
+        # process and gives it OMP_NUM_THREADS = all of the host's CPUs, so several engines oversubscribe the host.
+        # Each engine here has one worker (no tensor or pipeline parallelism), so run it in the engine process as
+        # vLLM 0.11 did; vLLM then splits the host's CPUs among the local engines itself.
+        if (
+            getattr(parallel_config, "world_size", 1) == 1
+            and getattr(parallel_config, "distributed_executor_backend", None) == "mp"
+        ):
+            logger.info("Running each engine's single worker in-process (distributed_executor_backend=uni).")
+            parallel_config.distributed_executor_backend = "uni"
         cls._serving_eagle3 = _is_eagle3_hf_config(_get_hf_config(vllm_config))
         cls._prepare_data_parallel(vllm_config)
+
+        # vLLM 0.32 turns async scheduling on by default. The engine then takes each step's result from a separate
+        # sample_tokens() call, while this worker samples inside execute_model() and returns the whole output there.
+        scheduler_config = vllm_config.scheduler_config
+        if getattr(scheduler_config, "async_scheduling", False):
+            logger.info("Disabling async scheduling: the MBLT worker samples inside execute_model().")
+            scheduler_config.async_scheduling = False
 
         cache_config: CacheConfig = vllm_config.cache_config
         # Keep user-provided value if present. Otherwise, use a smaller block
@@ -572,8 +607,7 @@ class MbltPlatform(Platform):
                     setattr(scheduler_config, attr_name, effective_max_num_seqs)
             if print_debug:
                 logger.info(
-                    "Using per-sequence chunk size %d across %d scheduler sequences "
-                    "(max_num_batched_tokens=%d).",
+                    "Using per-sequence chunk size %d across %d scheduler sequences (max_num_batched_tokens=%d).",
                     resolved_chunk_size,
                     effective_max_num_seqs,
                     scheduler_config.max_num_batched_tokens,

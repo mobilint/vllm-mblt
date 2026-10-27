@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm import ModelRegistry
 
 from tests.test_mblt_platform_prefill import _make_vllm_config
@@ -186,6 +187,7 @@ def test_load_model_forwards_moe_role_placement_kwargs(monkeypatch) -> None:
             "expert_target_cores": ["0:0:0", "0:0:1"],
             "lm_head_target_cores": ["1:0:0"],
             "num_expert_workers": 8,
+            "dtype": torch.float32,
         }
     ]
 

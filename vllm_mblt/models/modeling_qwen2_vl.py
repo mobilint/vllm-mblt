@@ -15,7 +15,7 @@ from vllm.model_executor.models.qwen2_vl import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
-from vllm_mblt.models.modeling_vl_utils import MobilintVLCachedProcessorMixin
+import vllm_mblt.models.modeling_vl_utils  # noqa: F401  (resolves SupportsMultiModal's annotation for transformers 5)
 
 
 class MobilintQwen2VLProcessingInfo(Qwen2VLProcessingInfo):
@@ -27,15 +27,8 @@ class MobilintQwen2VLProcessingInfo(Qwen2VLProcessingInfo):
         )
 
 
-class MobilintQwen2VLMultiModalProcessor(
-    MobilintVLCachedProcessorMixin,
-    Qwen2VLMultiModalProcessor,
-):
-    pass
-
-
 @MULTIMODAL_REGISTRY.register_processor(
-    MobilintQwen2VLMultiModalProcessor,
+    Qwen2VLMultiModalProcessor,
     info=MobilintQwen2VLProcessingInfo,
     dummy_inputs=Qwen2VLDummyInputsBuilder,
 )

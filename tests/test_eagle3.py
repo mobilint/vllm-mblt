@@ -2,10 +2,10 @@
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 from vllm import ModelRegistry
+from vllm.exceptions import VLLMValidationError
 
 from tests.test_mblt_platform_prefill import _make_vllm_config
 from vllm_mblt import register_model
@@ -95,7 +95,7 @@ def _step(scheduled, *, new=(), cached=(), finished=(), resumed=(), all_token_id
 
 
 def _sampled(output, req_id):
-    return output.sampled_token_ids[output.req_id_to_index[req_id]].tolist()
+    return output.sampled_token_ids[output.req_id_to_index[req_id]]
 
 
 def test_a_prompt_is_fed_once_vllm_has_scheduled_all_of_it_and_returns_the_first_token() -> None:
@@ -326,19 +326,17 @@ def test_platform_refuses_sampling_options_eagle3_rounds_cannot_honor() -> None:
 
     MbltPlatform.check_and_update_config(_eagle3_vllm_config())
     try:
-        MbltPlatform.validate_request("p", SamplingParams(temperature=0.6, top_p=0.9, top_k=20), {"type": "token"})
+        MbltPlatform.validate_request({"type": "token"}, SamplingParams(temperature=0.6, top_p=0.9, top_k=20))
         # vLLM fans n > 1 out into child requests with their own ids, so each candidate gets its own cache.
-        MbltPlatform.validate_request("p", SamplingParams(n=3, temperature=0.8), {"type": "token"})
-        with pytest.raises(ValueError, match="unsupported here: logprobs, repetition_penalty, seed"):
-            MbltPlatform.validate_request(
-                "p", SamplingParams(logprobs=1, repetition_penalty=1.1, seed=3), {"type": "token"}
-            )
-        with pytest.raises(ValueError, match="token prompts only"):
-            MbltPlatform.validate_request("p", SamplingParams(), {"type": "embeds"})
+        MbltPlatform.validate_request({"type": "token"}, SamplingParams(n=3, temperature=0.8))
+        with pytest.raises(VLLMValidationError, match="unsupported here: logprobs, repetition_penalty, seed"):
+            MbltPlatform.validate_request({"type": "token"}, SamplingParams(logprobs=1, repetition_penalty=1.1, seed=3))
+        with pytest.raises(VLLMValidationError, match="token prompts only"):
+            MbltPlatform.validate_request({"type": "embeds"}, SamplingParams())
     finally:
         MbltPlatform.check_and_update_config(_make_vllm_config(128))
     # Other models keep every option.
-    MbltPlatform.validate_request("p", SamplingParams(logprobs=1, seed=3), {"type": "token"})
+    MbltPlatform.validate_request({"type": "token"}, SamplingParams(logprobs=1, seed=3))
 
 
 class _Processor:
@@ -348,7 +346,7 @@ class _Processor:
         self.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
 
     def process_inputs(self, params) -> None:
-        MbltPlatform.validate_request(prompt="p", params=params, processed_inputs={"type": "token"})
+        MbltPlatform.validate_request(processed_inputs={"type": "token"}, params=params)
 
 
 def test_validation_follows_the_engine_that_processes_the_request() -> None:
@@ -359,7 +357,7 @@ def test_validation_follows_the_engine_that_processes_the_request() -> None:
     for configured_last in (_eagle3_vllm_config(), _make_vllm_config(128)):
         MbltPlatform.check_and_update_config(configured_last)
         dense.process_inputs(penalized)
-        with pytest.raises(ValueError, match="repetition_penalty"):
+        with pytest.raises(VLLMValidationError, match="repetition_penalty"):
             eagle3.process_inputs(penalized)
     MbltPlatform.check_and_update_config(_make_vllm_config(128))
 
@@ -377,8 +375,11 @@ def test_register_model_registers_the_eagle3_architectures_by_import_path() -> N
         assert registered.class_name == architecture
 
 
-def test_sampled_token_arrays_are_int64() -> None:
+def test_sampled_tokens_are_plain_int_lists() -> None:
+    # vLLM 0.32's scheduler takes list[list[int]] and tests each entry for truth, which a NumPy array of a round's
+    # several tokens cannot answer.
     model = _FakeEagle3Model()
     runner = _runner(model)
     out = runner.execute(_step({"a": 1}, new=[_new_req("a", [5])]))
-    assert out.sampled_token_ids[0].dtype == np.int64
+    (tokens,) = out.sampled_token_ids
+    assert isinstance(tokens, list) and tokens and all(type(token) is int for token in tokens)

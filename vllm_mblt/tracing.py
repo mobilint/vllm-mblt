@@ -27,16 +27,17 @@ import threading
 import time
 from typing import Any, Optional
 
-from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# vLLM's own switch for worker profiling. Reused rather than replaced with an
-# MBLT-specific variable so `/start_profile`, `LLM.start_profile()` and
+# vLLM's own setting for worker profiling. Reused rather than replaced with an
+# MBLT-specific option so `/start_profile`, `LLM.start_profile()` and
 # `vllm bench serve --profile` keep working unchanged: the OpenAI server only
-# registers the profile routes when this is set.
-TRACE_DIR_ENV_VAR = "VLLM_TORCH_PROFILER_DIR"
+# registers the profile routes when `--profiler-config.profiler` is set, and
+# `torch_profiler_dir` is accepted only with `profiler=torch`.
+TRACE_DIR_OPTION = "--profiler-config.torch_profiler_dir"
+TRACE_ENABLE_HINT = "--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=DIR"
 
 # Names the profiler a trace came from, the way vLLM's own front-end traces
 # carry `async_llm`, so both are recognizable in one directory listing.
@@ -67,15 +68,16 @@ def _external_trace_owner() -> Optional[str]:
     return None
 
 
-def resolve_trace_dir() -> Optional[str]:
+def resolve_trace_dir(profiler_config: Optional[Any]) -> Optional[str]:
     """Return the directory traces are written to, or None if tracing is off.
 
-    The value is whatever vLLM resolved the variable to -- it expands `~` and
-    makes the path absolute -- rather than a second normalization of the raw
-    environment variable, so the NPU trace lands beside the front-end CPU
-    trace instead of wherever this module happened to resolve it to.
+    The value is ``profiler_config.torch_profiler_dir`` as vLLM's
+    ``ProfilerConfig`` resolved it -- it expands `~` and makes the path
+    absolute -- rather than a second normalization of the raw option, so the
+    NPU trace lands beside the front-end CPU trace instead of wherever this
+    module happened to resolve it to.
     """
-    trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+    trace_dir = getattr(profiler_config, "torch_profiler_dir", "") if profiler_config is not None else ""
     if not trace_dir:
         return None
     if "://" in trace_dir:
@@ -83,7 +85,7 @@ def resolve_trace_dir() -> Optional[str]:
         # straight through for its own traces. qbruntime writes through a plain
         # file path and cannot reach one, and treating it as a local path would
         # silently create a directory named after the URI.
-        raise RuntimeError(f"NPU event tracing needs a local directory, but {TRACE_DIR_ENV_VAR} is {trace_dir!r}.")
+        raise RuntimeError(f"NPU event tracing needs a local directory, but {TRACE_DIR_OPTION} is {trace_dir!r}.")
     return trace_dir
 
 

@@ -13,6 +13,8 @@ import torch.nn as nn
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+import vllm.v1.core.sched.output as _sched_output
+import vllm.v1.sample.ops.topk_topp_sampler as _topk_topp_sampler
 from mblt_model_zoo.hf_transformers.utils.generation_utils import MobilintGenerationMixin
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
 from transformers_mblt.utils.cache_utils import MobilintCache, MobilintDeepStackCache
@@ -20,16 +22,19 @@ from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
+from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MLAAttentionSpec
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
-from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_mblt.data_parallel import (
     IdleStepPacer,
+    data_parallel_layout,
+    narrow_visible_devices_to_rank_card,
     place_model_kwargs_on_card,
     resolve_rank_card,
     runtime_device_number,
@@ -52,9 +57,29 @@ from vllm_mblt.runtime_cache import (
     first_seq_blocks,
     normalize_block_ids,
 )
-from vllm_mblt.tracing import TRACE_DIR_ENV_VAR, MbltTracer, resolve_trace_dir
+from vllm_mblt.tracing import TRACE_ENABLE_HINT, MbltTracer, resolve_trace_dir
 
 logger = init_logger(__name__)
+
+# vLLM 0.32 applies top-k/top-p with a Triton kernel whenever Triton reports a usable driver (HAS_TRITON), whatever
+# device the logits are on. Here the logits are always host tensors, and that path fails ("num_compute_units is
+# not implemented for the current platform") on hosts where a GPU driver, or an empty CUDA_VISIBLE_DEVICES, makes
+# Triton look available. Sample with vLLM's PyTorch implementation, as vLLM 0.11 always did.
+_topk_topp_sampler.HAS_TRITON = False
+
+
+def _keep_covered_mm_data(
+    mm_features: list[MultiModalFeatureSpec], num_computed_tokens: int, uses_mrope: bool = False
+) -> list[MultiModalFeatureSpec]:
+    del num_computed_tokens, uses_mrope
+    return mm_features
+
+
+# vLLM 0.32's scheduler drops the tensor data of a new request's multimodal items that its prefix cache covers,
+# because a GPU worker never re-encodes them. This worker keeps its own, smaller set of prefix snapshots and rebuilds
+# the whole prompt's embeddings for every new request, recomputing a prefix it does not hold; a repeated image or
+# audio clip then arrived without its data. Send the items whole, as vLLM 0.11 did.
+_sched_output.strip_covered_mm_data = _keep_covered_mm_data
 
 
 _TRUE_ENV_VALUES = frozenset({"1", "true", "TRUE", "True"})
@@ -450,8 +475,7 @@ class PrefixCacheCostModel:
         num_tokens = max(1, int(num_tokens))
         min_tokens = self.manual_min_hit_tokens or 1
         return max(
-            [estimate]
-            + [ms for tokens, ms in self.prefill_ms_by_tokens.items() if min_tokens <= tokens <= num_tokens]
+            [estimate] + [ms for tokens, ms in self.prefill_ms_by_tokens.items() if min_tokens <= tokens <= num_tokens]
         )
 
     def prefill_ms(self, matched_tokens: int) -> Optional[float]:
@@ -1192,6 +1216,13 @@ class MbltWorker(WorkerBase):
         pooler_output = getattr(embeddings, "pooler_output", None)
         if isinstance(pooler_output, torch.Tensor):
             return pooler_output
+        # transformers 5 returns a ModelOutput whose pooler_output holds one tensor per image or video.
+        if isinstance(pooler_output, (list, tuple)) and pooler_output:
+            if not all(isinstance(item, torch.Tensor) for item in pooler_output):
+                raise RuntimeError(
+                    f"Unsupported multimodal pooler_output: {[type(item).__name__ for item in pooler_output]!r}"
+                )
+            return pooler_output[0] if len(pooler_output) == 1 else torch.cat(tuple(pooler_output), dim=0)
         if isinstance(embeddings, (list, tuple)) and embeddings:
             first = embeddings[0]
             if isinstance(first, torch.Tensor):
@@ -1208,12 +1239,16 @@ class MbltWorker(WorkerBase):
 
     @staticmethod
     def _extract_deepstack_embeddings(embeddings: object) -> Optional[list[torch.Tensor]]:
-        if not isinstance(embeddings, (list, tuple)) or len(embeddings) < 2:
-            return None
-        first = embeddings[0]
-        deepstack = embeddings[1]
-        if not isinstance(first, (list, tuple)):
-            return None
+        if hasattr(embeddings, "pooler_output"):
+            # transformers 5: Qwen3-VL's ModelOutput carries one tensor per deepstack layer (all items joined).
+            deepstack = getattr(embeddings, "deepstack_features", None)
+        else:
+            if not isinstance(embeddings, (list, tuple)) or len(embeddings) < 2:
+                return None
+            first = embeddings[0]
+            deepstack = embeddings[1]
+            if not isinstance(first, (list, tuple)):
+                return None
         if deepstack is None:
             return None
         if not isinstance(deepstack, (list, tuple)):
@@ -1392,7 +1427,7 @@ class MbltWorker(WorkerBase):
                     raise RuntimeError("Audio multimodal feature is missing input_features.")
                 feature_attention_mask = self._extract_multimodal_value(feature, "feature_attention_mask")
                 if feature_attention_mask is None:
-                    # qwen_asr's get_audio_features() falls back to feature_attention_mask.sum(-1) when the
+                    # Qwen3-ASR's get_audio_features() falls back to feature_attention_mask.sum(-1) when the
                     # mask is None, so a missing mask would surface as an AttributeError.
                     raise RuntimeError(
                         "Audio multimodal feature is missing feature_attention_mask; the feature "
@@ -1571,6 +1606,7 @@ class MbltWorker(WorkerBase):
             # no second_per_grid_ts input; the token offsets carry that timing.
             position_ids, mrope_delta = get_rope_index(
                 input_ids=input_ids,
+                mm_token_type_ids=self._mm_token_type_ids(input_ids),
                 image_grid_thw=torch.cat(image_grids, dim=0) if image_grids else None,
                 video_grid_thw=torch.cat(video_grids, dim=0) if video_grids else None,
             )
@@ -1584,6 +1620,20 @@ class MbltWorker(WorkerBase):
             )
 
         return torch.arange(input_ids.shape[1], dtype=torch.long).view(1, 1, -1).expand(3, 1, -1), 0
+
+    def _mm_token_type_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Per-token modality of ``input_ids`` (0 text, 1 image, 2 video), which transformers 5's get_rope_index takes.
+
+        Built the way transformers 5's processors build it (``ProcessorMixin.create_mm_token_type_ids``): by comparing
+        each token with the model's image and video placeholder token ids.
+        """
+        config = getattr(self.model, "config", None)
+        token_types = torch.zeros_like(input_ids, dtype=torch.int)
+        for type_id, attr in ((1, "image_token_id"), (2, "video_token_id")):
+            token_id = getattr(config, attr, None)
+            if token_id is not None:
+                token_types[input_ids == int(token_id)] = type_id
+        return token_types
 
     @staticmethod
     def _row_position_ids(req_state: Optional[RequestState], start: int, end: int) -> torch.Tensor:
@@ -3131,6 +3181,7 @@ class MbltWorker(WorkerBase):
 
     def init_device(self) -> None:
         self._log_init_stage("init_device")
+        narrow_visible_devices_to_rank_card(self.vllm_config)
         apply_engine_host_thread_defaults(self.vllm_config)
         return
 
@@ -3139,9 +3190,9 @@ class MbltWorker(WorkerBase):
 
         A single engine (data parallel size 1) keeps the kwargs as given.
         """
-        parallel_config = getattr(self.vllm_config, "parallel_config", None)
-        if (getattr(parallel_config, "data_parallel_size", 1) or 1) <= 1:
+        if data_parallel_layout(self.vllm_config)[0] <= 1:
             return model_kwargs
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
         local_rank = getattr(parallel_config, "data_parallel_rank_local", None) or 0
         card = resolve_rank_card(model_kwargs, local_rank=local_rank)
         device_number = runtime_device_number(card)
@@ -3166,7 +3217,9 @@ class MbltWorker(WorkerBase):
         pacer = self._idle_step_pacer or IdleStepPacer()
         time.sleep(pacer.idle_seconds())
 
-    def load_model(self) -> None:
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        if load_dummy_weights:
+            raise NotImplementedError("Mobilint models load compiled MXQ weights; dummy weights are not supported.")
         self._log_init_stage("load_model:start", model=self.model_config.model)
         model_kwargs: Dict[str, object] = {}
 
@@ -3193,6 +3246,12 @@ class MbltWorker(WorkerBase):
 
         hf_config = getattr(self.model_config, "hf_config", None)
         model_kwargs = _normalize_model_kwargs_for_hf_config(model_kwargs, hf_config)
+        if "dtype" not in model_kwargs and "torch_dtype" not in model_kwargs:
+            # transformers 5 loads in the config's dtype (bfloat16 for most releases) where transformers 4 loaded
+            # float32. The host-side weights (embeddings, vision projections) of some releases are stored in
+            # float32, and rounding them to bfloat16 changes what the NPU receives and the greedy output. Keep
+            # transformers 4's float32 unless the loader config names a dtype.
+            model_kwargs["dtype"] = torch.float32
         model_kwargs = self._place_on_data_parallel_card(model_kwargs, hf_config)
 
         start = time.perf_counter()
@@ -3248,8 +3307,7 @@ class MbltWorker(WorkerBase):
             # forward; the adapter only presents it as one single-slot cache model.
             if self._is_batch_model():
                 raise RuntimeError(
-                    "Mixture-of-Experts models support only non-batch serving: "
-                    f"max_batch_size={self.max_batch_size}."
+                    f"Mixture-of-Experts models support only non-batch serving: max_batch_size={self.max_batch_size}."
                 )
             self.cache_model = MbltMoECacheModel(self.model)
             self.cache_backend = None
@@ -3371,6 +3429,14 @@ class MbltWorker(WorkerBase):
                 prompt_token_ids[row, : token_ids.numel()] = token_ids
         return prompt_token_ids
 
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        """vLLM's default layout preference: the NPU keeps KV in its own MXQ slots, not in vLLM's cache.
+
+        The base implementation asks the platform for the current attention backends, which this platform has none
+        of ("Invalid attention backend for cpu" at engine start-up).
+        """
+        return [layout.name for layout in get_supported_kv_cache_layouts(())]
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {
             "mblt": MLAAttentionSpec(block_size=self._kv_block_size(), num_kv_heads=1, head_size=1, dtype=torch.int8)
@@ -3384,9 +3450,10 @@ class MbltWorker(WorkerBase):
             num_groups=len(getattr(kv_cache_config, "groups", {}) or {}),
         )
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
+        """Nothing to compile: the MXQs are compiled ahead of time. vLLM 0.32 reads the times this returns."""
         self._log_init_stage("compile_or_warm_up_model")
-        pass
+        return CompilationTimes(language_model=0.0, encoder=0.0)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Advertise transcription from the model class, not the HF model_type.
@@ -3445,16 +3512,15 @@ class MbltWorker(WorkerBase):
 
     def _get_tracer(self) -> MbltTracer:
         if self._tracer is None:
-            trace_dir = resolve_trace_dir()
+            trace_dir = resolve_trace_dir(getattr(self.vllm_config, "profiler_config", None))
             if trace_dir is None:
                 raise RuntimeError(
-                    f"NPU event tracing is not enabled. Set {TRACE_DIR_ENV_VAR} to a directory "
-                    "before starting the server to enable it."
+                    f"NPU event tracing is not enabled. Start the server with {TRACE_ENABLE_HINT} to enable it."
                 )
             self._tracer = MbltTracer(trace_dir, rank=self.rank)
         return self._tracer
 
-    def profile(self, is_start: bool = True) -> None:
+    def profile(self, is_start: bool = True, profile_prefix: Optional[str] = None, **_unused: object) -> None:
         """Start or stop an NPU event trace.
 
         vLLM's `Executor.profile()` reaches every worker through
@@ -3473,6 +3539,10 @@ class MbltWorker(WorkerBase):
         be written, the caller hears about it rather than being told the
         profile succeeded and finding no trace on disk. A repeated start or a
         stop with nothing running is not a failure and only logs.
+
+        ``profile_prefix`` and vLLM 0.32's ``delay_iterations`` / ``max_iterations`` are accepted for the
+        hook's signature and not used: the trace file is named by rank and time (`tracing.trace_filename`), and
+        a qbruntime trace runs from start to stop.
         """
         tracer = self._get_tracer()
         if is_start:
@@ -3875,7 +3945,9 @@ class MbltWorker(WorkerBase):
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
 
-        sampled_token_ids: list[np.ndarray] = [np.empty(0, dtype=np.int64) for _ in req_ids]
+        # vLLM 0.32 takes plain token lists here and tests them for truth, which a NumPy array of more than one
+        # token cannot answer.
+        sampled_token_ids: list[list[int]] = [[] for _ in req_ids]
         logprobs = None
 
         if logits_batch:
@@ -3887,10 +3959,7 @@ class MbltWorker(WorkerBase):
             for i, req_id in enumerate(sampling_req_ids):
                 self.req_states[req_id].output_token_ids.extend(sampled_token_ids_int[i])
                 generated_lengths_by_req_id[req_id] = len(sampled_token_ids_int[i])
-                sampled_token_ids[req_id_to_index[req_id]] = np.asarray(
-                    sampled_token_ids_int[i],
-                    dtype=np.int64,
-                )
+                sampled_token_ids[req_id_to_index[req_id]] = sampled_token_ids_int[i]
 
             if sampler_output.logprobs_tensors is not None:
                 cu_num_generated_tokens = [0]

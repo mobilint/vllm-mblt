@@ -35,10 +35,11 @@ artifacts can be served through familiar vLLM commands and OpenAI-compatible API
 
 ## Requirements
 
-- Python 3.10+
-- `vllm==0.11.2`
-- `mblt-model-zoo[transformers] >= 2.7.0`
-- For Qwen3-ASR, the `qwen-asr` extra: `pip install "vllm-mblt[qwen-asr]"`
+- Python 3.11+
+- `vllm==0.32.0`
+- `transformers-mblt >= 0.6.1` and `mblt-model-zoo[transformers] >= 2.11.0`
+- Qwen3-ASR is not yet supported on this release. Support will come with the transformers-mblt 0.7.0 release,
+  through the `qwen-asr` extra (see [Serve a Speech-to-Text Model](#4-serve-a-speech-to-text-model)).
 - For Qwen3-MoE (`mobilint/Qwen3-30B-A3B`), the `qwen3-moe` extra: `pip install "vllm-mblt[qwen3-moe]"`
 - A Mobilint NPU environment. If you are not yet a Mobilint customer, please contact
   [tech-support@mobilint.com](mailto:tech-support@mobilint.com).
@@ -120,7 +121,9 @@ Current Mobilint Qwen2/3-VL notes:
 
 ### 4. Serve a Speech-to-Text Model
 
-Qwen3-ASR needs the optional `qwen-asr` extra:
+> **Not yet supported.** Qwen3-ASR will be supported once transformers-mblt 0.7.0 is released. vLLM 0.32 needs
+> transformers 5, and the `qwen-asr` package that Qwen3-ASR used pins transformers 4.57. transformers-mblt 0.7.0
+> vendors that backend, and the `qwen-asr` extra below requires it, so it cannot be installed until then.
 
 ```bash
 pip install "vllm-mblt[qwen-asr]"
@@ -361,9 +364,10 @@ vllm serve mobilint/Qwen3-0.6B \
   (for example `QBRUNTIME_VISIBLE_DEVICES=1,2,3`) or pass a `dev_no` list in `--model-loader-extra-config`
   (`'{"dev_no": [1, 2, 3]}'`); engine `r` takes the `r`-th card. Set only one of them. A single `dev_no` card
   is refused, as it would put every engine on one card, and so is a list shorter than the number of engines.
-- vLLM starts each engine with `QBRUNTIME_VISIBLE_DEVICES` set to that engine's card. qbruntime renumbers the
-  listed cards from 0, as `CUDA_VISIBLE_DEVICES` does, and cannot open the others (verified on qbruntime 1.5.0
-  with 3 cards), so every engine opens its card as `dev_no` 0.
+- vLLM records each engine's card in its config (`assigned_physical_gpu_ids`), and the worker narrows
+  `QBRUNTIME_VISIBLE_DEVICES` to that card before it opens the NPU. qbruntime renumbers the listed cards from 0,
+  as `CUDA_VISIBLE_DEVICES` does, and cannot open the others (verified on qbruntime 1.5.0 with 3 cards), so every
+  engine opens its card as `dev_no` 0.
 - Every NPU role of the model runs on the engine's card: the vision and text MXQs of a VLM, the base, draft and
   FC MXQs of an EAGLE-3 release, the encoder and decoder of Qwen3-ASR, and the shared, expert and `lm_head` MXQs
   of a Mixture-of-Experts model. Each role keeps the cores or clusters the release (or a prefixed `*_target_cores`
@@ -379,6 +383,10 @@ vllm serve mobilint/Qwen3-0.6B \
   gloo group every 32 steps. An idle engine waits about one of its recent model steps per wave step instead of
   running the model, so it neither spins a CPU core nor blocks early at that all-reduce.
 - `--data-parallel-size 1` (the default) serves exactly as before.
+- vLLM's data parallel front end exchanges requests through shared memory (`/dev/shm`). A three-engine serve
+  allocates 160 MiB there, more than a container's default 64 MiB, and engine start-up then fails with
+  "Insufficient space in /dev/shm". Give the container more, e.g. `docker run --shm-size 1g` or `--ipc=host`.
+  vLLM 0.32 also starts one API server process per engine by default (`--api-server-count`).
 
 ### Host CPU Threads
 
@@ -459,13 +467,16 @@ event tracer, so you can see where time actually goes on the accelerator. It is
 wired into vLLM's standard worker profiler hook, which means the usual controls
 apply -- there is no MBLT-specific flag or endpoint.
 
-Set `VLLM_TORCH_PROFILER_DIR` to a directory before starting the server. This is
-the switch: without it the OpenAI server does not register the profile routes,
-and the worker reports that tracing is not enabled.
+Start the server with vLLM's profiler config pointing at a directory. This is
+the switch: without `--profiler-config.profiler` the OpenAI server does not
+register the profile routes, and without `torch_profiler_dir` the worker reports
+that tracing is not enabled. vLLM accepts the directory only with
+`profiler=torch`; that also turns on its own front-end CPU trace (below).
 
 ```bash
-export VLLM_TORCH_PROFILER_DIR=/tmp/mblt_traces
-vllm serve mobilint/Llama-3.2-1B-Instruct --trust-remote-code
+vllm serve mobilint/Llama-3.2-1B-Instruct --trust-remote-code \
+  --profiler-config.profiler=torch \
+  --profiler-config.torch_profiler_dir=/tmp/mblt_traces
 ```
 
 Then bracket the work you care about:
@@ -491,8 +502,8 @@ spans -- `infer`, `run npu`, `copy to npu`, `lock core`, `read device` and the
 like -- so a window shows what each inference step spent on the accelerator.
 
 vLLM writes its own front-end CPU trace (`*.async_llm.*.pt.trace.json.gz`) into
-the same directory, because `VLLM_TORCH_PROFILER_DIR` also enables the API
-server's `AsyncLLM` profiler. The two are complementary: that file covers
+the same directory, because `--profiler-config.profiler=torch` also enables the
+API server's `AsyncLLM` profiler. The two are complementary: that file covers
 CPU-side scheduling, the MBLT file covers NPU execution.
 
 Notes:

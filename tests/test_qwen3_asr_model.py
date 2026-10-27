@@ -1,8 +1,8 @@
 """Contract tests for the Qwen3-ASR vLLM wrapper.
 
-The wrapper imports the optional qwen-asr package, which the test job does not install, so this
-module skips without it. The worker's audio path is tested in test_mblt_worker_optimizations.py
-and runs either way.
+The wrapper imports the Qwen3-ASR backend that transformers-mblt vendors from 0.7.0; with an older
+transformers-mblt this module skips. The worker's audio path is tested in
+test_mblt_worker_optimizations.py and runs either way.
 """
 
 from types import SimpleNamespace
@@ -12,12 +12,13 @@ import pytest
 import torch
 from transformers import BatchFeature
 from vllm.config.multimodal import AudioDummyOptions
+from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.models import is_text_generation_model, supports_multimodal, supports_transcription
 from vllm.multimodal.inputs import MultiModalBatchedField, PlaceholderRange
 from vllm.multimodal.processing import BaseMultiModalProcessor
 from vllm.transformers_utils import processor as processor_utils
 
-pytest.importorskip("qwen_asr")
+pytest.importorskip("transformers_mblt.models.qwen3_asr._upstream")
 
 from vllm_mblt.models import modeling_qwen3_asr as asr  # noqa: E402
 
@@ -49,7 +50,7 @@ def _generation_prompt(**overrides: object) -> dict:
         "to_language": None,
     }
     kwargs.update(overrides)
-    return Model.get_generation_prompt(**kwargs)
+    return Model.get_generation_prompt(SimpleNamespace(**kwargs))
 
 
 def _dummy_inputs_builder(*, chunk_length: int = 30) -> asr.MobilintQwen3ASRDummyInputsBuilder:
@@ -86,6 +87,7 @@ def _multimodal_processor(
         get_tokenizer=lambda: tokenizer,
         ctx=SimpleNamespace(call_hf_processor=call_hf_processor),
     )
+    processor.dummy_inputs = _dummy_inputs_builder()
     return processor
 
 
@@ -145,33 +147,41 @@ def test_dummy_inputs_honour_a_shorter_length_override() -> None:
 
 
 def test_data_parser_resamples_audio_to_the_feature_extractor_rate() -> None:
-    parser = _multimodal_processor()._get_data_parser()
+    info = object.__new__(asr.MobilintQwen3ASRProcessingInfo)
+    info.get_feature_extractor = lambda: SimpleNamespace(sampling_rate=16000)
+    info._get_expected_hidden_size = lambda: None
+    info.ctx = SimpleNamespace(model_config=SimpleNamespace(multimodal_config=None))
+    parser = info.get_data_parser()
 
     items = parser.parse_mm_data({"audio": (np.zeros(8000, dtype=np.float32), 8000)})
 
     assert items["audio"].get(0).shape == (16000,)
 
 
-def test_hf_processor_call_normalises_the_audio_key_and_passes_the_feature_extractor_rate() -> None:
+def test_hf_processor_text_is_one_audio_pad_per_clip() -> None:
+    assert _multimodal_processor()._get_hf_mm_text({"audio": 1}) == AUDIO_PAD
+
+
+def test_hf_processor_call_passes_the_feature_extractor_rate() -> None:
     calls = []
     processor = _multimodal_processor(hf_calls=calls, sampling_rate=24000)
 
-    processor._call_hf_processor(prompt="p", mm_data={"audios": [CLIP]}, mm_kwargs={}, tok_kwargs={})
+    # vLLM adds truncation=False next to the dummy text.
+    processor._call_hf_processor({"text": AUDIO_PAD, "audio": [CLIP]}, {"truncation": False})
 
     ((_, data, kwargs),) = calls
-    assert "audios" not in data
     assert data["audio"][0] is CLIP
-    assert data["text"] == "p"
-    assert kwargs["sampling_rate"] == 24000
+    assert data["text"] == AUDIO_PAD
+    assert kwargs == {"truncation": False, "sampling_rate": 24000}
 
 
-@pytest.mark.parametrize("mm_kwargs", [{"feature_size": 64}, {"sampling_rate": 16000}, {"sampling_rate": 8000}])
-def test_hf_processor_call_refuses_processor_overrides(mm_kwargs: dict) -> None:
+@pytest.mark.parametrize("hf_kwargs", [{"feature_size": 64}, {"sampling_rate": 16000}, {"sampling_rate": 8000}])
+def test_hf_processor_call_refuses_processor_overrides(hf_kwargs: dict) -> None:
     calls = []
     processor = _multimodal_processor(hf_calls=calls)
 
-    with pytest.raises(ValueError, match="does not accept processor overrides"):
-        processor._call_hf_processor(prompt="p", mm_data={"audios": [CLIP]}, mm_kwargs=mm_kwargs, tok_kwargs={})
+    with pytest.raises(VLLMValidationError, match="does not accept processor overrides"):
+        processor._call_hf_processor({"audio": [CLIP]}, {"truncation": False, **hf_kwargs})
     assert calls == []
 
 
@@ -181,25 +191,15 @@ def test_hf_processor_call_refuses_audio_whose_features_are_not_finite(bad_value
     input_features[0, 0, 0] = bad_value
     processor = _multimodal_processor(hf_output=BatchFeature({"input_features": input_features}))
 
-    with pytest.raises(ValueError, match="features are not finite"):
-        processor._call_hf_processor(prompt="p", mm_data={"audios": [CLIP]}, mm_kwargs={}, tok_kwargs={})
+    with pytest.raises(VLLMValidationError, match="features are not finite"):
+        processor._call_hf_processor({"audio": [CLIP]}, {})
 
 
 def test_hf_processor_call_returns_finite_features_unchanged() -> None:
     outputs = BatchFeature({"input_features": torch.zeros(1, 128, 10)})
     processor = _multimodal_processor(hf_output=outputs)
 
-    assert processor._call_hf_processor(prompt="p", mm_data={"audios": [CLIP]}, mm_kwargs={}, tok_kwargs={}) is outputs
-
-
-def test_hf_processor_call_tokenizes_text_only_prompts_without_the_audio_processor() -> None:
-    calls = []
-    processor = _multimodal_processor(encode=lambda _text: [11, 12, 13], hf_calls=calls)
-
-    out = processor._call_hf_processor(prompt="hello", mm_data={}, mm_kwargs={}, tok_kwargs={})
-
-    assert out["input_ids"].tolist() == [[11, 12, 13]]
-    assert calls == []
+    assert processor._call_hf_processor({"audio": [CLIP]}, {}) is outputs
 
 
 @pytest.mark.parametrize(
@@ -221,7 +221,7 @@ def test_apply_refuses_a_prompt_that_leaves_no_room_to_generate(
     )
 
     if refused:
-        with pytest.raises(ValueError, match="leaves no room to generate"):
+        with pytest.raises(VLLMValidationError, match="leaves no room to generate"):
             processor.apply("prompt", {}, {})
     else:
         assert len(processor.apply("prompt", {}, {})["prompt_token_ids"]) == num_tokens
@@ -250,7 +250,7 @@ def test_apply_refuses_audio_placeholders_that_no_clip_fills(
     monkeypatch.setattr(BaseMultiModalProcessor, "apply", lambda self, *args, **kwargs: out)
 
     if refused:
-        with pytest.raises(ValueError, match="audio placeholder tokens but its audio fills"):
+        with pytest.raises(VLLMValidationError, match="audio placeholder tokens but its audio fills"):
             processor.apply("prompt", {}, {})
     else:
         assert processor.apply("prompt", {}, {}) is out
@@ -275,13 +275,13 @@ def test_prompt_updates_reserve_one_pad_per_audio_embedding_for_each_clip() -> N
     (update,) = processor._get_prompt_updates(mm_items=None, hf_processor_mm_kwargs={}, out_mm_kwargs=out_mm_kwargs)
 
     assert update.modality == "audio"
-    assert update.target == AUDIO_PAD
+    assert update.target == [AUDIO_PAD_ID]
     # 13 tokens per 100-frame second, plus 11 for the 81-frame tail of the 4.8 s clip.
     expected = [63, 390]
     for item_idx, num_features in enumerate(expected):
         details = update.replacement(item_idx)
         assert details.full == [AUDIO_PAD_ID] * num_features
-        assert details.is_embed(None, details.full).all()
+        assert details.is_embed(details.full).all()
 
 
 def test_prompt_updates_explain_a_clip_the_processor_produced_no_fields_for() -> None:
@@ -291,7 +291,7 @@ def test_prompt_updates_explain_a_clip_the_processor_produced_no_fields_for() ->
         mm_items=None, hf_processor_mm_kwargs={}, out_mm_kwargs=out_mm_kwargs
     )
 
-    with pytest.raises(ValueError, match="No audio feature length for item 0"):
+    with pytest.raises(VLLMValidationError, match="No audio feature length for item 0"):
         update.replacement(0)
 
 
@@ -306,7 +306,7 @@ def test_vllm_recognises_a_multimodal_transcription_model_for_the_generate_runne
 
 
 def test_forward_exists_for_vllms_capability_check_only() -> None:
-    with pytest.raises(NotImplementedError, match="MbltWorker drives the mblt-model-zoo class directly"):
+    with pytest.raises(NotImplementedError, match="MbltWorker drives the transformers-mblt class directly"):
         Model.forward(None, input_ids=torch.zeros(1, dtype=torch.long), positions=torch.zeros(1, dtype=torch.long))
 
 
@@ -333,7 +333,7 @@ def test_validate_language_accepts_listed_codes(language: str | None) -> None:
 
 @pytest.mark.parametrize("language", ["sw", "EN", "en-US", ""])
 def test_validate_language_rejects_unlisted_codes_instead_of_warning(language: str) -> None:
-    with pytest.raises(ValueError, match="does not support language"):
+    with pytest.raises(VLLMValidationError, match="does not support language"):
         Model.validate_language(language)
 
 
@@ -379,7 +379,7 @@ def test_generation_prompt_attaches_the_speech_to_text_sample_rate() -> None:
 
 
 def test_generation_prompt_refuses_audio_with_no_samples() -> None:
-    with pytest.raises(ValueError, match="no samples"):
+    with pytest.raises(VLLMValidationError, match="no samples"):
         _generation_prompt(audio=np.zeros(0, dtype=np.float32))
 
 
@@ -402,7 +402,7 @@ def test_generation_prompt_passes_caller_context_as_the_system_message() -> None
     ["<|audio_pad|>", "<|audio_start|>", "<|audio_end|>", "<|audio_placeholder|>", "names: <|audio_pad|> Quilter"],
 )
 def test_generation_prompt_rejects_audio_placeholders_in_the_context(request_prompt: str) -> None:
-    with pytest.raises(ValueError, match="audio placeholder tokens"):
+    with pytest.raises(VLLMValidationError, match="audio placeholder tokens"):
         _generation_prompt(request_prompt=request_prompt)
 
 
@@ -413,9 +413,9 @@ def test_generation_prompt_passes_other_special_tokens_through_like_the_referenc
 
 
 def test_generation_prompt_refuses_translation() -> None:
-    with pytest.raises(ValueError, match="task_type='transcribe' only"):
+    with pytest.raises(VLLMValidationError, match="task_type='transcribe' only"):
         _generation_prompt(task_type="translate")
-    with pytest.raises(ValueError, match="does not support translation"):
+    with pytest.raises(VLLMValidationError, match="does not support translation"):
         _generation_prompt(to_language="fr")
 
 

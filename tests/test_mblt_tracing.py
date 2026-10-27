@@ -1,13 +1,15 @@
 import os
+import re
 import socket
 import sys
 from types import SimpleNamespace
 
 import pytest
+from vllm.config.profiler import ProfilerConfig
 
 import vllm_mblt.tracing as tracing
 from vllm_mblt.mblt_worker import MbltWorker
-from vllm_mblt.tracing import TRACE_DIR_ENV_VAR, MbltTracer, resolve_trace_dir
+from vllm_mblt.tracing import TRACE_DIR_OPTION, TRACE_ENABLE_HINT, MbltTracer, resolve_trace_dir
 
 
 class FakeQbRuntime:
@@ -45,32 +47,34 @@ def _clear_active_tracer():
     tracing._ACTIVE_TRACER = None
 
 
-class TestResolveTraceDir:
-    def test_resolve_trace_dir_returns_none_when_env_var_unset(self, monkeypatch) -> None:
-        monkeypatch.delenv(TRACE_DIR_ENV_VAR, raising=False)
-        assert resolve_trace_dir() is None
+def _profiler_config(trace_dir: str) -> ProfilerConfig:
+    return ProfilerConfig(profiler="torch", torch_profiler_dir=trace_dir)
 
-    def test_resolve_trace_dir_returns_absolute_path(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, str(tmp_path))
-        resolved = resolve_trace_dir()
+
+class TestResolveTraceDir:
+    def test_resolve_trace_dir_returns_none_when_profiling_is_off(self) -> None:
+        assert resolve_trace_dir(None) is None
+        assert resolve_trace_dir(ProfilerConfig()) is None
+
+    def test_resolve_trace_dir_returns_absolute_path(self, tmp_path) -> None:
+        resolved = resolve_trace_dir(_profiler_config(str(tmp_path)))
         assert resolved == os.path.abspath(str(tmp_path))
         assert os.path.isabs(resolved)
 
-    def test_resolve_trace_dir_makes_a_relative_path_absolute(self, monkeypatch) -> None:
-        # vLLM resolves the variable itself; reading its value rather than the
-        # raw environment keeps the NPU trace beside the front-end CPU trace.
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, "relative/traces")
-        resolved = resolve_trace_dir()
+    def test_resolve_trace_dir_makes_a_relative_path_absolute(self) -> None:
+        # vLLM's ProfilerConfig resolves the path itself; reading its value
+        # rather than the raw option keeps the NPU trace beside the front-end
+        # CPU trace.
+        resolved = resolve_trace_dir(_profiler_config("relative/traces"))
         assert os.path.isabs(resolved)
         assert resolved.endswith(os.path.join("relative", "traces"))
 
-    def test_resolve_trace_dir_rejects_a_remote_destination(self, monkeypatch) -> None:
+    def test_resolve_trace_dir_rejects_a_remote_destination(self) -> None:
         # vLLM passes gs:// through for its own traces, but qbruntime writes
         # through a plain file path and would otherwise create a local
         # directory named after the URI.
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, "gs://bucket/traces")
-        with pytest.raises(RuntimeError, match="local directory"):
-            resolve_trace_dir()
+        with pytest.raises(RuntimeError, match=f"local directory, but {TRACE_DIR_OPTION}"):
+            resolve_trace_dir(_profiler_config("gs://bucket/traces"))
 
 
 class TestTraceFilename:
@@ -252,24 +256,33 @@ class TestMbltTracer:
 
 
 class TestMbltWorkerProfileHook:
-    def _make_worker(self, *, rank: int = 0) -> MbltWorker:
+    def _make_worker(self, *, rank: int = 0, trace_dir: str | None = None) -> MbltWorker:
         worker = MbltWorker.__new__(MbltWorker)
         worker.rank = rank
         worker._tracer = None
+        profiler_config = _profiler_config(trace_dir) if trace_dir is not None else ProfilerConfig()
+        worker.vllm_config = SimpleNamespace(profiler_config=profiler_config)
         return worker
 
-    def test_profile_reports_how_to_enable_tracing_when_the_env_var_is_unset(self, monkeypatch) -> None:
-        monkeypatch.delenv(TRACE_DIR_ENV_VAR, raising=False)
+    def test_profile_reports_how_to_enable_tracing_when_profiling_is_off(self) -> None:
         worker = self._make_worker()
 
-        with pytest.raises(RuntimeError, match=TRACE_DIR_ENV_VAR):
+        with pytest.raises(RuntimeError, match=re.escape(TRACE_ENABLE_HINT)):
             worker.profile(is_start=True)
 
+    def test_profile_accepts_vllm_prefix_and_iteration_arguments(self, monkeypatch, tmp_path) -> None:
+        # vLLM 0.32 calls profile(is_start, profile_prefix, delay_iterations=..., max_iterations=...).
+        monkeypatch.setattr(tracing, "load_backend", lambda: FakeQbRuntime())
+        worker = self._make_worker(trace_dir=str(tmp_path))
+
+        worker.profile(True, "bench", delay_iterations=0, max_iterations=0)
+        assert worker._tracer.is_running
+        worker.profile(False)
+
     def test_profile_starts_and_stops_a_trace_in_the_configured_dir(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, str(tmp_path))
         backend = FakeQbRuntime()
         monkeypatch.setattr(tracing, "load_backend", lambda: backend)
-        worker = self._make_worker(rank=3)
+        worker = self._make_worker(rank=3, trace_dir=str(tmp_path))
 
         worker.profile(is_start=True)
         assert worker._tracer is not None
@@ -284,9 +297,8 @@ class TestMbltWorkerProfileHook:
         assert backend.stop_count == 1
 
     def test_profile_reuses_one_tracer_across_windows(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, str(tmp_path))
         monkeypatch.setattr(tracing, "load_backend", lambda: FakeQbRuntime())
-        worker = self._make_worker()
+        worker = self._make_worker(trace_dir=str(tmp_path))
 
         worker.profile(is_start=True)
         tracer = worker._tracer
@@ -297,10 +309,9 @@ class TestMbltWorkerProfileHook:
         worker.profile(is_start=False)
 
     def test_shutdown_stops_a_trace_left_running(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, str(tmp_path))
         backend = FakeQbRuntime()
         monkeypatch.setattr(tracing, "load_backend", lambda: backend)
-        worker = self._make_worker()
+        worker = self._make_worker(trace_dir=str(tmp_path))
         worker.model = None
         worker.cache_model = None
         worker.input_embeddings = None
@@ -313,8 +324,7 @@ class TestMbltWorkerProfileHook:
         assert not worker._tracer.is_running
 
     def test_shutdown_without_tracing_touches_no_tracer(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setenv(TRACE_DIR_ENV_VAR, str(tmp_path))
-        worker = self._make_worker()
+        worker = self._make_worker(trace_dir=str(tmp_path))
         worker.model = None
         worker.cache_model = None
         worker.input_embeddings = None

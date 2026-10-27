@@ -26,6 +26,14 @@ def helper_calls(monkeypatch):
         (SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=4, data_parallel_size_local=2)), 2),
         (SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_size_local=1)), 1),
         (SimpleNamespace(parallel_config=SimpleNamespace()), 1),
+        # vLLM 0.32 runs each rank of a dense model as an independent engine; the front end recorded the layout.
+        (
+            SimpleNamespace(
+                parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_size_local=1),
+                additional_config={"mblt_data_parallel": {"size": 3, "size_local": 3}},
+            ),
+            3,
+        ),
         (SimpleNamespace(), 1),
     ],
 )
@@ -34,7 +42,7 @@ def test_local_engine_count_uses_local_data_parallel_size(vllm_config, expected)
 
 
 def test_apply_passes_local_engine_count_to_transformers_mblt(helper_calls):
-    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size_local=3))
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=3, data_parallel_size_local=3))
 
     assert host_threads.apply_engine_host_thread_defaults(config) == 5
     assert helper_calls == [3]

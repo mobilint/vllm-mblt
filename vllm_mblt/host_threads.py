@@ -12,24 +12,22 @@ from typing import Any, Optional
 from transformers_mblt.utils.host_threads import apply_host_thread_defaults
 from vllm.logger import init_logger
 
+from vllm_mblt.data_parallel import data_parallel_layout
+
 logger = init_logger(__name__)
 
 
 def local_engine_count(vllm_config: Any) -> int:
     """Return the number of engine processes on this host, as the data-parallel config describes it.
 
-    Each local data-parallel rank is its own engine process, so this is ``data_parallel_size_local``. Without a
+    Each local data-parallel rank is its own engine process, so this is the local data-parallel size. Without a
     data-parallel config it is one engine. Engines launched as separate ``vllm serve`` processes are not counted;
     set ``OMP_NUM_THREADS`` for those.
 
     Args:
         vllm_config: The engine's ``VllmConfig``.
     """
-    parallel_config = getattr(vllm_config, "parallel_config", None)
-    value = getattr(parallel_config, "data_parallel_size_local", None)
-    if isinstance(value, int) and value >= 1:
-        return value
-    return 1
+    return data_parallel_layout(vllm_config)[1]
 
 
 def apply_engine_host_thread_defaults(vllm_config: Any) -> Optional[int]:

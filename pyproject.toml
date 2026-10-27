@@ -11,7 +11,7 @@ dynamic = ["version"]
 description = "An out-of-tree vLLM plugin for Mobilint NPU runtime integration."
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = [
     "vllm",
     "mobilint",
@@ -23,7 +23,7 @@ keywords = [
     "aries",
 ]
 dependencies = [
-    "vllm>=0.11.2,<=0.11.2",
+    "vllm>=0.32.0,<=0.32.0",
     # The worker keeps one transformers-mblt cache per request (portable caches, 0.3.0) and runs text models through
     # its forward on those caches joined with MobilintCache.from_rows (0.4.0), and EAGLE-3 through its round API
     # (eagle3_prefill / eagle3_decode_step, 0.5.0). The worker sizes its torch thread pool with
@@ -52,10 +52,11 @@ Home = "https://www.mobilint.com/"
 Repository = "https://github.com/mobilint/vllm-mblt"
 
 [project.optional-dependencies]
-# Serving mobilint/Qwen3-ASR-1.7B. Needs the mblt-model-zoo release whose Qwen3-ASR composite exposes
-# get_input_embeddings and get_audio_features on its outer class.
+# Serving mobilint/Qwen3-ASR-1.7B. transformers-mblt vendors the Qwen3-ASR backend from 0.7.0, which runs on
+# transformers 5; the qwen-asr package it replaces pins transformers 4.57. Until transformers-mblt 0.7.0 is
+# released this extra cannot be installed, and Qwen3-ASR is not yet supported.
 qwen-asr = [
-    "mblt-model-zoo[qwen-asr]>2.10.0",
+    "transformers-mblt>=0.7.0",
 ]
 # Serving mobilint/Qwen3-30B-A3B (Mixture-of-Experts). The base requirements now cover it; the extra is kept so
 # existing install commands keep working.
@@ -85,7 +86,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
