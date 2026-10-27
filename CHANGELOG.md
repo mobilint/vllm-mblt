@@ -14,6 +14,14 @@
 
 ### Changed
 
+- Random sampling on the host no longer draws an exponential variate for every vocabulary entry, and top-k / top-p
+  no longer sort the whole vocabulary (#55). `HostTopKTopPSampler` replaces vLLM's PyTorch top-k/top-p sampler: it
+  samples by inverse transform over the cumulative probabilities (one uniform variate per row) and finds top-k and
+  top-p candidates with `topk`, widening the top-p candidates from 1024 to 16384 tokens and sorting the vocabulary
+  only for rows those do not cover. The distribution is unchanged, except that tokens tied with the k-th largest
+  logit are cut at exactly k. Seeded requests stay reproducible but do not repeat vLLM's tokens for the same seed.
+  On Qwen3-0.6B with 48 rows on three devices, sampling took 145–159 ms per step and now takes 5–12 ms (41–44 ms
+  for top-p alone at temperature 1.0); the step is 69–81 ms (105 ms for top-p alone) against 67 ms greedy.
 - Each engine sizes its torch CPU thread pool for its share of the host instead of keeping PyTorch's host-sized
   default: the worker calls transformers-mblt's `apply_host_thread_defaults` with the number of local engines
   (`data_parallel_size_local`, 1 without data parallelism), which divides the CPUs the process may use among them,
