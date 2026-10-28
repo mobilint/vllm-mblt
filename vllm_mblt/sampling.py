@@ -4,8 +4,8 @@ vLLM's PyTorch sampler draws one exponential variate per vocabulary entry and ro
 by sorting the whole vocabulary. Both are cheap on a GPU and slow on a CPU: for 48 rows of a 151,936-entry
 vocabulary the exponential draw alone takes 100-200 ms, against about 60 ms for the NPU forward.
 
-``HostTopKTopPSampler`` draws the same distribution with one uniform variate per row (inverse transform sampling
-over the cumulative probabilities), and finds the top-k and top-p candidates with ``topk`` instead of a full sort.
+``HostTopKTopPSampler`` uses one uniform variate per row (inverse transform sampling over the cumulative
+probabilities), and finds the top-k and top-p candidates with ``topk`` instead of a full sort.
 """
 
 from typing import Optional
@@ -21,10 +21,12 @@ TOP_P_CANDIDATES = (1024, 16384)
 
 
 class HostTopKTopPSampler(TopKTopPSampler):
-    """``TopKTopPSampler`` for host logits: same distribution, without per-token noise or a full-vocabulary sort.
+    """``TopKTopPSampler`` for host logits, without per-token noise or an unconditional full-vocabulary sort.
 
-    Tokens tied with the k-th largest logit are cut at exactly k; vLLM keeps every tied token. Sampled tokens are
-    not bit-identical to vLLM's for a given seed, only identically distributed, as vLLM's own GPU kernels are.
+    Tokens tied with the k-th largest logit are all retained, as in vLLM. With top-k active, ambiguous top-p
+    cutoffs use vLLM's reference mask to preserve its token identities. Top-p without top-k is unchanged: a tied
+    nucleus boundary can retain different equal-score token identities from vLLM's full sort. Seeded requests
+    are reproducible, but do not repeat vLLM's token sequence.
     """
 
     def __init__(
@@ -52,7 +54,8 @@ class HostTopKTopPSampler(TopKTopPSampler):
 
         rows = has_k.nonzero().flatten()
         if rows.numel():
-            sampled[rows] = _sample_top_k(logits[rows], k[rows], None if p is None else p[rows], uniform[rows])
+            selected_logits = logits if rows.numel() == num_rows else logits[rows]
+            sampled[rows] = _sample_top_k(selected_logits, k[rows], None if p is None else p[rows], uniform[rows])
 
         rows = (has_p & ~has_k).nonzero().flatten()
         if rows.numel():
@@ -95,10 +98,73 @@ def _uniform(num_rows: int, generators: dict[int, torch.Generator]) -> torch.Ten
 def _sample_top_k(
     logits: torch.Tensor, k: torch.Tensor, p: Optional[torch.Tensor], uniform: torch.Tensor
 ) -> torch.Tensor:
-    values, indices = logits.topk(int(k.max()), dim=-1)
-    beyond_k = torch.arange(values.shape[1]) >= k.unsqueeze(1)
-    cumulative = values.masked_fill_(beyond_k, float("-inf")).softmax(dim=-1).cumsum_(dim=-1)
-    return _sample_candidates(cumulative, indices, p, uniform)
+    sampled = torch.empty(logits.shape[0], dtype=torch.long)
+    pending = torch.arange(logits.shape[0])
+    fallback = []
+    # Headroom covers typical quantization plateaus in one scan; the last candidate proves each kth tie is
+    # complete. Widen once if needed, then use the reference mask for broad ties or nonfinite thresholds.
+    initial = min(2 * int(k.max()) + 1, logits.shape[1])
+    for size in dict.fromkeys((initial, min(max(initial * 2, 128), logits.shape[1]))):
+        candidates = logits if size == initial else logits[pending]
+        values, indices = candidates.topk(size, dim=-1)
+        threshold = values.gather(1, (k[pending] - 1).long().unsqueeze(1))
+        complete = (values[:, -1] < threshold.squeeze(1)) | (size == logits.shape[1])
+        needs_reference = ~threshold.squeeze(1).isfinite()
+        kept = values >= threshold
+        complete &= ~needs_reference
+        fallback.append(pending[needs_reference])
+        rows = pending[complete]
+        if rows.numel():
+            candidate_logits = values[complete].masked_fill(~kept[complete], float("-inf"))
+            candidate_indices = indices[complete]
+            cumulative = candidate_logits.softmax(dim=-1).cumsum_(dim=-1)
+            num_kept = None
+            safe = torch.ones(rows.numel(), dtype=torch.bool)
+            if p is not None and bool((p[rows] < 1).any()):
+                num_kept, uncertain = _top_k_nucleus(candidate_logits, p[rows])
+                safe &= ~uncertain
+                fallback.append(rows[uncertain])
+                num_kept = num_kept[safe]
+            sampled[rows[safe]] = (
+                candidate_indices[safe]
+                .gather(1, _inverse_cdf(cumulative[safe], uniform[rows[safe]], num_kept).unsqueeze(1))
+                .squeeze(1)
+            )
+        pending = pending[~(complete | needs_reference)]
+        if not pending.numel():
+            break
+    pending = torch.cat([*fallback, pending])
+    if pending.numel():
+        fallback_p = None if p is None or bool((p[pending] >= 1).all()) else p[pending]
+        # Advanced indexing already gives the reference its own writable copies.
+        masked = apply_top_k_top_p_pytorch(logits[pending], k[pending], fallback_p, allow_cpu_sync=True)
+        sampled[pending] = _sample_full(masked, uniform[pending])
+    return sampled
+
+
+def _top_k_nucleus(values: torch.Tensor, p: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Count kept candidates; defer tied cutoffs and numerically ambiguous masks to the reference.
+
+    Complete top-k candidates have the same nonzero probabilities as the full reference vocabulary. Work in
+    ascending order, like vLLM, and double precision to locate its cutoff without subtraction of near-one masses.
+    Fully kept/dropped equal-score groups need no token ordering; only a split group needs the full sort.
+    """
+    ascending = values.flip(dims=(-1,)).double().softmax(dim=-1).cumsum_(dim=-1)
+    # Match the reference's subtraction in p's original dtype before promoting for the comparison.
+    cutoff = (1 - p).double().unsqueeze(1)
+    num_kept = (ascending > cutoff).sum(dim=-1).clamp_(min=1)
+    last = (num_kept - 1).unsqueeze(1)
+    next_index = num_kept.clamp(max=values.shape[1] - 1).unsqueeze(1)
+    split_tie = (values.gather(1, last) == values.gather(1, next_index)).squeeze(1)
+    split_tie &= num_kept < values.shape[1]
+    # The float32 reference normalizes and accumulates in a different layout. Bound rounding conservatively by
+    # the number of nonzero terms (masked -inf contributes exact zeros), with headroom for exp and reduction.
+    # If any non-forced token could change sides, do not guess which upstream mask it receives.
+    finite = values.isfinite().sum(dim=-1)
+    tolerance = 16 * torch.finfo(values.dtype).eps * finite
+    near_cutoff = ((ascending[:, :-1] - cutoff).abs() <= tolerance.unsqueeze(1)).any(dim=-1)
+    uncertain = (p < 1) & (split_tie | near_cutoff)
+    return num_kept, uncertain
 
 
 def _sample_candidates(
