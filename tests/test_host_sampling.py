@@ -142,21 +142,6 @@ def test_quantized_mixed_batch_preserves_each_rows_reference_support():
         assert not freq[expected[row] == 0].any()
 
 
-@pytest.mark.parametrize("top_score", [2.0, 3.0])
-@pytest.mark.parametrize("candidates", [(1,), (4, 6)])
-@pytest.mark.parametrize("p_value", [0.0, 0.25, 0.5, 0.9, 1.0])
-def test_top_p_tied_cutoff_uses_reference_token_identities(p_value, candidates, top_score):
-    logits = torch.tensor([top_score, 2.0, 2.0, 2.0, 2.0, 1.0, 0.0, float("-inf")])
-    draws = 8192
-    expected = apply_top_k_top_p_pytorch(logits[None].clone(), None, torch.tensor([p_value])).softmax(-1)[0]
-    sampled, _ = HostTopKTopPSampler(top_p_candidates=candidates)(
-        logits.repeat(draws, 1), {}, None, torch.full((draws,), p_value)
-    )
-    freq = torch.bincount(sampled, minlength=logits.numel()) / draws
-    assert torch.allclose(freq, expected, atol=0.025)
-    assert not freq[expected == 0].any()
-
-
 @pytest.mark.parametrize(
     ("p_value", "fallback"), [(0.1, False), (0.8, False), (0.9, False), (0.99, False), (0.95, True)]
 )

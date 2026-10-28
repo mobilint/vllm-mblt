@@ -4,8 +4,8 @@ vLLM's PyTorch sampler draws one exponential variate per vocabulary entry and ro
 by sorting the whole vocabulary. Both are cheap on a GPU and slow on a CPU: for 48 rows of a 151,936-entry
 vocabulary the exponential draw alone takes 100-200 ms, against about 60 ms for the NPU forward.
 
-``HostTopKTopPSampler`` draws the same distribution with one uniform variate per row (inverse transform sampling
-over the cumulative probabilities), and finds the top-k and top-p candidates with ``topk`` instead of a full sort.
+``HostTopKTopPSampler`` uses one uniform variate per row (inverse transform sampling over the cumulative
+probabilities), and finds the top-k and top-p candidates with ``topk`` instead of a full sort.
 """
 
 from typing import Optional
@@ -21,11 +21,12 @@ TOP_P_CANDIDATES = (1024, 16384)
 
 
 class HostTopKTopPSampler(TopKTopPSampler):
-    """``TopKTopPSampler`` for host logits: same distribution, without per-token noise or a full-vocabulary sort.
+    """``TopKTopPSampler`` for host logits, without per-token noise or an unconditional full-vocabulary sort.
 
-    Tokens tied with the k-th largest logit are all retained, as in vLLM. Ambiguous top-p cutoffs use vLLM's
-    reference mask so that its sort decides token identities at a split tie. Sampled tokens are not bit-identical to
-    vLLM's for a given seed, only identically distributed, as vLLM's own GPU kernels are.
+    Tokens tied with the k-th largest logit are all retained, as in vLLM. With top-k active, ambiguous top-p
+    cutoffs use vLLM's reference mask to preserve its token identities. Top-p without top-k is unchanged: a tied
+    nucleus boundary can retain different equal-score token identities from vLLM's full sort. Seeded requests
+    are reproducible, but do not repeat vLLM's token sequence.
     """
 
     def __init__(
@@ -72,16 +73,11 @@ class HostTopKTopPSampler(TopKTopPSampler):
         for num_candidates in self.top_p_candidates:
             if num_candidates >= logits.shape[1] or not pending.numel():
                 break
-            values, indices = logits[pending].topk(num_candidates + 1, dim=-1)
-            # Include a sentinel so a tie extending outside even a one-token candidate set is detected.
-            tied = ((values[:, 1:] == values[:, :-1]) & values[:, 1:].isfinite()).any(dim=1)
-            values, indices = values[:, :-1], indices[:, :-1]
+            values, indices = logits[pending].topk(num_candidates, dim=-1)
             cumulative = (values - log_total[pending]).exp_().cumsum_(dim=-1)
             # Every token outside the candidates has at least their total mass ahead of it, so when that total
             # reaches p no such token survives top-p and the candidates decide the row exactly.
             covered = cumulative[:, -1] >= p[pending]
-            # Equal-score token identities at a nucleus cutoff depend on the reference's full sort order.
-            covered &= ~tied
             rows = pending[covered]
             if rows.numel():
                 sampled[rows] = _sample_candidates(cumulative[covered], indices[covered], p[rows], uniform[rows])

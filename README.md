@@ -431,9 +431,12 @@ before choosing a value.
 ### Host Random Sampling
 
 Host random sampling uses inverse-CDF draws over small top-k/top-p candidate sets. Top-k preserves all tokens
-with the k-th largest score, including ties in quantized NPU logits. Broad ties, nonfinite k-th thresholds, and
-ambiguous tied top-p cutoffs use vLLM's reference mask; these rows can cost a full-vocabulary sort. Seeded requests
-are reproducible, but do not produce the same token sequence as vLLM's exponential-noise sampler.
+with the k-th largest score, including ties in quantized NPU logits. Broad ties and nonfinite k-th thresholds use
+vLLM's reference mask. With top-k active, ambiguous top-p cutoffs also use that mask to preserve its token
+identities; these rows can cost a full-vocabulary sort. Top-p without top-k is unchanged: at a tied nucleus
+boundary, candidate sorting can retain different equal-score token identities from vLLM's full sort, so named-token
+support and distribution need not match there. Seeded requests are reproducible, but do not produce the same token
+sequence as vLLM's exponential-noise sampler.
 
 ## Benchmarking
 
