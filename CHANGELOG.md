@@ -22,8 +22,12 @@
   no longer sort the whole vocabulary (#55). `HostTopKTopPSampler` replaces vLLM's PyTorch top-k/top-p sampler: it
   samples by inverse transform over the cumulative probabilities (one uniform variate per row) and finds top-k and
   top-p candidates with `topk`, widening the top-p candidates from 1024 to 16384 tokens and sorting the vocabulary
-  only for rows those do not cover. The distribution is unchanged, except that tokens tied with the k-th largest
-  logit are cut at exactly k. Seeded requests stay reproducible but do not repeat vLLM's tokens for the same seed.
+  only for rows those do not cover or whose tied top-p scores require the reference sort's token ordering.
+  Top-k retains every token tied with the k-th largest logit, including quantized-logit plateaus; narrow ties use
+  bounded candidate widening, while broad ties or nonfinite thresholds fall back to vLLM's reference mask.
+  For top-k plus top-p, fully retained or dropped tie groups stay on the candidate path; a split nucleus tie or
+  numerically ambiguous cutoff uses the reference mask to preserve its token identities.
+  Seeded requests stay reproducible but do not repeat vLLM's tokens for the same seed.
   On Qwen3-0.6B with 48 rows on three devices, sampling took 145–159 ms per step and now takes 5–12 ms (41–44 ms
   for top-p alone at temperature 1.0); the step is 69–81 ms (105 ms for top-p alone) against 67 ms greedy.
 - Each engine sizes its torch CPU thread pool for its share of the host instead of keeping PyTorch's host-sized

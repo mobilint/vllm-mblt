@@ -428,6 +428,13 @@ sampling: a 48-row sampling step took 9.5 ms with 2 threads instead of 1.6 ms, s
 when it has a large host to itself. These numbers depend on the host and model; measure on your own target
 before choosing a value.
 
+### Host Random Sampling
+
+Host random sampling uses inverse-CDF draws over small top-k/top-p candidate sets. Top-k preserves all tokens
+with the k-th largest score, including ties in quantized NPU logits. Broad ties, nonfinite k-th thresholds, and
+ambiguous tied top-p cutoffs use vLLM's reference mask; these rows can cost a full-vocabulary sort. Seeded requests
+are reproducible, but do not produce the same token sequence as vLLM's exponential-noise sampler.
+
 ## Benchmarking
 
 This repository includes `sonnet.txt`, which can be used with vLLM benchmark commands.
