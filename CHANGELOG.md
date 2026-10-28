@@ -14,6 +14,10 @@
 
 ### Changed
 
+- Plugin loggers now live under `vllm.vllm_mblt.*`, inheriting vLLM's handlers and log level. INFO diagnostics
+  (including `[mblt-init]`, device placement and host-thread settings) are visible by default on vLLM 0.32 without
+  an extra logging configuration. Custom configs targeting the old `vllm_mblt` namespace should use
+  `vllm.vllm_mblt` instead. No handlers are installed when the application disables vLLM logging.
 - Random sampling on the host no longer draws an exponential variate for every vocabulary entry, and top-k / top-p
   no longer sort the whole vocabulary (#55). `HostTopKTopPSampler` replaces vLLM's PyTorch top-k/top-p sampler: it
   samples by inverse transform over the cumulative probabilities (one uniform variate per row) and finds top-k and

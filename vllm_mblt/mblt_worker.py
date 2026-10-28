@@ -60,7 +60,7 @@ from vllm_mblt.runtime_cache import (
 from vllm_mblt.sampling import HostTopKTopPSampler
 from vllm_mblt.tracing import TRACE_ENABLE_HINT, MbltTracer, resolve_trace_dir
 
-logger = init_logger(__name__)
+logger = init_logger(f"vllm.{__name__}")
 
 # vLLM 0.32 applies top-k/top-p with a Triton kernel whenever Triton reports a usable driver (HAS_TRITON), whatever
 # device the logits are on. Here the logits are always host tensors, and that path fails ("num_compute_units is
