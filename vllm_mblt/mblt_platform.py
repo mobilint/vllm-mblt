@@ -17,7 +17,7 @@ from vllm_mblt.data_parallel import (
     record_data_parallel_layout,
 )
 
-logger = init_logger(__name__)
+logger = init_logger(f"vllm.{__name__}")
 
 SINGLE_CORE_BATCH_MODEL_MAX_PREFILL_CHUNK_SIZE = 128
 _MULTIMODAL_HF_MODEL_TYPES = frozenset(

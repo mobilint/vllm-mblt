@@ -14,7 +14,7 @@ from vllm.logger import init_logger
 
 from vllm_mblt.data_parallel import data_parallel_layout
 
-logger = init_logger(__name__)
+logger = init_logger(f"vllm.{__name__}")
 
 
 def local_engine_count(vllm_config: Any) -> int:

@@ -33,6 +33,15 @@ artifacts can be served through familiar vLLM commands and OpenAI-compatible API
   tune chunked prefill and scheduler concurrency automatically.
 - **vLLM benchmark compatibility**: works with `vllm serve`, `vllm bench serve`, and `vllm bench throughput`.
 
+## Logging
+
+Plugin logs use the `vllm.vllm_mblt.*` logger namespace and inherit vLLM's logging configuration, including
+`VLLM_LOGGING_LEVEL`, formatting and output stream. Initialization (`[mblt-init]`), device placement and host-thread
+INFO messages are visible with the default vLLM configuration; no extra handler or logging config file is needed.
+Use `VLLM_LOGGING_LEVEL=WARNING` to suppress INFO messages. If you provide a custom logging config, target
+`vllm.vllm_mblt` (rather than the old `vllm_mblt` namespace) for plugin-specific settings. With vLLM logging disabled,
+the plugin does not install a fallback handler; logging remains the application's responsibility.
+
 ## Requirements
 
 - Python 3.11+

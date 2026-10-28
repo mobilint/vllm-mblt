@@ -29,7 +29,7 @@ from typing import Any, Optional
 
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = init_logger(f"vllm.{__name__}")
 
 # vLLM's own setting for worker profiling. Reused rather than replaced with an
 # MBLT-specific option so `/start_profile`, `LLM.start_profile()` and
