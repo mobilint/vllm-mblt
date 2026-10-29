@@ -41,6 +41,10 @@ class EncoderOutputCache:
     def nbytes(self) -> int:
         return self._nbytes
 
+    def clear(self) -> None:
+        self._items.clear()
+        self._nbytes = 0
+
     def get(self, key: Hashable) -> Optional[EncodedVisionItem]:
         item = self._items.get(key)
         if item is not None:

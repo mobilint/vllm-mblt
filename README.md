@@ -673,12 +673,13 @@ chat turn, or the same picture in several requests) skips the vision encoder.
 `VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB` sets the host memory it may take
 (default 256; 0 turns it off).
 
-The images and videos of all requests that start in the same step go through the
-vision encoder together, one call per modality, as vLLM batches a step's encoder
-inputs. With `"vision_core_mode": "multi"` the model zoo runs same-shape images
-of that call in one NPU infer spread over the cores, which pays off when several
-image requests arrive together; `global8` gives the lowest latency for a single
-image.
+Images and videos of requests starting in the same step are grouped by modality
+and sent to the vision encoder in batches of at most 16 items and 64 MiB of
+float32 pixel inputs; a single larger item is sent alone. Unlike upstream vLLM,
+this worker still encodes the entire new request before its first text chunk.
+With `"vision_core_mode": "multi"`, the model zoo can run same-shape images in
+one NPU infer spread over the cores. Performance depends on the artifact and
+workload.
 
 Batch-compiled VLM text backends (`max_batch_size > 1`) are supported for
 Mobilint Qwen2-VL and Qwen3-VL model types. With `mblt-model-zoo>=2.7.0`,

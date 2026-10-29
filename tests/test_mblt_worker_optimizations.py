@@ -3152,6 +3152,27 @@ class TestMbltWorkerOptimizations:
         assert len(calls) == 1
         assert encoded_later[id(later)] is encoded[id(first)]
 
+    def test_encoder_cache_reset_reencodes_items(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        feature = self._make_image_feature(1.0, "same-image")
+        worker._encode_vision_items([[feature]])
+        assert worker.encoder_output_cache.nbytes > 0
+        worker.reset_encoder_cache()
+        assert worker.encoder_output_cache.nbytes == 0
+        worker._encode_vision_items([[feature]])
+        assert len(calls) == 2
+
+    def test_encoder_batch_limits_temporary_pixel_copies(self, monkeypatch) -> None:
+        import vllm_mblt.mblt_worker as worker_module
+
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        monkeypatch.setattr(worker_module, "_VISION_BATCH_MAX_PIXEL_BYTES", 24)
+        features = [self._make_image_feature(float(i)) for i in range(5)]
+        encoded = worker._encode_vision_items([features])
+        assert [len(call["image_grid_thw"]) for call in calls] == [2, 2, 1]
+        for i, feature in enumerate(features):
+            torch.testing.assert_close(encoded[id(feature)].embeds, torch.full((2, 4), float(i)))
+
     def test_batched_encoder_output_must_match_the_placeholders(self) -> None:
         worker, _calls = self._make_qwen3_vl_encoder_worker()
         worker.model.get_image_features = lambda **_kwargs: ((torch.zeros(3, 4),), None)

@@ -298,6 +298,9 @@ def _prefix_cache_config_value(config: object, name: str) -> object:
 
 DEFAULT_PREFIX_CACHE_MAX_HOST_MIB = 4096
 DEFAULT_ENCODER_CACHE_MAX_HOST_MIB = 256
+# Bound temporary pixel copies when new requests contain large images or videos. A single item can exceed the cap.
+_VISION_BATCH_MAX_PIXEL_BYTES = 64 * 1024 * 1024
+_VISION_BATCH_MAX_ITEMS = 16
 
 # The model hook, pixel key and grid key of each vision modality; the hooks take the data keys as keyword arguments.
 _VISION_ENCODER_INPUTS = {
@@ -1469,14 +1472,38 @@ class MbltWorker(WorkerBase):
                 pending.setdefault(kind, []).append(feature)
 
         for kind, features in pending.items():
-            for feature, item in zip(features, self._run_vision_encoder(kind, features)):
-                encoded[id(feature)] = item
-                key = self._vision_cache_key(kind, feature)
-                if key is not None:
-                    for repeat in repeats[key]:
-                        encoded[id(repeat)] = item
-                    self.encoder_output_cache.put(key, item)
+            _, pixel_key, _ = _VISION_ENCODER_INPUTS[kind]
+            batch: list[MultiModalFeatureSpec] = []
+            batch_bytes = 0
+
+            def encode_batch() -> None:
+                for feature, item in zip(batch, self._run_vision_encoder(kind, batch)):
+                    encoded[id(feature)] = item
+                    key = self._vision_cache_key(kind, feature)
+                    if key is not None:
+                        for repeat in repeats[key]:
+                            encoded[id(repeat)] = item
+                        self.encoder_output_cache.put(key, item)
+
+            for feature in features:
+                pixels = self._extract_multimodal_value(feature, pixel_key)
+                # The encoder converts pixels to float32 before concatenation.
+                pixel_bytes = 0 if pixels is None else int(torch.as_tensor(pixels).numel()) * 4
+                if batch and (
+                    len(batch) >= _VISION_BATCH_MAX_ITEMS or batch_bytes + pixel_bytes > _VISION_BATCH_MAX_PIXEL_BYTES
+                ):
+                    encode_batch()
+                    batch = []
+                    batch_bytes = 0
+                batch.append(feature)
+                batch_bytes += pixel_bytes
+            if batch:
+                encode_batch()
         return encoded
+
+    def reset_encoder_cache(self) -> None:
+        """Drop vision outputs when vLLM resets the encoder cache or reloads weights."""
+        self.encoder_output_cache.clear()
 
     def _build_prompt_embeds(
         self,

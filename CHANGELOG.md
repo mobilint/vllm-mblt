@@ -4,10 +4,10 @@
 
 ### Changed
 
-- The images and videos of the requests that start in the same step are encoded together, one vision encoder call
-  per modality, as vLLM's GPU model runner batches a step's encoder inputs (it used to be one call per item). With
-  `vision_core_mode` `multi`, the model zoo runs same-shape images of that call in a single NPU infer spread over
-  the cores.
+- Images and videos of requests starting in the same step are grouped by modality and encoded in bounded batches
+  (up to 16 items and 64 MiB of float32 pixel inputs, with oversized items sent alone). With `vision_core_mode`
+  `multi`, the model zoo can run same-shape images in a single NPU infer spread over the cores. Unlike upstream's
+  encoder scheduling, this worker still encodes all items of a new request before its first text chunk.
 
 ### Added
 
