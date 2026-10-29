@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The images and videos of the requests that start in the same step are encoded together, one vision encoder call
+  per modality, as vLLM's GPU model runner batches a step's encoder inputs (it used to be one call per item). With
+  `vision_core_mode` `multi`, the model zoo runs same-shape images of that call in a single NPU infer spread over
+  the cores.
+
+### Added
+
+- A host cache of vision encoder outputs keyed by vLLM's multimodal content hash: an image that a later request
+  sends again, or that several requests of one step share, is encoded once. `VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB`
+  sets its budget (default 256 MiB, 0 disables it).
+
 ## 0.9.0
 
 ### Added

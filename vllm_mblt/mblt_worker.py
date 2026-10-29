@@ -40,6 +40,7 @@ from vllm_mblt.data_parallel import (
     runtime_device_number,
 )
 from vllm_mblt.eagle3_runtime import Eagle3Runner, is_eagle3_model
+from vllm_mblt.encoder_cache import EncodedVisionItem, EncoderOutputCache
 from vllm_mblt.host_threads import apply_engine_host_thread_defaults
 from vllm_mblt.mblt_platform import resolve_model_max_batch_size
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
@@ -296,6 +297,35 @@ def _prefix_cache_config_value(config: object, name: str) -> object:
 
 
 DEFAULT_PREFIX_CACHE_MAX_HOST_MIB = 4096
+DEFAULT_ENCODER_CACHE_MAX_HOST_MIB = 256
+
+# The model hook, pixel key and grid key of each vision modality; the hooks take the data keys as keyword arguments.
+_VISION_ENCODER_INPUTS = {
+    "image": ("get_image_features", "pixel_values", "image_grid_thw"),
+    "video": ("get_video_features", "pixel_values_videos", "video_grid_thw"),
+}
+
+
+def _vision_kind(modality: str) -> Optional[str]:
+    """Return ``"image"`` or ``"video"`` for a vision modality, ``None`` for any other."""
+    for kind in _VISION_ENCODER_INPUTS:
+        if modality.startswith(kind):
+            return kind
+    return None
+
+
+def _resolve_encoder_cache_max_host_mib() -> int:
+    """Host memory (MiB) for cached vision encoder outputs: ``VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB``, 0 disables."""
+    value = os.getenv("VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB")
+    try:
+        return DEFAULT_ENCODER_CACHE_MAX_HOST_MIB if value in (None, "") else max(0, int(value))
+    except ValueError:
+        logger.warning(
+            "Ignoring VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB=%r: not an integer number of MiB. Using %d MiB.",
+            value,
+            DEFAULT_ENCODER_CACHE_MAX_HOST_MIB,
+        )
+        return DEFAULT_ENCODER_CACHE_MAX_HOST_MIB
 
 
 def _resolve_prefix_cache_max_host_mib(config: object) -> int:
@@ -558,6 +588,7 @@ class MbltWorker(WorkerBase):
             self.vllm_config,
             block_size=self._kv_block_size(),
         )
+        self.encoder_output_cache = EncoderOutputCache(_resolve_encoder_cache_max_host_mib() * 1024 * 1024)
         self.sampler = Sampler(logprobs_mode="raw_logits")
         self.sampler.topk_topp_sampler = HostTopKTopPSampler(logprobs_mode="raw_logits")
         self.empty_logits_processors = LogitsProcessors(None)
@@ -1336,12 +1367,129 @@ class MbltWorker(WorkerBase):
             )
         target[mask] = multimodal_embeds
 
+    @staticmethod
+    def _placeholder_num_embeds(placeholder: PlaceholderRange) -> int:
+        """Number of encoder embeddings a placeholder takes: its length, or its ``is_embed`` positions."""
+        if placeholder.is_embed is None:
+            return int(placeholder.length)
+        return int(torch.as_tensor(placeholder.is_embed).bool().sum().item())
+
+    @staticmethod
+    def _vision_cache_key(kind: str, feature: MultiModalFeatureSpec) -> Optional[Hashable]:
+        """The encoder-cache key of an item: vLLM's content hash of it, or ``None`` when it carries none."""
+        identifier = getattr(feature, "identifier", None)
+        return (kind, identifier) if isinstance(identifier, str) and identifier else None
+
+    def _run_vision_encoder(self, kind: str, features: Sequence[MultiModalFeatureSpec]) -> list[EncodedVisionItem]:
+        """Encode images (or videos) of one or more requests in one model call; return one output per item.
+
+        The items' pixels and grids are joined the way a processor joins several images of one prompt, so the
+        model zoo sees one batch: on a ``multi`` core-mode vision MXQ it runs same-shape items in a single
+        infer that spreads them over the NPU cores, and otherwise encodes them one after another as before.
+        """
+        hook_name, pixel_key, grid_key = _VISION_ENCODER_INPUTS[kind]
+        encode = getattr(self.model, hook_name, None)
+        if not callable(encode):
+            raise RuntimeError(f"Model {type(self.model).__name__} does not expose {hook_name}().")
+
+        pixels: list[torch.Tensor] = []
+        grids: list[Optional[torch.Tensor]] = []
+        for feature in features:
+            pixel_values = self._extract_multimodal_value(feature, pixel_key)
+            if pixel_values is None:
+                raise RuntimeError(f"{kind.capitalize()} multimodal feature is missing {pixel_key}.")
+            grid_thw = self._normalize_grid_thw(self._extract_multimodal_value(feature, grid_key))
+            # The NPU limit holds per item: the model zoo encodes every image or video frame on its own.
+            self._validate_dynamic_qwen3_vl_grid(kind, grid_thw)
+            pixels.append(self._to_torch_tensor(pixel_values, dtype=torch.float32))
+            grids.append(grid_thw)
+
+        if len(features) > 1 and any(grid is None for grid in grids):
+            # Without grids the joined pixels could not be split back into items.
+            return [item for feature in features for item in self._run_vision_encoder(kind, [feature])]
+
+        outputs = encode(
+            **{
+                pixel_key: pixels[0] if len(pixels) == 1 else torch.cat(pixels, dim=0),
+                grid_key: grids[0] if len(grids) == 1 else torch.cat(grids, dim=0),
+            }
+        )
+        embeds = self._normalize_multimodal_embeddings(outputs)
+        deepstack = self._extract_deepstack_embeddings(outputs) if self._supports_deepstack_input() else None
+        if len(features) == 1:
+            return [EncodedVisionItem(embeds, None if deepstack is None else tuple(deepstack))]
+
+        counts = [self._placeholder_num_embeds(feature.mm_position) for feature in features]
+        if int(embeds.shape[0]) != sum(counts):
+            raise RuntimeError(
+                f"Batched {kind} encoder output has {int(embeds.shape[0])} embeddings; "
+                f"the {len(features)} placeholders take {counts}."
+            )
+        # Copy each item out of the batch output: a cached view would keep the whole batch tensor alive.
+        per_item_deepstack: list[Optional[tuple[torch.Tensor, ...]]] = [None] * len(features)
+        if deepstack:
+            layer_splits = [torch.split(layer, counts, dim=0) for layer in deepstack]
+            per_item_deepstack = [
+                tuple(layer[index].clone() for layer in layer_splits) for index in range(len(features))
+            ]
+        return [
+            EncodedVisionItem(item_embeds.clone(), item_deepstack)
+            for item_embeds, item_deepstack in zip(torch.split(embeds, counts, dim=0), per_item_deepstack)
+        ]
+
+    def _encode_vision_items(
+        self,
+        feature_lists: Sequence[Optional[Sequence[MultiModalFeatureSpec]]],
+    ) -> dict[int, EncodedVisionItem]:
+        """Encode the images and videos of several prompts, one encoder call per modality; key outputs by item.
+
+        vLLM's GPU model runner encodes every multimodal item a step schedules, from all requests, in one batch
+        per modality, and reuses an item's output from its encoder cache. This does the same for the new requests
+        of a step: items whose content hash is cached, or repeated within the step, are encoded once. The result
+        maps ``id(feature)`` of each vision item to its output.
+        """
+        encoded: dict[int, EncodedVisionItem] = {}
+        pending: dict[str, list[MultiModalFeatureSpec]] = {}
+        repeats: dict[Hashable, list[MultiModalFeatureSpec]] = {}
+        for features in feature_lists:
+            for feature in features or ():
+                kind = _vision_kind(feature.modality)
+                if kind is None or feature.data is None:
+                    continue
+                key = self._vision_cache_key(kind, feature)
+                if key is not None:
+                    cached = self.encoder_output_cache.get(key)
+                    if cached is not None:
+                        encoded[id(feature)] = cached
+                        continue
+                    if key in repeats:
+                        repeats[key].append(feature)
+                        continue
+                    repeats[key] = []
+                pending.setdefault(kind, []).append(feature)
+
+        for kind, features in pending.items():
+            for feature, item in zip(features, self._run_vision_encoder(kind, features)):
+                encoded[id(feature)] = item
+                key = self._vision_cache_key(kind, feature)
+                if key is not None:
+                    for repeat in repeats[key]:
+                        encoded[id(repeat)] = item
+                    self.encoder_output_cache.put(key, item)
+        return encoded
+
     def _build_prompt_embeds(
         self,
         prompt_token_ids: Optional[list[int]],
         prompt_embeds: Optional[torch.Tensor],
         mm_features: Optional[list[MultiModalFeatureSpec]],
+        encoded_vision: Optional[dict[int, EncodedVisionItem]] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Embed a prompt and scatter its multimodal items into it.
+
+        ``encoded_vision`` holds this prompt's vision outputs when the caller encoded several prompts together
+        (:meth:`_encode_vision_items`); without it the prompt's own images and videos are encoded here.
+        """
         if prompt_embeds is not None:
             merged_prompt_embeds = prompt_embeds.clone()
         else:
@@ -1358,68 +1506,28 @@ class MbltWorker(WorkerBase):
         if self.model is None:
             raise RuntimeError("Model is not initialized.")
 
-        get_image_features = getattr(self.model, "get_image_features", None)
-        get_video_features = getattr(self.model, "get_video_features", None)
         get_audio_features = getattr(self.model, "get_audio_features", None)
         supports_deepstack_input = self._supports_deepstack_input()
         deepstack_prompt_embeds: Optional[torch.Tensor] = None
+        if encoded_vision is None:
+            encoded_vision = self._encode_vision_items([mm_features])
 
         for feature in mm_features:
             if feature.data is None:
                 continue
 
             modality = feature.modality
-            if modality.startswith("image"):
-                if not callable(get_image_features):
-                    raise RuntimeError(f"Model {type(self.model).__name__} does not expose get_image_features().")
-                pixel_values = self._extract_multimodal_value(feature, "pixel_values")
-                image_grid_thw = self._extract_multimodal_value(feature, "image_grid_thw")
-                if pixel_values is None:
-                    raise RuntimeError("Image multimodal feature is missing pixel_values.")
-                image_grid_thw = self._normalize_grid_thw(image_grid_thw)
-                self._validate_dynamic_qwen3_vl_grid("image", image_grid_thw)
-                image_features = get_image_features(
-                    pixel_values=self._to_torch_tensor(pixel_values, dtype=torch.float32),
-                    image_grid_thw=image_grid_thw,
-                )
-                image_embeds = self._normalize_multimodal_embeddings(image_features)
-                self._scatter_multimodal_embeddings(
-                    merged_prompt_embeds,
-                    feature.mm_position,
-                    image_embeds,
-                )
+            if _vision_kind(modality) is not None:
+                item = encoded_vision.get(id(feature))
+                if item is None:
+                    raise RuntimeError(f"No encoder output for the {modality} item of this prompt.")
+                self._scatter_multimodal_embeddings(merged_prompt_embeds, feature.mm_position, item.embeds)
                 if supports_deepstack_input:
                     deepstack_prompt_embeds = self._scatter_deepstack_embeddings(
                         deepstack_prompt_embeds,
                         merged_prompt_embeds,
                         feature.mm_position,
-                        self._extract_deepstack_embeddings(image_features),
-                    )
-            elif modality.startswith("video"):
-                if not callable(get_video_features):
-                    raise RuntimeError(f"Model {type(self.model).__name__} does not expose get_video_features().")
-                pixel_values_videos = self._extract_multimodal_value(feature, "pixel_values_videos")
-                video_grid_thw = self._extract_multimodal_value(feature, "video_grid_thw")
-                if pixel_values_videos is None:
-                    raise RuntimeError("Video multimodal feature is missing pixel_values_videos.")
-                video_grid_thw = self._normalize_grid_thw(video_grid_thw)
-                self._validate_dynamic_qwen3_vl_grid("video", video_grid_thw)
-                video_features = get_video_features(
-                    pixel_values_videos=self._to_torch_tensor(pixel_values_videos, dtype=torch.float32),
-                    video_grid_thw=video_grid_thw,
-                )
-                video_embeds = self._normalize_multimodal_embeddings(video_features)
-                self._scatter_multimodal_embeddings(
-                    merged_prompt_embeds,
-                    feature.mm_position,
-                    video_embeds,
-                )
-                if supports_deepstack_input:
-                    deepstack_prompt_embeds = self._scatter_deepstack_embeddings(
-                        deepstack_prompt_embeds,
-                        merged_prompt_embeds,
-                        feature.mm_position,
-                        self._extract_deepstack_embeddings(video_features),
+                        None if item.deepstack is None else list(item.deepstack),
                     )
             elif modality.startswith("audio"):
                 if not callable(get_audio_features):
@@ -3583,18 +3691,26 @@ class MbltWorker(WorkerBase):
         for req_id in scheduler_output.finished_req_ids:
             self._finalize_finished_request(req_id, print_debug=print_debug)
 
-        # Add new requests to req_states
+        # Add new requests to req_states. Their images and videos are encoded together first, one encoder call
+        # per modality for the whole step, as vLLM's GPU model runner batches a step's encoder inputs.
+        vlm_session_ids = {}
         for new_req in scheduler_output.scheduled_new_reqs:
-            sampling_params = new_req.sampling_params or SamplingParams.from_optional()
-            vlm_session_id = self._get_vlm_session_id(new_req)
+            vlm_session_ids[new_req.req_id] = self._get_vlm_session_id(new_req)
             self._validate_mobilint_vlm_request_constraints(
                 new_req.mm_features,
-                session_id=vlm_session_id,
+                session_id=vlm_session_ids[new_req.req_id],
             )
+        encoded_vision = self._encode_vision_items(
+            [new_req.mm_features for new_req in scheduler_output.scheduled_new_reqs]
+        )
+        for new_req in scheduler_output.scheduled_new_reqs:
+            sampling_params = new_req.sampling_params or SamplingParams.from_optional()
+            vlm_session_id = vlm_session_ids[new_req.req_id]
             prompt_embeds, prompt_deepstack_embeds = self._build_prompt_embeds(
                 new_req.prompt_token_ids,
                 new_req.prompt_embeds,
                 new_req.mm_features,
+                encoded_vision,
             )
 
             normalized_block_ids = self._normalize_block_ids(new_req.block_ids)

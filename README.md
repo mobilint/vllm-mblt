@@ -666,9 +666,19 @@ output generated under different sampling than a GPU reference run.
 
 VLM prefix caching currently covers the language-model KV cache only. The
 worker may load a compatible LM KV prefix snapshot and run only the uncached
-text/embedding suffix. Image/video feature extraction is not cached by this
-layer: image requests still rebuild vision features through the model's
-multimodal feature hooks before the LM prefill/decode step.
+text/embedding suffix. Vision features have their own cache instead: as vLLM's
+GPU model runner does, the worker keeps recent image/video encoder outputs keyed
+by vLLM's content hash of each item, so an image that comes back (a follow-up
+chat turn, or the same picture in several requests) skips the vision encoder.
+`VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB` sets the host memory it may take
+(default 256; 0 turns it off).
+
+The images and videos of all requests that start in the same step go through the
+vision encoder together, one call per modality, as vLLM batches a step's encoder
+inputs. With `"vision_core_mode": "multi"` the model zoo runs same-shape images
+of that call in one NPU infer spread over the cores, which pays off when several
+image requests arrive together; `global8` gives the lowest latency for a single
+image.
 
 Batch-compiled VLM text backends (`max_batch_size > 1`) are supported for
 Mobilint Qwen2-VL and Qwen3-VL model types. With `mblt-model-zoo>=2.7.0`,
