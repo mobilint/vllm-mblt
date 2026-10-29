@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
 ### Added
 
@@ -14,6 +14,20 @@
 
 ### Changed
 
+- vllm-mblt now runs on vLLM 0.32.0 instead of 0.11.2 (#53), which needs Python 3.11+ and transformers 5 (≥5.16.1).
+  The platform keeps vLLM 0.11's serving behavior where 0.32 changed it: it turns off async scheduling, because the
+  worker samples inside `execute_model()`, and runs a single-worker engine on the `uni` executor. It also sets
+  `simple_compile_backend` to `eager`, so vLLM does not `torch.compile` its host sampling helpers. The worker follows
+  the 0.32 worker hooks (`compile_or_warm_up_model`, `load_model`, `profile`, `validate_request`) and returns
+  `sampled_token_ids` as lists. Multimodal requests whose items the prefix cache covers still carry their data,
+  because the worker rebuilds each prompt's embeddings. Qwen2-VL and Qwen3-VL use vLLM's own processors, and Qwen3-VL
+  reads transformers 5's image-feature outputs. When the loader config names no dtype, host-side weights load in
+  float32, as on transformers 4, so greedy outputs match 0.8.0. NPU tracing takes its directory from
+  `--profiler-config.torch_profiler_dir` (with `profiler=torch`) instead of `VLLM_TORCH_PROFILER_DIR`. Data parallel
+  serving needs a `/dev/shm` larger than a container's 64 MiB default.
+- Qwen3-ASR (`mobilint/Qwen3-ASR-1.7B`) serves on vLLM 0.32 through the `qwen-asr` extra, which now installs
+  transformers-mblt 0.7.0 or later instead of the `qwen-asr` package. That package pins transformers 4.57, and
+  transformers-mblt 0.7.0 vendors its backend so it runs on transformers 5. The default install is unchanged.
 - Plugin loggers now live under `vllm.vllm_mblt.*`, inheriting vLLM's handlers and log level. INFO diagnostics
   (including `[mblt-init]`, device placement and host-thread settings) are visible by default on vLLM 0.32 without
   an extra logging configuration. Custom configs targeting the old `vllm_mblt` namespace should use
@@ -66,6 +80,8 @@
 
 ### Documentation
 
+- README: requirements, the vLLM pin and the badge name vLLM 0.32.0; the Qwen3-ASR section no longer says it is
+  unsupported, and drops the vLLM 0.11.2 upload hang that vLLM 0.25.0 fixed.
 - README: a `dev_no` list runs every card from one engine, so scaling with the number of cards needs one engine
   per card (data parallel, or one `vllm serve` per card). A new "Host CPU Threads" section explains how each
   engine sizes its torch thread pool, why separate `vllm serve` processes need `OMP_NUM_THREADS`, and gives

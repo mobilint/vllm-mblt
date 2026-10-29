@@ -11,7 +11,7 @@
 
 [![PyPI - Version](https://img.shields.io/pypi/v/vllm-mblt?logo=pypi)](https://pypi.org/project/vllm-mblt/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/vllm-mblt?logo=python)](https://pypi.org/project/vllm-mblt/)
-[![vLLM](https://img.shields.io/badge/vLLM-0.11.2-blue)](https://github.com/vllm-project/vllm)
+[![vLLM](https://img.shields.io/badge/vLLM-0.32.0-blue)](https://github.com/vllm-project/vllm)
 [![Mobilint](https://img.shields.io/badge/Mobilint-NPU-green)](https://www.mobilint.com/)
 [![PyPI Downloads](https://static.pepy.tech/badge/vllm-mblt?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://clickpy.clickhouse.com/dashboard/vllm-mblt)
 
@@ -47,8 +47,8 @@ the plugin does not install a fallback handler; logging remains the application'
 - Python 3.11+
 - `vllm==0.32.0`
 - `transformers-mblt >= 0.6.1` and `mblt-model-zoo[transformers] >= 2.11.0`
-- Qwen3-ASR is not yet supported on this release. Support will come with the transformers-mblt 0.7.0 release,
-  through the `qwen-asr` extra (see [Serve a Speech-to-Text Model](#4-serve-a-speech-to-text-model)).
+- For Qwen3-ASR (`mobilint/Qwen3-ASR-1.7B`), the `qwen-asr` extra, which installs `transformers-mblt >= 0.7.0`:
+  `pip install "vllm-mblt[qwen-asr]"`
 - For Qwen3-MoE (`mobilint/Qwen3-30B-A3B`), the `qwen3-moe` extra: `pip install "vllm-mblt[qwen3-moe]"`
 - A Mobilint NPU environment. If you are not yet a Mobilint customer, please contact
   [tech-support@mobilint.com](mailto:tech-support@mobilint.com).
@@ -56,7 +56,7 @@ the plugin does not install a fallback handler; logging remains the application'
 The package pins vLLM for compatibility:
 
 ```text
-vllm>=0.11.2,<=0.11.2
+vllm>=0.32.0,<=0.32.0
 ```
 
 ## Installation
@@ -130,9 +130,7 @@ Current Mobilint Qwen2/3-VL notes:
 
 ### 4. Serve a Speech-to-Text Model
 
-> **Not yet supported.** Qwen3-ASR will be supported once transformers-mblt 0.7.0 is released. vLLM 0.32 needs
-> transformers 5, and the `qwen-asr` package that Qwen3-ASR used pins transformers 4.57. transformers-mblt 0.7.0
-> vendors that backend, and the `qwen-asr` extra below requires it, so it cannot be installed until then.
+Qwen3-ASR needs the optional `qwen-asr` extra, which installs `transformers-mblt>=0.7.0`:
 
 ```bash
 pip install "vllm-mblt[qwen-asr]"
@@ -165,13 +163,10 @@ Current Mobilint Qwen3-ASR notes:
 - vllm-mblt turns off vLLM's multimodal processor cache for this model. In vLLM 0.11.2, a request refused
   after preprocessing, such as one over the length limit, leaves that cache out of step with the engine, and
   sending the same audio again would stop the server from accepting requests.
-- vLLM 0.11.2 can hang the whole API server while splitting some malformed long uploads (fixed in vLLM 0.25.0
-  by [vllm-project/vllm#46463](https://github.com/vllm-project/vllm/pull/46463), after the version this plugin
-  pins). Validate or re-encode uploads in front of a public deployment.
 
 ### 5. Serve a Mixture-of-Experts Model
 
-Qwen3-30B-A3B needs the optional `qwen3-moe` extra, which installs `transformers-mblt>=0.5.0`:
+Qwen3-30B-A3B needs the optional `qwen3-moe` extra, which installs `transformers-mblt>=0.6.1`:
 
 ```bash
 pip install "vllm-mblt[qwen3-moe]"
