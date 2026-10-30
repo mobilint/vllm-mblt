@@ -46,7 +46,7 @@ the plugin does not install a fallback handler; logging remains the application'
 
 - Python 3.11+
 - `vllm==0.32.0`
-- `transformers-mblt >= 0.6.1` and `mblt-model-zoo[transformers] >= 2.11.0`
+- `transformers-mblt >= 0.7.1` and `mblt-model-zoo[transformers] >= 2.11.0`
 - For Qwen3-ASR (`mobilint/Qwen3-ASR-1.7B`), the `qwen-asr` extra, which installs `transformers-mblt >= 0.7.0`:
   `pip install "vllm-mblt[qwen-asr]"`
 - For Qwen3-MoE (`mobilint/Qwen3-30B-A3B`), the `qwen3-moe` extra: `pip install "vllm-mblt[qwen3-moe]"`
