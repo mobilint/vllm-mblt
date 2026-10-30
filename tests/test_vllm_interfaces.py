@@ -65,6 +65,31 @@ def test_dynamic_qwen3_vl_frontend_does_not_use_static_layout() -> None:
     _StaticInputProcessor(config).process({"type": "token"})
 
 
+@pytest.mark.parametrize("dynamic_flag", [None, False, True])
+def test_qwen3_vl_without_static_position_does_not_assume_static_layout(dynamic_flag) -> None:
+    hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+    if dynamic_flag is not None:
+        hf_config.dynamic_vision = dynamic_flag
+    config = _make_vllm_config(128, hf_config=hf_config, loader_extra_config={"text_max_batch_size": 16})
+    _StaticInputProcessor(config).process({"type": "token"})
+
+
+def test_null_static_position_is_unset_but_zero_offset_is_valid() -> None:
+    from vllm.exceptions import VLLMValidationError
+
+    hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=False)
+    config = _make_vllm_config(
+        128,
+        hf_config=hf_config,
+        loader_extra_config={"text_max_batch_size": 16, "static_image_token_offset": None},
+    )
+    processor = _StaticInputProcessor(config)
+    processor.process({"type": "token"})
+    config.load_config.model_loader_extra_config.update(static_image_token_offset=0, static_image_token_length=64)
+    with pytest.raises(VLLMValidationError, match="one image at the compiled placeholder"):
+        processor.process({"type": "token"})
+
+
 def test_compile_or_warm_up_model_returns_compilation_times() -> None:
     # The executor reads `.language_model` from every worker's result.
     worker = MbltWorker.__new__(MbltWorker)
