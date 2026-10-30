@@ -1482,9 +1482,11 @@ class MbltWorker(WorkerBase):
                 pending.setdefault(kind, []).append(feature)
 
         for kind, features in pending.items():
-            _, pixel_key, _ = _VISION_ENCODER_INPUTS[kind]
+            _, pixel_key, grid_key = _VISION_ENCODER_INPUTS[kind]
             batch: list[MultiModalFeatureSpec] = []
             batch_bytes = 0
+            batch_tokens = 0
+            dynamic = self._supports_dynamic_qwen3_vl_inputs()
 
             def encode_batch() -> None:
                 for feature, item in zip(batch, self._run_vision_encoder(kind, batch)):
@@ -1499,14 +1501,21 @@ class MbltWorker(WorkerBase):
                 pixels = self._extract_multimodal_value(feature, pixel_key)
                 # The encoder converts pixels to float32 before concatenation.
                 pixel_bytes = 0 if pixels is None else int(torch.as_tensor(pixels).numel()) * 4
+                grid = self._normalize_grid_thw(self._extract_multimodal_value(feature, grid_key)) if dynamic else None
+                self._validate_dynamic_qwen3_vl_grid(kind, grid)
+                tokens = int(grid.prod(dim=-1).sum().item()) if grid is not None else 0
                 if batch and (
-                    len(batch) >= _VISION_BATCH_MAX_ITEMS or batch_bytes + pixel_bytes > _VISION_BATCH_MAX_PIXEL_BYTES
+                    len(batch) >= _VISION_BATCH_MAX_ITEMS
+                    or batch_bytes + pixel_bytes > _VISION_BATCH_MAX_PIXEL_BYTES
+                    or batch_tokens + tokens > QWEN3_VL_MAX_VISION_TOKENS
                 ):
                     encode_batch()
                     batch = []
                     batch_bytes = 0
+                    batch_tokens = 0
                 batch.append(feature)
                 batch_bytes += pixel_bytes
+                batch_tokens += tokens
             if batch:
                 encode_batch()
         return encoded

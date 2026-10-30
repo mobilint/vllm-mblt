@@ -3169,6 +3169,17 @@ class TestMbltWorkerOptimizations:
         assert len(calls) == 1
         assert encoded_later[id(later)] is encoded[id(first)]
 
+    def test_dynamic_vision_batch_respects_total_token_limit(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        worker.model.config.dynamic_vision = True
+        features = [self._make_image_feature(float(i)) for i in range(3)]
+        for feature in features:
+            feature.data["image_grid_thw"] = torch.tensor([1, 50, 60])
+        encoded = worker._encode_vision_items([features])
+        assert [len(call["image_grid_thw"]) for call in calls] == [1, 1, 1]
+        for i, feature in enumerate(features):
+            torch.testing.assert_close(encoded[id(feature)].embeds, torch.full((2, 4), float(i)))
+
     def test_encoder_cache_reset_reencodes_items(self) -> None:
         worker, calls = self._make_qwen3_vl_encoder_worker()
         feature = self._make_image_feature(1.0, "same-image")
