@@ -13,6 +13,7 @@ from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_mblt.encoder_cache import EncodedVisionItem, EncoderOutputCache
 from vllm_mblt.mblt_worker import (
     InferenceLogits,
     MbltWorker,
@@ -26,6 +27,10 @@ from vllm_mblt.request_cache import RequestCacheSlots
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest
 
 from .kv_slot_fakes import FakeForwardModel, FakeKVSlotModel, attach_request_caches, make_snapshot_cache
+
+
+class _StopAfterPromptEmbeds(Exception):
+    """Ends a test step once the worker has built a prompt embedding."""
 
 
 class TestMbltWorkerOptimizations:
@@ -349,6 +354,7 @@ class TestMbltWorkerOptimizations:
         worker.print_debug = False
         worker._warned_last_logit_prompt_logprobs = False
         worker._vlm_image_positions_by_session = {}
+        worker.encoder_output_cache = EncoderOutputCache(64 * 1024 * 1024)
         worker.req_states = {}
         # Room for every batch slot a test switches to after building the worker.
         worker.kv_slot_models = attach_request_caches(worker, k_per_model=64)
@@ -2711,9 +2717,9 @@ class TestMbltWorkerOptimizations:
         video_calls = []
 
         def get_image_features(**kwargs):
+            # Both images of the prompt arrive in one call, joined the way a processor joins them.
             image_calls.append(kwargs)
-            value = float(len(image_calls))
-            embeds = torch.full((2, 4), value)
+            embeds = torch.cat([torch.full((2, 4), float(index + 1)) for index in range(len(kwargs["image_grid_thw"]))])
             return ((embeds,), [embeds + 10])
 
         def get_video_features(**kwargs):
@@ -2751,7 +2757,9 @@ class TestMbltWorkerOptimizations:
             prompt_token_ids=None, prompt_embeds=base_prompt_embeds, mm_features=features
         )
 
-        assert len(image_calls) == 2
+        assert len(image_calls) == 1
+        assert tuple(image_calls[0]["pixel_values"].shape) == (2, 3)
+        assert image_calls[0]["image_grid_thw"].tolist() == [[1, 1, 2], [1, 1, 2]]
         assert len(video_calls) == 1
         torch.testing.assert_close(merged[0:2], torch.full((2, 4), 1.0))
         torch.testing.assert_close(merged[3:5], torch.full((2, 4), 3.0))
@@ -3074,6 +3082,182 @@ class TestMbltWorkerOptimizations:
         assert len(infer_inputs) == 2
         np.testing.assert_array_equal(infer_inputs[0][2:4], np.full((2, 4), 1.0, dtype=np.float32))
         np.testing.assert_array_equal(infer_inputs[1][2:4], np.full((2, 4), 2.0, dtype=np.float32))
+
+    def _make_qwen3_vl_encoder_worker(self) -> tuple[MbltWorker, list[dict[str, torch.Tensor]]]:
+        """A Qwen3-VL worker whose image encoder returns, per image, rows filled with that image's first pixel."""
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        calls: list[dict[str, torch.Tensor]] = []
+
+        def get_image_features(**kwargs):
+            calls.append(kwargs)
+            pixels = kwargs["pixel_values"]
+            embeds = torch.cat([torch.full((2, 4), float(pixels[index, 0])) for index in range(len(pixels))])
+            return ((embeds,), [embeds + 10, embeds + 20])
+
+        worker.model = SimpleNamespace(
+            config=SimpleNamespace(model_type="mobilint-qwen3_vl", vocab_size=32000),
+            get_image_features=get_image_features,
+        )
+        return worker, calls
+
+    def _make_image_feature(self, value: float, identifier: str | None = None) -> SimpleNamespace:
+        feature = self._make_mm_feature(
+            "image",
+            offset=1,
+            data={"pixel_values": torch.full((1, 3), value), "image_grid_thw": torch.tensor([1, 1, 2])},
+        )
+        if identifier is not None:
+            feature.identifier = identifier
+        return feature
+
+    def test_images_of_several_prompts_go_through_one_encoder_call(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        first, second, third = (self._make_image_feature(value) for value in (1.0, 2.0, 3.0))
+
+        encoded = worker._encode_vision_items([[first], [second, third], None])
+
+        assert len(calls) == 1
+        assert tuple(calls[0]["pixel_values"].shape) == (3, 3)
+        assert calls[0]["image_grid_thw"].tolist() == [[1, 1, 2]] * 3
+        for feature, value in ((first, 1.0), (second, 2.0), (third, 3.0)):
+            item = encoded[id(feature)]
+            torch.testing.assert_close(item.embeds, torch.full((2, 4), value))
+            assert item.deepstack is not None
+            torch.testing.assert_close(item.deepstack[0], torch.full((2, 4), value + 10))
+            torch.testing.assert_close(item.deepstack[1], torch.full((2, 4), value + 20))
+
+        merged, deepstack = worker._build_prompt_embeds(
+            prompt_token_ids=None, prompt_embeds=torch.zeros(4, 4), mm_features=[second], encoded_vision=encoded
+        )
+        assert len(calls) == 1
+        torch.testing.assert_close(merged[1:3], torch.full((2, 4), 2.0))
+        assert deepstack is not None
+        torch.testing.assert_close(deepstack[1, 1:3], torch.full((2, 4), 22.0))
+
+    @pytest.mark.parametrize("container", [tuple, list])
+    def test_qwen2_flat_per_image_outputs_are_combined(self, container) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        worker.model_config.hf_config.model_type = "mobilint-qwen2_vl"
+        worker.model.config.model_type = "mobilint-qwen2_vl"
+
+        def encode(**kwargs):
+            calls.append(kwargs)
+            return container(torch.full((2, 4), float(value)) for value in (1, 2))
+
+        worker.model.get_image_features = encode
+        first, second = self._make_image_feature(1), self._make_image_feature(2)
+        result = worker._encode_vision_items([[first], [second]])
+        assert len(calls) == 1
+        torch.testing.assert_close(result[id(first)].embeds, torch.full((2, 4), 1.0))
+        torch.testing.assert_close(result[id(second)].embeds, torch.full((2, 4), 2.0))
+
+    def test_repeated_images_are_encoded_once_and_reused_from_the_encoder_cache(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        first, repeat = self._make_image_feature(1.0, "hash-a"), self._make_image_feature(1.0, "hash-a")
+        other = self._make_image_feature(2.0, "hash-b")
+
+        encoded = worker._encode_vision_items([[first], [repeat, other]])
+
+        assert len(calls) == 1
+        assert tuple(calls[0]["pixel_values"].shape) == (2, 3)
+        assert encoded[id(repeat)] is encoded[id(first)]
+        torch.testing.assert_close(encoded[id(other)].embeds, torch.full((2, 4), 2.0))
+
+        later = self._make_image_feature(1.0, "hash-a")
+        encoded_later = worker._encode_vision_items([[later]])
+        assert len(calls) == 1
+        assert encoded_later[id(later)] is encoded[id(first)]
+
+    def test_vision_cache_key_includes_processed_pixels_and_grid(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        first = self._make_image_feature(1.0, "same-image")
+        changed_pixels = self._make_image_feature(2.0, "same-image")
+        changed_grid = self._make_image_feature(1.0, "same-image")
+        changed_grid.data["image_grid_thw"] = torch.tensor([1, 2, 1])
+
+        result = worker._encode_vision_items([[first, changed_pixels, changed_grid]])
+        assert len(calls) == 1 and len(calls[0]["image_grid_thw"]) == 3
+        torch.testing.assert_close(result[id(changed_pixels)].embeds, torch.full((2, 4), 2.0))
+        assert result[id(changed_grid)] is not result[id(first)]
+        worker._encode_vision_items([[self._make_image_feature(1.0, "same-image")]])
+        assert len(calls) == 1
+        worker._encode_vision_items([[self._make_image_feature(3.0, "same-image")]])
+        assert len(calls) == 2
+
+    def test_dynamic_vision_batch_respects_total_token_limit(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        worker.model.config.dynamic_vision = True
+        features = [self._make_image_feature(float(i)) for i in range(3)]
+        for feature in features:
+            feature.data["image_grid_thw"] = torch.tensor([1, 50, 60])
+        encoded = worker._encode_vision_items([features])
+        assert [len(call["image_grid_thw"]) for call in calls] == [1, 1, 1]
+        for i, feature in enumerate(features):
+            torch.testing.assert_close(encoded[id(feature)].embeds, torch.full((2, 4), float(i)))
+
+    def test_encoder_cache_reset_reencodes_items(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        feature = self._make_image_feature(1.0, "same-image")
+        worker._encode_vision_items([[feature]])
+        assert worker.encoder_output_cache.nbytes > 0
+        worker.reset_encoder_cache()
+        assert worker.encoder_output_cache.nbytes == 0
+        worker._encode_vision_items([[feature]])
+        assert len(calls) == 2
+
+    def test_encoder_batch_limits_temporary_pixel_copies(self, monkeypatch) -> None:
+        import vllm_mblt.mblt_worker as worker_module
+
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        monkeypatch.setattr(worker_module, "_VISION_BATCH_MAX_PIXEL_BYTES", 24)
+        features = [self._make_image_feature(float(i)) for i in range(5)]
+        encoded = worker._encode_vision_items([features])
+        assert [len(call["image_grid_thw"]) for call in calls] == [2, 2, 1]
+        for i, feature in enumerate(features):
+            torch.testing.assert_close(encoded[id(feature)].embeds, torch.full((2, 4), float(i)))
+
+    def test_batched_encoder_output_must_match_the_placeholders(self) -> None:
+        worker, _calls = self._make_qwen3_vl_encoder_worker()
+        worker.model.get_image_features = lambda **_kwargs: ((torch.zeros(3, 4),), None)
+
+        with pytest.raises(RuntimeError, match=r"has 3 embeddings; the 2 placeholders take \[2, 2\]"):
+            worker._encode_vision_items([[self._make_image_feature(1.0)], [self._make_image_feature(2.0)]])
+
+    def test_execute_model_encodes_a_steps_new_vision_requests_together(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        worker._supports_deepstack_input = lambda: False
+        encoded_batches: list[list[int]] = []
+        encode = worker._encode_vision_items
+
+        def record_encode(feature_lists):
+            encoded_batches.append([len(features or ()) for features in feature_lists])
+            return encode(feature_lists)
+
+        built: dict[str, torch.Tensor] = {}
+
+        def build_prompt_embeds(prompt_token_ids, prompt_embeds, mm_features, encoded_vision=None):
+            assert encoded_vision is not None and all(id(feature) in encoded_vision for feature in mm_features)
+            merged, _ = MbltWorker._build_prompt_embeds(
+                worker, prompt_token_ids, prompt_embeds, mm_features, encoded_vision
+            )
+            built[str(float(mm_features[0].data["pixel_values"][0, 0]))] = merged
+            raise _StopAfterPromptEmbeds
+
+        worker._encode_vision_items = record_encode
+        worker._build_prompt_embeds = build_prompt_embeds
+        scheduler_output = self._make_scheduler_output({"a": 4, "b": 4})
+        scheduler_output.scheduled_new_reqs = [
+            self._make_new_request(req_id, torch.zeros(4, 4), [self._make_image_feature(value)], session_id=req_id)
+            for req_id, value in (("a", 1.0), ("b", 2.0))
+        ]
+
+        with pytest.raises(_StopAfterPromptEmbeds):
+            worker.execute_model(scheduler_output)
+
+        assert encoded_batches == [[1, 1]]
+        assert len(calls) == 1 and tuple(calls[0]["pixel_values"].shape) == (2, 3)
+        torch.testing.assert_close(built["1.0"][1:3], torch.full((2, 4), 1.0))
 
     def test_build_deepstack_input_embeds_pads_decode_tokens(self) -> None:
         worker = self._make_worker()
@@ -3742,3 +3926,41 @@ class TestMbltWorkerOptimizations:
         sampler_output = worker._sample_next_token(logits=logits, sampling_metadata=sampling_metadata)
 
         assert int(sampler_output.sampled_token_ids[0, 0].item()) == 2
+
+
+def _encoded(rows: int, value: float) -> EncodedVisionItem:
+    return EncodedVisionItem(torch.full((rows, 256), value))  # 1 KiB per row
+
+
+def test_encoder_output_cache_evicts_least_recently_used_items_within_its_budget() -> None:
+    cache = EncoderOutputCache(3 * 1024)
+    cache.put("a", _encoded(1, 1.0))
+    cache.put("b", _encoded(1, 2.0))
+    cache.put("c", _encoded(1, 3.0))
+    assert cache.get("a") is not None  # "b" is now the least recently used
+
+    cache.put("d", _encoded(1, 4.0))
+
+    assert cache.get("b") is None
+    assert {key for key in "acd" if cache.get(key) is not None} == {"a", "c", "d"}
+    assert cache.nbytes == 3 * 1024
+
+    cache.put("big", _encoded(4, 5.0))  # larger than the whole budget: not cached, nothing evicted
+    assert cache.get("big") is None and len(cache) == 3
+
+
+def test_encoder_output_cache_with_no_budget_keeps_nothing() -> None:
+    cache = EncoderOutputCache(0)
+    cache.put("a", _encoded(1, 1.0))
+    assert cache.get("a") is None and len(cache) == 0
+
+
+def test_encoder_cache_budget_comes_from_the_environment(monkeypatch) -> None:
+    from vllm_mblt.mblt_worker import DEFAULT_ENCODER_CACHE_MAX_HOST_MIB, _resolve_encoder_cache_max_host_mib
+
+    monkeypatch.delenv("VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB", raising=False)
+    assert _resolve_encoder_cache_max_host_mib() == DEFAULT_ENCODER_CACHE_MAX_HOST_MIB
+    monkeypatch.setenv("VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB", "0")
+    assert _resolve_encoder_cache_max_host_mib() == 0
+    monkeypatch.setenv("VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB", "lots")
+    assert _resolve_encoder_cache_max_host_mib() == DEFAULT_ENCODER_CACHE_MAX_HOST_MIB

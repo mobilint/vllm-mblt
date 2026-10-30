@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Images and videos of requests starting in the same step are grouped by modality and encoded in bounded batches
+  (up to 16 items and 64 MiB of float32 pixel inputs, with oversized items sent alone). With `vision_core_mode`
+  `multi`, the model zoo can run same-shape images in a single NPU infer spread over the cores. Unlike upstream's
+  encoder scheduling, this worker still encodes all items of a new request before its first text chunk.
+
+### Added
+
+- A host cache of vision encoder outputs keyed by vLLM's multimodal identifier and a fingerprint of the processed
+  pixels and grid: repeated identical inputs are encoded once. `VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB`
+  sets its budget (default 256 MiB, 0 disables it).
+
 ## 0.9.0
 
 ### Added
