@@ -42,7 +42,7 @@ from vllm_mblt.data_parallel import (
 from vllm_mblt.eagle3_runtime import Eagle3Runner, is_eagle3_model
 from vllm_mblt.encoder_cache import EncodedVisionItem, EncoderOutputCache
 from vllm_mblt.host_threads import apply_engine_host_thread_defaults
-from vllm_mblt.mblt_platform import resolve_model_max_batch_size
+from vllm_mblt.mblt_platform import resolve_model_max_batch_size, resolve_static_image_position
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
 from vllm_mblt.moe_runtime import MbltMoECacheModel, is_mixture_of_experts_model
 from vllm_mblt.request_cache import RequestCacheSlots, join_request_caches
@@ -2020,22 +2020,10 @@ class MbltWorker(WorkerBase):
                     "Batched Qwen3-VL text MXQs without a RoPE input must use the four-input split-static layout; "
                     f"got {len(shapes)} inputs. Bundled-static batch MXQs are unsupported."
                 )
-            values = []
-            for name in ("static_image_token_offset", "static_image_token_length"):
-                value = _prefix_cache_config_value(self.vllm_config, name)
-                if value is None:
-                    value = getattr(getattr(self.model, "config", None), name, None)
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, int)
-                    or value < (1 if name.endswith("length") else 0)
-                ):
-                    raise RuntimeError(
-                        f"Split-static Qwen3-VL batch requires {name} as an integer in "
-                        "model-loader-extra-config or the model config, matching the compiled prompt layout."
-                    )
-                values.append(value)
-            self._static_batch_image_position = (values[0], values[1])
+            try:
+                self._static_batch_image_position = resolve_static_image_position(self.vllm_config)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
 
     def _is_audio_text_model(self) -> bool:
         model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)
