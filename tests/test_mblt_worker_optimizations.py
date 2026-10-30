@@ -3169,6 +3169,22 @@ class TestMbltWorkerOptimizations:
         assert len(calls) == 1
         assert encoded_later[id(later)] is encoded[id(first)]
 
+    def test_vision_cache_key_includes_processed_pixels_and_grid(self) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        first = self._make_image_feature(1.0, "same-image")
+        changed_pixels = self._make_image_feature(2.0, "same-image")
+        changed_grid = self._make_image_feature(1.0, "same-image")
+        changed_grid.data["image_grid_thw"] = torch.tensor([1, 2, 1])
+
+        result = worker._encode_vision_items([[first, changed_pixels, changed_grid]])
+        assert len(calls) == 1 and len(calls[0]["image_grid_thw"]) == 3
+        torch.testing.assert_close(result[id(changed_pixels)].embeds, torch.full((2, 4), 2.0))
+        assert result[id(changed_grid)] is not result[id(first)]
+        worker._encode_vision_items([[self._make_image_feature(1.0, "same-image")]])
+        assert len(calls) == 1
+        worker._encode_vision_items([[self._make_image_feature(3.0, "same-image")]])
+        assert len(calls) == 2
+
     def test_dynamic_vision_batch_respects_total_token_limit(self) -> None:
         worker, calls = self._make_qwen3_vl_encoder_worker()
         worker.model.config.dynamic_vision = True

@@ -1377,11 +1377,14 @@ class MbltWorker(WorkerBase):
             return int(placeholder.length)
         return int(torch.as_tensor(placeholder.is_embed).bool().sum().item())
 
-    @staticmethod
-    def _vision_cache_key(kind: str, feature: MultiModalFeatureSpec) -> Optional[Hashable]:
-        """The encoder-cache key of an item: vLLM's content hash of it, or ``None`` when it carries none."""
+    @classmethod
+    def _vision_cache_key(cls, kind: str, feature: MultiModalFeatureSpec) -> Optional[Hashable]:
+        """Key outputs by item identity and the actual preprocessed pixels/grid; skip caching if either is absent."""
         identifier = getattr(feature, "identifier", None)
-        return (kind, identifier) if isinstance(identifier, str) and identifier else None
+        if not isinstance(identifier, str) or not identifier:
+            return None
+        fingerprint = cls._multimodal_feature_content_fingerprint(feature)
+        return (kind, identifier, fingerprint) if fingerprint is not None else None
 
     def _run_vision_encoder(self, kind: str, features: Sequence[MultiModalFeatureSpec]) -> list[EncodedVisionItem]:
         """Encode images (or videos) of one or more requests in one model call; return one output per item.
@@ -1464,12 +1467,14 @@ class MbltWorker(WorkerBase):
         encoded: dict[int, EncodedVisionItem] = {}
         pending: dict[str, list[MultiModalFeatureSpec]] = {}
         repeats: dict[Hashable, list[MultiModalFeatureSpec]] = {}
+        keys: dict[int, Optional[Hashable]] = {}
         for features in feature_lists:
             for feature in features or ():
                 kind = _vision_kind(feature.modality)
                 if kind is None or feature.data is None:
                     continue
                 key = self._vision_cache_key(kind, feature)
+                keys[id(feature)] = key
                 if key is not None:
                     cached = self.encoder_output_cache.get(key)
                     if cached is not None:
@@ -1491,7 +1496,7 @@ class MbltWorker(WorkerBase):
             def encode_batch() -> None:
                 for feature, item in zip(batch, self._run_vision_encoder(kind, batch)):
                     encoded[id(feature)] = item
-                    key = self._vision_cache_key(kind, feature)
+                    key = keys[id(feature)]
                     if key is not None:
                         for repeat in repeats[key]:
                             encoded[id(repeat)] = item

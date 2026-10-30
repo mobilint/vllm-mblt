@@ -668,8 +668,9 @@ VLM prefix caching currently covers the language-model KV cache only. The
 worker may load a compatible LM KV prefix snapshot and run only the uncached
 text/embedding suffix. Vision features have their own cache instead: as vLLM's
 GPU model runner does, the worker keeps recent image/video encoder outputs keyed
-by vLLM's content hash of each item, so an image that comes back (a follow-up
-chat turn, or the same picture in several requests) skips the vision encoder.
+by vLLM's item identifier and a fingerprint of the preprocessed pixels and grid.
+An image that comes back with the same preprocessing (a follow-up chat turn, or
+the same picture in several requests) skips the vision encoder.
 `VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB` sets the host memory it may take
 (default 256; 0 turns it off).
 

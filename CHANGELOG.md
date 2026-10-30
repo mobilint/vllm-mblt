@@ -11,8 +11,8 @@
 
 ### Added
 
-- A host cache of vision encoder outputs keyed by vLLM's multimodal content hash: an image that a later request
-  sends again, or that several requests of one step share, is encoded once. `VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB`
+- A host cache of vision encoder outputs keyed by vLLM's multimodal identifier and a fingerprint of the processed
+  pixels and grid: repeated identical inputs are encoded once. `VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB`
   sets its budget (default 256 MiB, 0 disables it).
 
 ## 0.9.0
