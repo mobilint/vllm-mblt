@@ -390,6 +390,25 @@ def resolve_static_image_position(vllm_config: "VllmConfig") -> tuple[int, int]:
     return values[0], values[1]
 
 
+def _has_static_image_position(vllm_config: "VllmConfig") -> bool:
+    """A static position explicitly declared by the artifact or caller opts into frontend validation.
+
+    The frontend cannot inspect the NPU MXQ signature, and an absent dynamic-vision flag is not proof of a static
+    decoder. The worker separately rejects split-static batch MXQs without a complete position at model load.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = _get_hf_config(vllm_config)
+    roots = (
+        _get_model_loader_extra_config(vllm_config),
+        getattr(model_config, "model_kwargs", None),
+        getattr(model_config, "hf_overrides", None),
+    )
+    names = ("static_image_token_offset", "static_image_token_length")
+    return any(isinstance(root, dict) and any(name in root for name in names) for root in roots) or any(
+        getattr(hf_config, name, None) is not None for name in names
+    )
+
+
 class MbltPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_type = "cpu"
@@ -449,6 +468,7 @@ class MbltPlatform(Platform):
         if (
             getattr(hf_config, "model_type", None) == "mobilint-qwen3_vl"
             and not bool(getattr(hf_config, "dynamic_vision", False))
+            and _has_static_image_position(config)
             and (resolve_model_max_batch_size(config) or 1) > 1
         ):
             try:
