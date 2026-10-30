@@ -11,6 +11,10 @@
 
 ### Added
 
+- Qwen3-VL split-static batch text MXQs use the transformers-mblt 0.7.1 forward without an external RoPE input.
+  Every prompt must match the image position baked into the decoder; the worker cannot verify that position from
+  the MXQ. Bundled-static batch MXQs remain unsupported.
+
 - A host cache of vision encoder outputs keyed by vLLM's multimodal identifier and a fingerprint of the processed
   pixels and grid: repeated identical inputs are encoded once. `VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB`
   sets its budget (default 256 MiB, 0 disables it).

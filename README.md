@@ -576,9 +576,9 @@ their text decoder with the merged embeddings, M-RoPE `position_ids` and
 deepstack features, and Qwen3-ASR calls its thinker's text decoder with the
 merged audio-text embeddings. Mixture-of-Experts models serve one request at a
 time, so each step runs on that request's `MobilintMixtureOfExpertsCache`. The
-worker never calls an MXQ itself. A Qwen3-VL batch MXQ without a RoPE input is
-refused at load, as the batched deepstack forward cannot run it; every Qwen3-VL
-Batch16 release has one.
+worker never calls an MXQ itself. Qwen3-VL batch MXQs may use the dynamic
+three- or five-input layout or the four-input split-static layout supported by
+transformers-mblt 0.7.1. Bundled-static batch MXQs remain unsupported.
 
 Every request keeps its own transformers-mblt cache on the NPU slot it runs on,
 and the worker binds it before each infer. transformers-mblt records which
@@ -686,8 +686,12 @@ Batch-compiled VLM text backends (`max_batch_size > 1`) are supported for
 Mobilint Qwen2-VL and Qwen3-VL model types. With `mblt-model-zoo>=2.7.0`,
 Qwen3-VL dynamic-vision Batch16 artifacts forward packed text embeddings plus
 the matching packed RoPE and DeepStack tensors. Both the bundled 3-input text
-layout and the per-layer split 5-input layout are supported; batched split-static
-artifacts remain unsupported.
+layout and the per-layer split 5-input layout are supported. The four-input
+split-static batch layout is also supported without a RoPE input. Static MXQs
+have a baked prompt layout: every request must put its image at the position used
+when compiling the decoder. The worker cannot derive that position from the MXQ
+and does not verify it; a different layout can silently produce incorrect output.
+Bundled-static batch MXQs remain unsupported.
 Qwen3-VL dynamic image and video processor resolution overrides are forwarded up to
 the NPU encoder's 4096 pre-merge vision-token limit. Larger overrides are clamped and
 `do_resize=False` is rejected so preprocessing cannot produce an unsupported MXQ input shape.

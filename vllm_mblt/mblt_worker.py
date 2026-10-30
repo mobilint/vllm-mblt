@@ -1999,14 +1999,16 @@ class MbltWorker(WorkerBase):
     def _check_text_mxq_supported(self) -> None:
         """Refuse a text MXQ the transformers-mblt forward cannot run, at load time rather than on the first batch.
 
-        transformers-mblt's batched deepstack forward takes only a Qwen3-VL text MXQ with a RoPE input; every
-        Qwen3-VL Batch16 release has one.
+        transformers-mblt 0.7.1 supports split-static batch MXQs with four inputs, but still rejects bundled-static
+        batch MXQs with two inputs. Dynamic batch MXQs use three or five inputs including a RoPE input.
         """
         if self._supports_deepstack_input() and self._is_batch_model() and not self._text_mxq_uses_rope_input():
-            raise RuntimeError(
-                "Batched Qwen3-VL text MXQs without a RoPE input are unsupported; "
-                "use a dynamic text MXQ, which has one."
-            )
+            shapes = self._cache_model_input_shapes(self._get_cache_model())
+            if len(shapes) != 4:
+                raise RuntimeError(
+                    "Batched Qwen3-VL text MXQs without a RoPE input must use the four-input split-static layout; "
+                    f"got {len(shapes)} inputs. Bundled-static batch MXQs are unsupported."
+                )
 
     def _is_audio_text_model(self) -> bool:
         model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)
