@@ -404,7 +404,7 @@ def _has_static_image_position(vllm_config: "VllmConfig") -> bool:
         getattr(model_config, "hf_overrides", None),
     )
     names = ("static_image_token_offset", "static_image_token_length")
-    return any(isinstance(root, dict) and any(name in root for name in names) for root in roots) or any(
+    return any(isinstance(root, dict) and any(root.get(name) is not None for name in names) for root in roots) or any(
         getattr(hf_config, name, None) is not None for name in names
     )
 
