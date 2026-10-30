@@ -365,6 +365,31 @@ def resolve_model_max_batch_size(
     )
 
 
+def resolve_static_image_position(vllm_config: "VllmConfig") -> tuple[int, int]:
+    """Read the artifact's compiled static image placeholder position from loader settings or model config."""
+    loader = _get_model_loader_extra_config(vllm_config) or {}
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = _get_hf_config(vllm_config)
+    values = []
+    for name in ("static_image_token_offset", "static_image_token_length"):
+        value = loader.get(name)
+        if value is None:
+            for root in (getattr(model_config, "model_kwargs", None), getattr(model_config, "hf_overrides", None)):
+                if isinstance(root, dict) and name in root:
+                    value = root[name]
+                    break
+        if value is None:
+            value = getattr(hf_config, name, None)
+        minimum = 1 if name.endswith("length") else 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(
+                f"Split-static Qwen3-VL batch requires {name} as an integer in model-loader-extra-config "
+                "or the model config, matching the compiled prompt layout."
+            )
+        values.append(value)
+    return values[0], values[1]
+
+
 class MbltPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_type = "cpu"
@@ -416,6 +441,36 @@ class MbltPlatform(Platform):
 
         vLLM 0.32 maps only its VLLMClientError family to 4xx; a plain ValueError here reaches the client as a 500.
         """
+        # vLLM calls this in InputProcessor after rendering, before enqueueing the request. Raising its client error
+        # here prevents a bad static image position from failing the whole engine inside execute_model().
+        caller = sys._getframe(1).f_locals.get("self")
+        config = getattr(caller, "vllm_config", None)
+        hf_config = _get_hf_config(config)
+        if (
+            getattr(hf_config, "model_type", None) == "mobilint-qwen3_vl"
+            and not bool(getattr(hf_config, "dynamic_vision", False))
+            and (resolve_model_max_batch_size(config) or 1) > 1
+        ):
+            try:
+                expected = resolve_static_image_position(config)
+            except ValueError as exc:
+                raise VLLMValidationError(str(exc), parameter="model") from exc
+            inputs = processed_inputs if isinstance(processed_inputs, dict) else {}
+            placeholders = inputs.get("mm_placeholders") or {}
+            images = placeholders.get("image", [])
+            other_modalities = any(items for kind, items in placeholders.items() if kind != "image")
+            valid = len(images) == 1 and not other_modalities
+            if valid:
+                image = images[0]
+                mask = getattr(image, "is_embed", None)
+                valid = (int(image.offset), int(image.length)) == expected and (mask is None or bool(mask.all()))
+            if not valid:
+                raise VLLMValidationError(
+                    "Static Qwen3-VL batch requires one image at the compiled placeholder position "
+                    f"offset={expected[0]}, length={expected[1]}, with all image tokens.",
+                    parameter="messages",
+                )
+
         if not cls._validating_for_eagle3():
             return
         unsupported = _unsupported_eagle3_sampling(params)

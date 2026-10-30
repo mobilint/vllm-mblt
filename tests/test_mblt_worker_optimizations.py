@@ -165,6 +165,25 @@ class TestMbltWorkerOptimizations:
         worker._validate_mobilint_vlm_request_constraints([], session_id="session-a")
         assert worker._vlm_image_positions_by_session == {}
 
+    def test_static_batch_requires_compiled_image_position_in_every_request(self) -> None:
+        worker = self._make_worker()
+        worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")
+        worker._static_batch_image_position = (4, 2)
+        worker._validate_mobilint_vlm_request_constraints(
+            [self._make_mm_feature("image", offset=4, length=2)], session_id="first"
+        )
+        with pytest.raises(RuntimeError, match="does not match the compiled layout"):
+            worker._validate_mobilint_vlm_request_constraints(
+                [self._make_mm_feature("image", offset=5, length=2)], session_id="another"
+            )
+        with pytest.raises(RuntimeError, match="must include their compiled-layout image"):
+            worker._validate_mobilint_vlm_request_constraints(None, session_id="text-only")
+        with pytest.raises(RuntimeError, match="does not match the compiled layout"):
+            worker._validate_mobilint_vlm_request_constraints(
+                [self._make_mm_feature("image", offset=4, length=2, is_embed=torch.tensor([True, False]))],
+                session_id="masked",
+            )
+
     def test_mobilint_vlm_request_constraints_allow_one_image_and_fix_position(self) -> None:
         worker = self._make_worker()
         worker.model_config.hf_config = SimpleNamespace(model_type="mobilint-qwen3_vl")

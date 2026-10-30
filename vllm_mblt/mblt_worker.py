@@ -42,7 +42,7 @@ from vllm_mblt.data_parallel import (
 from vllm_mblt.eagle3_runtime import Eagle3Runner, is_eagle3_model
 from vllm_mblt.encoder_cache import EncodedVisionItem, EncoderOutputCache
 from vllm_mblt.host_threads import apply_engine_host_thread_defaults
-from vllm_mblt.mblt_platform import resolve_model_max_batch_size
+from vllm_mblt.mblt_platform import resolve_model_max_batch_size, resolve_static_image_position
 from vllm_mblt.models.modeling_vl_utils import QWEN3_VL_MAX_VISION_TOKENS
 from vllm_mblt.moe_runtime import MbltMoECacheModel, is_mixture_of_experts_model
 from vllm_mblt.request_cache import RequestCacheSlots, join_request_caches
@@ -871,7 +871,10 @@ class MbltWorker(WorkerBase):
     ) -> None:
         if not self._is_multimodal_model():
             return
+        expected_static_position = getattr(self, "_static_batch_image_position", None)
         if not mm_features:
+            if expected_static_position is not None:
+                raise RuntimeError("Static Qwen3-VL batch requests must include their compiled-layout image.")
             return
 
         if self._supports_dynamic_qwen3_vl_inputs():
@@ -907,6 +910,14 @@ class MbltWorker(WorkerBase):
             )
 
         position = self._multimodal_position_signature(image_features[0].mm_position)
+        if expected_static_position is not None:
+            offset, length = expected_static_position
+            mask = position[2]
+            if position[:2] != expected_static_position or (mask is not None and not all(mask)):
+                raise RuntimeError(
+                    "Static Qwen3-VL batch image position does not match the compiled layout: "
+                    f"expected offset={offset}, length={length}, all image tokens; got {position}."
+                )
         positions_by_session = getattr(self, "_vlm_image_positions_by_session", None)
         if positions_by_session is None:
             positions_by_session = {}
@@ -1999,14 +2010,20 @@ class MbltWorker(WorkerBase):
     def _check_text_mxq_supported(self) -> None:
         """Refuse a text MXQ the transformers-mblt forward cannot run, at load time rather than on the first batch.
 
-        transformers-mblt's batched deepstack forward takes only a Qwen3-VL text MXQ with a RoPE input; every
-        Qwen3-VL Batch16 release has one.
+        transformers-mblt 0.7.1 supports split-static batch MXQs with four inputs, but still rejects bundled-static
+        batch MXQs with two inputs. Dynamic batch MXQs use three or five inputs including a RoPE input.
         """
         if self._supports_deepstack_input() and self._is_batch_model() and not self._text_mxq_uses_rope_input():
-            raise RuntimeError(
-                "Batched Qwen3-VL text MXQs without a RoPE input are unsupported; "
-                "use a dynamic text MXQ, which has one."
-            )
+            shapes = self._cache_model_input_shapes(self._get_cache_model())
+            if len(shapes) != 4:
+                raise RuntimeError(
+                    "Batched Qwen3-VL text MXQs without a RoPE input must use the four-input split-static layout; "
+                    f"got {len(shapes)} inputs. Bundled-static batch MXQs are unsupported."
+                )
+            try:
+                self._static_batch_image_position = resolve_static_image_position(self.vllm_config)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
 
     def _is_audio_text_model(self) -> bool:
         model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)

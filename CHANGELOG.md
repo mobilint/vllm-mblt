@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 ### Changed
 
@@ -10,6 +10,11 @@
   encoder scheduling, this worker still encodes all items of a new request before its first text chunk.
 
 ### Added
+
+- Qwen3-VL split-static batch text MXQs use the transformers-mblt 0.7.1 forward without an external RoPE input.
+  Set `static_image_token_offset` and `static_image_token_length` to the compiled image placeholder layout; the
+  worker rejects missing or mismatched image inputs, but cannot verify the configured values against the MXQ.
+  Text-only requests and bundled-static batch MXQs remain unsupported in this path.
 
 - A host cache of vision encoder outputs keyed by vLLM's multimodal identifier and a fingerprint of the processed
   pixels and grid: repeated identical inputs are encoded once. `VLLM_MBLT_ENCODER_CACHE_MAX_HOST_MIB`

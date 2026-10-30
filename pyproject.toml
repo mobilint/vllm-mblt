@@ -30,7 +30,7 @@ dependencies = [
     # recommended_host_threads (0.6.1). The Model Zoo release that forwards
     # hf_transformers to transformers-mblt loads the same model classes.
     "mblt-model-zoo[transformers]>=2.11.0",
-    "transformers-mblt>=0.6.1",
+    "transformers-mblt>=0.7.1",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

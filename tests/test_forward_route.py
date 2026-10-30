@@ -156,21 +156,48 @@ def test_calibration_before_any_request_runs_on_a_scratch_cache() -> None:
 
 
 @pytest.mark.parametrize(
-    ("batch", "rope_input", "supported"),
-    [(False, False, True), (True, True, True), (True, False, False)],
-    ids=["non-batch-static", "batch-rope-input", "batch-static"],
+    ("batch", "rope_input", "input_count", "supported"),
+    [(False, False, 2, True), (True, True, 3, True), (True, True, 5, True),
+     (True, False, 4, True), (True, False, 2, False), (True, False, 0, False)],
+    ids=["non-batch-static", "batch-bundled-dynamic", "batch-split-dynamic", "batch-split-static",
+         "batch-bundled-static", "batch-unknown"],
 )
-def test_only_a_batched_qwen3_vl_text_mxq_without_rope_input_is_refused(batch, rope_input, supported) -> None:
+def test_qwen3_vl_batch_mxq_layout_validation(batch, rope_input, input_count, supported) -> None:
     worker = MbltWorker.__new__(MbltWorker)
     worker.max_batch_size = 16 if batch else 1
     worker._supports_deepstack_input = lambda: True
     worker._text_mxq_uses_rope_input = lambda: rope_input
+    worker._get_cache_model = lambda: None
+    worker._cache_model_input_shapes = lambda _: [(1, -1, 4)] * input_count
+    worker.vllm_config = SimpleNamespace(
+        load_config=SimpleNamespace(
+            model_loader_extra_config={"static_image_token_offset": 4, "static_image_token_length": 64}
+        )
+    )
 
     if supported:
         worker._check_text_mxq_supported()
     else:
         with pytest.raises(RuntimeError, match="without a RoPE input"):
             worker._check_text_mxq_supported()
+
+
+@pytest.mark.parametrize("value", [None, -1, True, "4"])
+def test_split_static_batch_requires_a_valid_compiled_image_offset(value) -> None:
+    worker = MbltWorker.__new__(MbltWorker)
+    worker.max_batch_size = 16
+    worker.model = SimpleNamespace(config=SimpleNamespace())
+    worker._supports_deepstack_input = lambda: True
+    worker._text_mxq_uses_rope_input = lambda: False
+    worker._get_cache_model = lambda: None
+    worker._cache_model_input_shapes = lambda _: [(1, -1, 4)] * 4
+    worker.vllm_config = SimpleNamespace(
+        load_config=SimpleNamespace(
+            model_loader_extra_config={"static_image_token_offset": value, "static_image_token_length": 64}
+        )
+    )
+    with pytest.raises(RuntimeError, match="requires static_image_token_offset"):
+        worker._check_text_mxq_supported()
 
 
 class _RecordingTextDecoder(_RecordingModel):

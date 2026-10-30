@@ -46,7 +46,7 @@ the plugin does not install a fallback handler; logging remains the application'
 
 - Python 3.11+
 - `vllm==0.32.0`
-- `transformers-mblt >= 0.6.1` and `mblt-model-zoo[transformers] >= 2.11.0`
+- `transformers-mblt >= 0.7.1` and `mblt-model-zoo[transformers] >= 2.11.0`
 - For Qwen3-ASR (`mobilint/Qwen3-ASR-1.7B`), the `qwen-asr` extra, which installs `transformers-mblt >= 0.7.0`:
   `pip install "vllm-mblt[qwen-asr]"`
 - For Qwen3-MoE (`mobilint/Qwen3-30B-A3B`), the `qwen3-moe` extra: `pip install "vllm-mblt[qwen3-moe]"`
@@ -576,9 +576,9 @@ their text decoder with the merged embeddings, M-RoPE `position_ids` and
 deepstack features, and Qwen3-ASR calls its thinker's text decoder with the
 merged audio-text embeddings. Mixture-of-Experts models serve one request at a
 time, so each step runs on that request's `MobilintMixtureOfExpertsCache`. The
-worker never calls an MXQ itself. A Qwen3-VL batch MXQ without a RoPE input is
-refused at load, as the batched deepstack forward cannot run it; every Qwen3-VL
-Batch16 release has one.
+worker never calls an MXQ itself. Qwen3-VL batch MXQs may use the dynamic
+three- or five-input layout or the four-input split-static layout supported by
+transformers-mblt 0.7.1. Bundled-static batch MXQs remain unsupported.
 
 Every request keeps its own transformers-mblt cache on the NPU slot it runs on,
 and the worker binds it before each infer. transformers-mblt records which
@@ -686,8 +686,17 @@ Batch-compiled VLM text backends (`max_batch_size > 1`) are supported for
 Mobilint Qwen2-VL and Qwen3-VL model types. With `mblt-model-zoo>=2.7.0`,
 Qwen3-VL dynamic-vision Batch16 artifacts forward packed text embeddings plus
 the matching packed RoPE and DeepStack tensors. Both the bundled 3-input text
-layout and the per-layer split 5-input layout are supported; batched split-static
-artifacts remain unsupported.
+layout and the per-layer split 5-input layout are supported. The four-input
+split-static batch layout is also supported without a RoPE input. Static MXQs
+have a baked prompt layout: every request must include its image at the compiled
+position. Set `static_image_token_offset` and `static_image_token_length` in
+`--model-loader-extra-config` or the model config to the artifact's compiled
+image placeholder offset and length, for example
+`'{"static_image_token_offset":4,"static_image_token_length":64}'` for an artifact
+compiled with that layout. These values are artifact-specific, not defaults. The
+worker rejects missing or mismatched image placeholders; it cannot verify whether
+the configured values match the MXQ itself. Text-only requests are rejected in
+this split-static batch path. Bundled-static batch MXQs remain unsupported.
 Qwen3-VL dynamic image and video processor resolution overrides are forwarded up to
 the NPU encoder's 4096 pre-merge vision-token limit. Larger overrides are clamped and
 `do_resize=False` is rejected so preprocessing cannot produce an unsupported MXQ input shape.

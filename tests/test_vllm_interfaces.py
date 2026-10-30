@@ -12,6 +12,59 @@ from vllm_mblt.mblt_platform import MbltPlatform
 from vllm_mblt.mblt_worker import MbltWorker
 
 
+class _StaticInputProcessor:
+    """Stand-in for vLLM's InputProcessor, which calls the platform with the engine's config."""
+
+    def __init__(self, config) -> None:
+        self.vllm_config = config
+        self.model_config = config.model_config
+
+    def process(self, inputs) -> None:
+        MbltPlatform.validate_request(inputs, SimpleNamespace())
+
+
+def test_static_batch_frontend_rejects_incompatible_image_layout() -> None:
+    import torch
+    from vllm.exceptions import VLLMValidationError
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    config = _make_vllm_config(
+        128,
+        hf_config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=False),
+        loader_extra_config={
+            "text_max_batch_size": 16,
+            "static_image_token_offset": 4,
+            "static_image_token_length": 64,
+        },
+    )
+    processor = _StaticInputProcessor(config)
+    valid = {"type": "multimodal", "mm_placeholders": {"image": [PlaceholderRange(offset=4, length=64)]}}
+    processor.process(valid)
+    for inputs in (
+        {"type": "token"},
+        {"type": "multimodal", "mm_placeholders": {"image": [PlaceholderRange(offset=5, length=64)]}},
+        {"type": "multimodal", "mm_placeholders": {"image": [PlaceholderRange(offset=4, length=63)]}},
+        {
+            "type": "multimodal",
+            "mm_placeholders": {
+                "image": [PlaceholderRange(offset=4, length=64, is_embed=torch.zeros(64, dtype=torch.bool))]
+            },
+        },
+    ):
+        with pytest.raises(VLLMValidationError, match="one image at the compiled placeholder"):
+            processor.process(inputs)
+    processor.process(valid)  # a rejected request does not affect subsequent validation
+
+
+def test_dynamic_qwen3_vl_frontend_does_not_use_static_layout() -> None:
+    config = _make_vllm_config(
+        128,
+        hf_config=SimpleNamespace(model_type="mobilint-qwen3_vl", dynamic_vision=True),
+        loader_extra_config={"text_max_batch_size": 16},
+    )
+    _StaticInputProcessor(config).process({"type": "token"})
+
+
 def test_compile_or_warm_up_model_returns_compilation_times() -> None:
     # The executor reads `.language_model` from every worker's result.
     worker = MbltWorker.__new__(MbltWorker)
