@@ -871,7 +871,10 @@ class MbltWorker(WorkerBase):
     ) -> None:
         if not self._is_multimodal_model():
             return
+        expected_static_position = getattr(self, "_static_batch_image_position", None)
         if not mm_features:
+            if expected_static_position is not None:
+                raise RuntimeError("Static Qwen3-VL batch requests must include their compiled-layout image.")
             return
 
         if self._supports_dynamic_qwen3_vl_inputs():
@@ -907,6 +910,14 @@ class MbltWorker(WorkerBase):
             )
 
         position = self._multimodal_position_signature(image_features[0].mm_position)
+        if expected_static_position is not None:
+            offset, length = expected_static_position
+            mask = position[2]
+            if position[:2] != expected_static_position or (mask is not None and not all(mask)):
+                raise RuntimeError(
+                    "Static Qwen3-VL batch image position does not match the compiled layout: "
+                    f"expected offset={offset}, length={length}, all image tokens; got {position}."
+                )
         positions_by_session = getattr(self, "_vlm_image_positions_by_session", None)
         if positions_by_session is None:
             positions_by_session = {}
@@ -2009,6 +2020,22 @@ class MbltWorker(WorkerBase):
                     "Batched Qwen3-VL text MXQs without a RoPE input must use the four-input split-static layout; "
                     f"got {len(shapes)} inputs. Bundled-static batch MXQs are unsupported."
                 )
+            values = []
+            for name in ("static_image_token_offset", "static_image_token_length"):
+                value = _prefix_cache_config_value(self.vllm_config, name)
+                if value is None:
+                    value = getattr(getattr(self.model, "config", None), name, None)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < (1 if name.endswith("length") else 0)
+                ):
+                    raise RuntimeError(
+                        f"Split-static Qwen3-VL batch requires {name} as an integer in "
+                        "model-loader-extra-config or the model config, matching the compiled prompt layout."
+                    )
+                values.append(value)
+            self._static_batch_image_position = (values[0], values[1])
 
     def _is_audio_text_model(self) -> bool:
         model_type = getattr(getattr(getattr(self, "model_config", None), "hf_config", None), "model_type", None)

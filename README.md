@@ -688,10 +688,15 @@ Qwen3-VL dynamic-vision Batch16 artifacts forward packed text embeddings plus
 the matching packed RoPE and DeepStack tensors. Both the bundled 3-input text
 layout and the per-layer split 5-input layout are supported. The four-input
 split-static batch layout is also supported without a RoPE input. Static MXQs
-have a baked prompt layout: every request must put its image at the position used
-when compiling the decoder. The worker cannot derive that position from the MXQ
-and does not verify it; a different layout can silently produce incorrect output.
-Bundled-static batch MXQs remain unsupported.
+have a baked prompt layout: every request must include its image at the compiled
+position. Set `static_image_token_offset` and `static_image_token_length` in
+`--model-loader-extra-config` or the model config to the artifact's compiled
+image placeholder offset and length, for example
+`'{"static_image_token_offset":4,"static_image_token_length":64}'` for an artifact
+compiled with that layout. These values are artifact-specific, not defaults. The
+worker rejects missing or mismatched image placeholders; it cannot verify whether
+the configured values match the MXQ itself. Text-only requests are rejected in
+this split-static batch path. Bundled-static batch MXQs remain unsupported.
 Qwen3-VL dynamic image and video processor resolution overrides are forwarded up to
 the NPU encoder's 4096 pre-merge vision-token limit. Larger overrides are clamped and
 `do_resize=False` is rejected so preprocessing cannot produce an unsupported MXQ input shape.

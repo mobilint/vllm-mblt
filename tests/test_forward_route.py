@@ -169,12 +169,35 @@ def test_qwen3_vl_batch_mxq_layout_validation(batch, rope_input, input_count, su
     worker._text_mxq_uses_rope_input = lambda: rope_input
     worker._get_cache_model = lambda: None
     worker._cache_model_input_shapes = lambda _: [(1, -1, 4)] * input_count
+    worker.vllm_config = SimpleNamespace(
+        load_config=SimpleNamespace(
+            model_loader_extra_config={"static_image_token_offset": 4, "static_image_token_length": 64}
+        )
+    )
 
     if supported:
         worker._check_text_mxq_supported()
     else:
         with pytest.raises(RuntimeError, match="without a RoPE input"):
             worker._check_text_mxq_supported()
+
+
+@pytest.mark.parametrize("value", [None, -1, True, "4"])
+def test_split_static_batch_requires_a_valid_compiled_image_offset(value) -> None:
+    worker = MbltWorker.__new__(MbltWorker)
+    worker.max_batch_size = 16
+    worker.model = SimpleNamespace(config=SimpleNamespace())
+    worker._supports_deepstack_input = lambda: True
+    worker._text_mxq_uses_rope_input = lambda: False
+    worker._get_cache_model = lambda: None
+    worker._cache_model_input_shapes = lambda _: [(1, -1, 4)] * 4
+    worker.vllm_config = SimpleNamespace(
+        load_config=SimpleNamespace(
+            model_loader_extra_config={"static_image_token_offset": value, "static_image_token_length": 64}
+        )
+    )
+    with pytest.raises(RuntimeError, match="requires static_image_token_offset"):
+        worker._check_text_mxq_supported()
 
 
 class _RecordingTextDecoder(_RecordingModel):
