@@ -3135,6 +3135,23 @@ class TestMbltWorkerOptimizations:
         assert deepstack is not None
         torch.testing.assert_close(deepstack[1, 1:3], torch.full((2, 4), 22.0))
 
+    @pytest.mark.parametrize("container", [tuple, list])
+    def test_qwen2_flat_per_image_outputs_are_combined(self, container) -> None:
+        worker, calls = self._make_qwen3_vl_encoder_worker()
+        worker.model_config.hf_config.model_type = "mobilint-qwen2_vl"
+        worker.model.config.model_type = "mobilint-qwen2_vl"
+
+        def encode(**kwargs):
+            calls.append(kwargs)
+            return container(torch.full((2, 4), float(value)) for value in (1, 2))
+
+        worker.model.get_image_features = encode
+        first, second = self._make_image_feature(1), self._make_image_feature(2)
+        result = worker._encode_vision_items([[first], [second]])
+        assert len(calls) == 1
+        torch.testing.assert_close(result[id(first)].embeds, torch.full((2, 4), 1.0))
+        torch.testing.assert_close(result[id(second)].embeds, torch.full((2, 4), 2.0))
+
     def test_repeated_images_are_encoded_once_and_reused_from_the_encoder_cache(self) -> None:
         worker, calls = self._make_qwen3_vl_encoder_worker()
         first, repeat = self._make_image_feature(1.0, "hash-a"), self._make_image_feature(1.0, "hash-a")

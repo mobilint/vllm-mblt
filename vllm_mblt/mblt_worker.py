@@ -1417,7 +1417,17 @@ class MbltWorker(WorkerBase):
                 grid_key: grids[0] if len(grids) == 1 else torch.cat(grids, dim=0),
             }
         )
-        embeds = self._normalize_multimodal_embeddings(outputs)
+        if (
+            len(features) > 1
+            and not self._supports_deepstack_input()
+            and isinstance(outputs, (list, tuple))
+            and len(outputs) == len(features)
+            and all(isinstance(item, torch.Tensor) and item.ndim == 2 for item in outputs)
+        ):
+            # Qwen2-VL on transformers 4 can return one 2-D tensor per image rather than a joined tensor.
+            embeds = torch.cat(outputs, dim=0)
+        else:
+            embeds = self._normalize_multimodal_embeddings(outputs)
         deepstack = self._extract_deepstack_embeddings(outputs) if self._supports_deepstack_input() else None
         if len(features) == 1:
             return [EncodedVisionItem(embeds, None if deepstack is None else tuple(deepstack))]
