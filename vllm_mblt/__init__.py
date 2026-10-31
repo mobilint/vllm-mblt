@@ -8,6 +8,14 @@ def register():
 def register_model():
     from vllm import ModelRegistry
 
+    for architecture in (
+        "MobilintEmbeddingModel",
+        "MobilintLastTokenEmbeddingModel",
+        "MobilintForSequenceClassification",
+        "MobilintQwen3ForSequenceClassification",
+    ):
+        ModelRegistry.register_model(architecture, f"vllm_mblt.models.modeling_pooling:{architecture}")
+
     ModelRegistry.register_model("MobilintLlamaForCausalLM", "vllm_mblt.models.modeling_llama:MobilintLlamaForCausalLM")
 
     ModelRegistry.register_model(
