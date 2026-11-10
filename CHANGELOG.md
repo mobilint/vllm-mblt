@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Structured output requests (`response_format` with a JSON schema or `json_object`, and `structured_outputs`) are
+  now constrained by their grammar. The worker sampled inside `execute_model()`, before the engine had computed the
+  step's grammar bitmask, so the grammar never reached the logits: a request succeeded only when the model happened
+  to emit a valid token, and otherwise ended with HTTP 500 and `Failed to advance FSM ... grammar rejected tokens`
+  in the server log (for example when Qwen3 opened its answer with a ` ``` ` fence). A step with structured output
+  requests now returns `None` from `execute_model()` and is sampled in `sample_tokens()` under the bitmask; other
+  steps are sampled as before. EAGLE-3 models still refuse structured output.
+
 ## 0.10.0
 
 ### Changed

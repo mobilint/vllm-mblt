@@ -4,6 +4,7 @@ import os
 import statistics
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Sequence
 
 import numpy as np
@@ -29,6 +30,7 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunner
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_mblt.data_parallel import (
@@ -192,6 +194,19 @@ def _positive_int_attr(root: object, path: str) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return int_value if int_value > 0 else None
+
+
+@dataclass
+class PendingSampling:
+    """What a step's forward pass leaves for sampling: the last-token logits of the requests that sample."""
+
+    req_ids: list[str]
+    req_id_to_index: dict[str, int]
+    prompt_logprobs_dict: dict[str, Any]
+    # One (1, vocab) row per request in sampling_req_ids, in that order.
+    logits_batch: list[torch.Tensor]
+    req_states_for_sampling: list["RequestState"]
+    sampling_req_ids: list[str]
 
 
 @dataclass
@@ -595,6 +610,8 @@ class MbltWorker(WorkerBase):
         self.sampler = Sampler(logprobs_mode="raw_logits")
         self.sampler.topk_topp_sampler = HostTopKTopPSampler(logprobs_mode="raw_logits")
         self.empty_logits_processors = LogitsProcessors(None)
+        # The forward results of a step with structured output requests, held from execute_model() to sample_tokens().
+        self._pending_sampling: Optional[PendingSampling] = None
         self.empty_prompt_token_ids = torch.empty((0, 0), dtype=torch.int64)
         self.enable_chunked_prefill = self.vllm_config.scheduler_config.enable_chunked_prefill
         self.max_num_batched_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -3746,6 +3763,8 @@ class MbltWorker(WorkerBase):
             raise RuntimeError("Input embeddings are not initialized.")
         if self.eagle3_runner is not None:
             return self.eagle3_runner.execute(scheduler_output)
+        # A step left for sample_tokens() that the engine never sampled (it failed in between) is dropped.
+        self._pending_sampling = None
 
         print_debug = self.print_debug
 
@@ -4131,21 +4150,41 @@ class MbltWorker(WorkerBase):
                     req_states_for_sampling.append(req_state)
                     sampling_req_ids.append(req_id)
 
+        step = PendingSampling(
+            req_ids=req_ids,
+            req_id_to_index=req_id_to_index,
+            prompt_logprobs_dict=prompt_logprobs_dict,
+            logits_batch=logits_batch,
+            req_states_for_sampling=req_states_for_sampling,
+            sampling_req_ids=sampling_req_ids,
+        )
+        if logits_batch and getattr(scheduler_output, "has_structured_output_requests", False):
+            # The engine builds this step's grammar bitmask only after execute_model() and hands it to
+            # sample_tokens(), which it calls when execute_model() returns None. Sampling here instead would
+            # ignore the grammar: the scheduler then rejects the first token outside it and fails the request.
+            self._pending_sampling = step
+            return None
+        return self._sample_step(step, None)
+
+    def _sample_step(self, step: "PendingSampling", grammar_output: Optional[GrammarOutput]) -> ModelRunnerOutput:
+        req_ids = step.req_ids
         # vLLM 0.32 takes plain token lists here and tests them for truth, which a NumPy array of more than one
         # token cannot answer.
         sampled_token_ids: list[list[int]] = [[] for _ in req_ids]
         logprobs = None
 
-        if logits_batch:
-            logits = torch.cat(logits_batch, dim=0)
-            sampling_metadata = self._make_sampling_metadata(req_states_for_sampling)
+        if step.logits_batch:
+            logits = torch.cat(step.logits_batch, dim=0)
+            if grammar_output is not None:
+                self._apply_grammar_bitmask(logits, step.sampling_req_ids, grammar_output)
+            sampling_metadata = self._make_sampling_metadata(step.req_states_for_sampling)
             sampler_output = self._sample_next_token(logits, sampling_metadata)
             sampled_token_ids_int: list[list[int]] = sampler_output.sampled_token_ids.tolist()
             generated_lengths_by_req_id: dict[str, int] = {}
-            for i, req_id in enumerate(sampling_req_ids):
+            for i, req_id in enumerate(step.sampling_req_ids):
                 self.req_states[req_id].output_token_ids.extend(sampled_token_ids_int[i])
                 generated_lengths_by_req_id[req_id] = len(sampled_token_ids_int[i])
-                sampled_token_ids[req_id_to_index[req_id]] = sampled_token_ids_int[i]
+                sampled_token_ids[step.req_id_to_index[req_id]] = sampled_token_ids_int[i]
 
             if sampler_output.logprobs_tensors is not None:
                 cu_num_generated_tokens = [0]
@@ -4155,16 +4194,33 @@ class MbltWorker(WorkerBase):
                     )
                 logprobs = sampler_output.logprobs_tensors.tolists(cu_num_generated_tokens)
 
-        if print_debug:
-            print(req_ids, req_id_to_index, sampled_token_ids)
+        if self.print_debug:
+            print(req_ids, step.req_id_to_index, sampled_token_ids)
 
         return ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index=req_id_to_index,
+            req_id_to_index=step.req_id_to_index,
             sampled_token_ids=sampled_token_ids,
             logprobs=logprobs,
-            prompt_logprobs_dict=prompt_logprobs_dict,
+            prompt_logprobs_dict=step.prompt_logprobs_dict,
             pooler_output=[],
+        )
+
+    @staticmethod
+    def _apply_grammar_bitmask(
+        logits: torch.Tensor, sampling_req_ids: list[str], grammar_output: GrammarOutput
+    ) -> None:
+        """Mask, in place, the logits of every structured output request to the tokens its grammar allows next.
+
+        ``logits`` has one row per entry of ``sampling_req_ids``. vLLM's own helper matches the bitmask rows, which
+        follow ``grammar_output.structured_output_request_ids``, to those rows by request id, so other requests in
+        the step are untouched. This worker schedules no speculative tokens (EAGLE-3 refuses structured output).
+        """
+        apply_grammar_bitmask(
+            SimpleNamespace(scheduled_spec_decode_tokens={}),
+            grammar_output,
+            SimpleNamespace(req_ids=sampling_req_ids),
+            logits,
         )
 
     def _make_sampling_metadata(
@@ -4255,8 +4311,14 @@ class MbltWorker(WorkerBase):
             spec_token_ids=None,
         )
 
-    def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        raise NotImplementedError
+    @torch.inference_mode()
+    def sample_tokens(self, grammar_output: Optional[GrammarOutput]) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        """Sample the step whose execute_model() returned None, under the grammar bitmask of its requests."""
+        step = self._pending_sampling
+        self._pending_sampling = None
+        if step is None:
+            raise RuntimeError("sample_tokens() was called without a step that execute_model() left to sample.")
+        return self._sample_step(step, grammar_output)
 
     def shutdown(self) -> None:
         # qbruntime buffers the trace log and writes it only on stop, so a

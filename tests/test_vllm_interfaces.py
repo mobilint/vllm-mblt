@@ -126,8 +126,8 @@ def test_supported_kv_cache_layouts_need_no_attention_backend() -> None:
 
 
 def test_async_scheduling_is_turned_off() -> None:
-    # vLLM 0.32 enables it by default; the engine would then call sample_tokens(), which this worker leaves
-    # unimplemented because execute_model() already samples.
+    # vLLM 0.32 enables it by default; the engine would then take every step's result from sample_tokens(), while
+    # this worker returns it from execute_model() unless the step has structured output requests.
     config = _make_vllm_config(64)
     config.scheduler_config.async_scheduling = True
 
