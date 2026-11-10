@@ -8,6 +8,7 @@ from vllm.logprobs import Logprob
 from vllm.model_executor import model_loader
 from vllm.sampling_params import SamplingParams
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.engine.logprobs import LogprobsProcessor, create_prompt_logprobs
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -25,6 +26,7 @@ from vllm_mblt.mblt_worker import (
 )
 from vllm_mblt.request_cache import RequestCacheSlots
 from vllm_mblt.runtime_cache import MbltRuntimeCacheManager, RuntimeCacheRequest
+from vllm_mblt.sampling import HostTopKTopPSampler
 
 from .kv_slot_fakes import FakeForwardModel, FakeKVSlotModel, attach_request_caches, make_snapshot_cache
 
@@ -2488,6 +2490,113 @@ class TestMbltWorkerOptimizations:
         assert infer_calls == [((1, 2, 0), (1, 2, 1), (1, 2, 2))]
         for slot in range(3):
             assert output.sampled_token_ids[output.req_id_to_index[f"req-{slot}"]] == [20 + slot]
+
+    @staticmethod
+    def _make_grammar_output(vocab_size: int, allowed: dict[str, list[int]]) -> GrammarOutput:
+        """A grammar bitmask in vLLM's layout: one row of int32 words per request, bit set = token allowed."""
+        bitmask = np.zeros((len(allowed), (vocab_size + 31) // 32), dtype=np.uint32)
+        for row, token_ids in enumerate(allowed.values()):
+            for token_id in token_ids:
+                bitmask[row, token_id // 32] |= np.uint32(1 << (token_id % 32))
+        return GrammarOutput(list(allowed), bitmask.view(np.int32))
+
+    def _make_structured_output_step(self, worker: MbltWorker) -> SimpleNamespace:
+        """Two requests decode one token each; the forward's most likely tokens are 50 and 51."""
+        vocab_size = 64
+        worker.req_states = {
+            "structured": self._make_batch_prompt_state(
+                worker, [1, 2, 3], slot_id=0, prompt_logprobs=False, output_token_ids=[30]
+            ),
+            "plain": self._make_batch_prompt_state(
+                worker, [4, 5], slot_id=1, prompt_logprobs=False, output_token_ids=[31]
+            ),
+        }
+        self._install_fake_batch_mxq(
+            worker,
+            full_logits=False,
+            vocab_size=vocab_size,
+            max_batch_size=4,
+            next_token={0: [0, 0, 30, 50], 1: [0, 31, 51]},
+            infer_calls=[],
+        )
+        scheduler_output = self._make_scheduler_output({"structured": 1, "plain": 1})
+        scheduler_output.has_structured_output_requests = True
+        return scheduler_output
+
+    def test_structured_output_step_samples_under_the_grammar_bitmask(self) -> None:
+        # The forward prefers token 50 for the structured request, as Qwen3 prefers a ``` fence over JSON. Sampling
+        # it anyway made the scheduler reject the token and fail the request with HTTP 500.
+        worker = self._make_batch_worker(max_batch_size=4)
+        scheduler_output = self._make_structured_output_step(worker)
+
+        # The engine computes the bitmask after execute_model(), so the step is not sampled yet.
+        assert worker.execute_model(scheduler_output) is None
+        assert worker.req_states["structured"].output_token_ids == [30]
+
+        # The bitmask rows follow the scheduler's request order, which need not be the worker's.
+        grammar_output = self._make_grammar_output(64, {"structured": [7, 9]})
+        output = worker.sample_tokens(grammar_output)
+
+        assert output.sampled_token_ids[output.req_id_to_index["structured"]][0] in (7, 9)
+        assert output.sampled_token_ids[output.req_id_to_index["plain"]] == [51]
+        assert worker.req_states["structured"].output_token_ids[0] == 30
+        assert len(worker.req_states["structured"].output_token_ids) == 2
+        assert worker.req_states["plain"].output_token_ids == [31, 51]
+
+    def test_structured_output_random_sampling_stays_inside_the_grammar(self) -> None:
+        worker = self._make_batch_worker(max_batch_size=4)
+        # The sampler a served worker uses; the fixture's default is vLLM's own.
+        worker.sampler.topk_topp_sampler = HostTopKTopPSampler(logprobs_mode="raw_logits")
+        allowed = [3, 40, 63]
+        for _ in range(20):
+            scheduler_output = self._make_structured_output_step(worker)
+            # Qwen3's generation defaults; the three allowed tokens are fewer than top_k.
+            random_sampling = SamplingParams.from_optional(temperature=0.6, top_k=20, top_p=0.95)
+            state = worker.req_states["structured"]
+            state.sampling_params = random_sampling
+            state.cached_sampling_state = worker._make_cached_sampling_state(random_sampling, [1, 2, 3])
+
+            assert worker.execute_model(scheduler_output) is None
+            output = worker.sample_tokens(self._make_grammar_output(64, {"structured": allowed}))
+
+            assert output.sampled_token_ids[output.req_id_to_index["structured"]][0] in allowed
+            assert output.sampled_token_ids[output.req_id_to_index["plain"]] == [51]
+
+    def test_structured_output_step_without_a_bitmask_samples_freely(self) -> None:
+        # The scheduler returns no GrammarOutput when, for example, no structured request is left to constrain.
+        worker = self._make_batch_worker(max_batch_size=4)
+
+        assert worker.execute_model(self._make_structured_output_step(worker)) is None
+        output = worker.sample_tokens(None)
+
+        assert output.sampled_token_ids[output.req_id_to_index["structured"]] == [50]
+        assert output.sampled_token_ids[output.req_id_to_index["plain"]] == [51]
+
+    def test_structured_output_prefill_chunk_returns_its_output_directly(self) -> None:
+        # Nothing is sampled in a step that only prefills, so there is nothing to hold for sample_tokens().
+        worker = self._make_batch_worker(max_batch_size=4)
+        worker.req_states = {
+            "prefill": self._make_batch_prompt_state(worker, [6, 7, 8, 9], slot_id=0, prompt_logprobs=False)
+        }
+        self._install_fake_batch_mxq(
+            worker, full_logits=False, vocab_size=64, max_batch_size=4, next_token={0: [7, 8, 9, 52]}, infer_calls=[]
+        )
+        scheduler_output = self._make_scheduler_output({"prefill": 2})
+        scheduler_output.has_structured_output_requests = True
+
+        output = worker.execute_model(scheduler_output)
+
+        assert output is not None
+        assert output.sampled_token_ids == [[]]
+
+    def test_sample_tokens_needs_a_step_left_by_execute_model(self) -> None:
+        worker = self._make_batch_worker(max_batch_size=4)
+        scheduler_output = self._make_structured_output_step(worker)
+        scheduler_output.has_structured_output_requests = False
+
+        assert worker.execute_model(scheduler_output) is not None
+        with pytest.raises(RuntimeError, match="sample_tokens"):
+            worker.sample_tokens(None)
 
     def test_sampling_penalties_can_be_forced_off_for_non_cuda_runtime(self) -> None:
         worker = self._make_worker()

@@ -705,6 +705,16 @@ error.
 
 Implementation file: [`vllm_mblt/mblt_worker.py`](vllm_mblt/mblt_worker.py)
 
+## Structured Outputs
+
+`response_format` (`json_schema`, `json_object`) and vLLM's `structured_outputs` request field constrain
+generation with any of vLLM's backends (`--structured-outputs-config`). The engine computes each step's grammar
+bitmask and the worker applies it to the host logits before sampling, so a sampled token is always one the grammar
+allows. EAGLE-3 models refuse these requests with HTTP 400.
+
+A response that reaches `max_tokens` (or the context limit) before the grammar completes is cut short and is not
+valid JSON; check `finish_reason`.
+
 ## Known Issues
 
 ### Offline `LLM` scripts can hang or abort at exit
