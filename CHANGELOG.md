@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `--revision` (and `--code-revision`) now reach the worker's model load. The worker loaded the Hub repo's default
+  branch while vLLM read the config and tokenizer from the requested branch, tag or commit, so in a repo whose
+  branches ship an MXQ under the same name (for example `main` and a batch-16 branch) the default branch's host
+  weights and MXQ were served. Without `--revision`, loading is unchanged.
+
 ## 0.10.0
 
 ### Changed

@@ -3431,6 +3431,13 @@ class MbltWorker(WorkerBase):
             # transformers 4's float32 unless the loader config names a dtype.
             model_kwargs["dtype"] = torch.float32
         model_kwargs = self._place_on_data_parallel_card(model_kwargs, hf_config)
+        # Load the Hub revision vLLM read the config from, with the same code_revision. transformers-mblt resolves the
+        # MXQ from the loaded config's commit, so without it a repo whose branches ship same-name MXQs (main and a
+        # batch branch) loads the default branch's weights and MXQ under the requested branch's config.
+        for key in ("revision", "code_revision"):
+            value = getattr(self.model_config, key, None)
+            if value is not None:
+                model_kwargs[key] = value
 
         start = time.perf_counter()
         self._log_init_stage(
