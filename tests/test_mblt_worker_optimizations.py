@@ -3601,6 +3601,70 @@ class TestMbltWorkerOptimizations:
             )
         ]
 
+    @pytest.mark.parametrize(
+        ("model_type", "loader"),
+        [("qwen2", "AutoModelForCausalLM"), ("mobilint-qwen3_vl", "AutoModelForImageTextToText")],
+    )
+    @pytest.mark.parametrize(
+        ("revision", "code_revision"),
+        [(None, None), ("bs16", None), ("0123456789abcdef0123456789abcdef01234567", "bs16")],
+    )
+    def test_load_model_forwards_hub_revision_to_from_pretrained(
+        self, monkeypatch, model_type, loader, revision, code_revision
+    ) -> None:
+        worker = MbltWorker.__new__(MbltWorker)
+        worker.rank = 0
+        worker.local_rank = 0
+        worker.model = None
+        worker.cache_model = None
+        worker.max_batch_size = 1
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=1, block_size=128)
+        worker.load_config = SimpleNamespace(model_loader_extra_config={"dev_no": 0, "core_mode": "global4"})
+        worker.model_config = SimpleNamespace(
+            model="mobilint/test-model",
+            revision=revision,
+            code_revision=code_revision,
+            hf_config=SimpleNamespace(model_type=model_type),
+            model_kwargs={},
+            hf_overrides={},
+        )
+        worker.vllm_config = SimpleNamespace(
+            load_config=SimpleNamespace(model_loader_extra_config={}), model_config=worker.model_config
+        )
+        fake_model = SimpleNamespace(
+            eval=lambda: None,
+            get_input_embeddings=lambda: SimpleNamespace(),
+            get_cache_mxq_model=lambda: SimpleNamespace(),
+        )
+        calls = []
+
+        def from_pretrained(*args, **kwargs):
+            calls.append((args, kwargs))
+            return fake_model
+
+        monkeypatch.setattr(f"vllm_mblt.mblt_worker.{loader}.from_pretrained", from_pretrained)
+
+        worker.load_model()
+
+        if model_type == "qwen2":
+            backend_kwargs = {"dev_no": 0, "core_mode": "global4"}
+        else:
+            backend_kwargs = {
+                "vision_dev_no": 0,
+                "text_dev_no": 0,
+                "vision_core_mode": "global4",
+                "text_core_mode": "global4",
+            }
+        hub_kwargs = {
+            key: value for key, value in (("revision", revision), ("code_revision", code_revision)) if value is not None
+        }
+        assert calls == [
+            (
+                ("mobilint/test-model",),
+                {"trust_remote_code": True, "dtype": torch.float32, **backend_kwargs, **hub_kwargs},
+            )
+        ]
+
     def test_load_model_reconciles_qwen3_vl_dynamic_vision_when_available(self, monkeypatch) -> None:
         worker = MbltWorker.__new__(MbltWorker)
         worker.rank = 0

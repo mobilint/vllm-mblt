@@ -132,7 +132,11 @@ class TestPlatform:
             worker.local_rank = 0
             worker.load_config = SimpleNamespace(model_loader_extra_config=extra_config)
             worker.model_config = SimpleNamespace(
-                model="mobilint/EAGLE3-JPharmatron-7B", hf_config=EAGLE3_CONFIG, model_kwargs={}, hf_overrides={}
+                model="mobilint/EAGLE3-JPharmatron-7B",
+                revision="bs16",
+                hf_config=EAGLE3_CONFIG,
+                model_kwargs={},
+                hf_overrides={},
             )
             worker.vllm_config = SimpleNamespace(
                 load_config=worker.load_config,
@@ -162,6 +166,7 @@ class TestPlatform:
             worker.load_model()
 
             (kwargs,) = loaded
+            assert kwargs["revision"] == "bs16"
             assert "dev_no" not in kwargs
             for role in ("base_", "draft_", "fc_"):
                 assert kwargs[f"{role}dev_no"] == 0
