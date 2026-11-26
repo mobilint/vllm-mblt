@@ -3,7 +3,7 @@ import math
 import os
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Sequence
 
 import numpy as np
@@ -2935,12 +2935,29 @@ class MbltWorker(WorkerBase):
         return scheduled_end >= req_state.prompt_len
 
     def _sample_next_token(self, logits: torch.Tensor, sampling_metadata: SamplingMetadata):
+        specific_token_ids = sampling_metadata.logprob_token_ids
+        num_logprobs = sampling_metadata.max_num_logprobs
+        if specific_token_ids and num_logprobs is not None:
+            ordinary_indices = [i for i in range(logits.shape[0]) if i not in specific_token_ids]
+            if ordinary_indices:
+                # vLLM's specific-token gather replaces top-k for the entire batch.
+                # Keep ordinary rows' top-k IDs, using the same normalized float32
+                # values as gather_logprobs so rounding ties keep the same IDs too.
+                if num_logprobs > 0:
+                    ordinary_logprobs = self.sampler.compute_logprobs(logits[ordinary_indices])
+                    ordinary_token_ids = torch.topk(ordinary_logprobs, num_logprobs, dim=-1).indices.tolist()
+                else:
+                    ordinary_token_ids = [[] for _ in ordinary_indices]
+                sampling_metadata = replace(
+                    sampling_metadata,
+                    logprob_token_ids={**specific_token_ids, **dict(zip(ordinary_indices, ordinary_token_ids))},
+                )
         # OpenAI-compatible logprobs must be log-softmax-normalized
         # probabilities, not raw logits. Keep the sampler's raw-logits default
         # for generation behavior, but request normalized raw logprobs for the
         # optional generated-token logprob tensors. The sampler only computes
-        # these when max_num_logprobs is not None, so normal generation without
-        # logprobs does not pay the log_softmax cost.
+        # these when top-k or specific-token logprobs are requested, so normal
+        # generation without logprobs does not pay the log_softmax cost.
         return self.sampler.forward(
             logits=logits,
             sampling_metadata=sampling_metadata,
@@ -4193,6 +4210,7 @@ class MbltWorker(WorkerBase):
 
         generators: dict[int, torch.Generator] = {}
         bad_words_token_ids: dict[int, list[list[int]]] = {}
+        logprob_token_ids: dict[int, list[int]] = {}
 
         max_num_logprobs = None
         any_penalties = False
@@ -4226,6 +4244,8 @@ class MbltWorker(WorkerBase):
 
             if cached_sampling.bad_words_token_ids is not None:
                 bad_words_token_ids[i] = cached_sampling.bad_words_token_ids
+            if state.sampling_params.logprob_token_ids is not None:
+                logprob_token_ids[i] = state.sampling_params.logprob_token_ids
 
             any_penalties = any_penalties or cached_sampling.has_penalties
             # vLLM treats temperature=0 as greedy decoding regardless of
@@ -4258,6 +4278,7 @@ class MbltWorker(WorkerBase):
             output_token_ids=output_token_ids,
             allowed_token_ids_mask=None,
             bad_words_token_ids=bad_words_token_ids,
+            logprob_token_ids=logprob_token_ids or None,
             logitsprocs=self.empty_logits_processors,
             spec_token_ids=None,
         )

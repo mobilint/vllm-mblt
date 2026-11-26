@@ -1867,6 +1867,130 @@ class TestMbltWorkerOptimizations:
         assert output.sampled_token_ids[output.req_id_to_index["normal"]] == [7]
         assert output.sampled_token_ids[output.req_id_to_index["prompt"]] == [8]
 
+    def test_sampling_metadata_specific_tokens_follow_sampling_order(self) -> None:
+        worker = self._make_worker()
+        candidate_state = self._make_request_state(
+            worker, SamplingParams.from_optional(logprob_token_ids=[7, 3]), [1, 2]
+        )
+        ordinary_state = self._make_request_state(worker, SamplingParams.from_optional(), [3, 4])
+
+        assert worker._make_sampling_metadata([candidate_state, ordinary_state]).logprob_token_ids == {0: [7, 3]}
+        assert worker._make_sampling_metadata([ordinary_state, candidate_state]).logprob_token_ids == {1: [7, 3]}
+        assert worker._make_sampling_metadata([ordinary_state]).logprob_token_ids is None
+        empty_state = self._make_request_state(worker, SamplingParams.from_optional(logprob_token_ids=[]), [1])
+        assert worker._make_sampling_metadata([empty_state]).logprob_token_ids == {0: []}
+
+    @pytest.mark.parametrize(
+        "request_order",
+        [
+            ("prefill", "sample-a", "ordinary", "sample-b", "plain", "empty"),
+            ("plain", "sample-b", "prefill", "empty", "ordinary", "sample-a"),
+        ],
+    )
+    @pytest.mark.parametrize("include_num_logprobs", [False, True])
+    def test_specific_token_logprobs_survive_chunked_prefill_and_batch_output(
+        self, request_order: tuple[str, ...], include_num_logprobs: bool
+    ) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 6
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=6, block_size=128)
+        worker.cache_model = SimpleNamespace(get_model_output_shape=lambda: [(6, 16)])
+        worker.sampler.pin_memory = False
+        candidate_ids = {"prefill": [5, 7], "sample-a": [1, 3], "sample-b": [2, 4, 6], "empty": []}
+        slot_logits = {}
+        for slot_id, req_id in enumerate((*candidate_ids, "ordinary", "plain")):
+            candidates = candidate_ids.get(req_id)
+            num_logprobs = len(candidates) if candidates is not None and include_num_logprobs else None
+            sampling_params = SamplingParams.from_optional(
+                temperature=0.0,
+                logprobs=2 if req_id == "ordinary" else num_logprobs,
+                logprob_token_ids=candidates,
+            )
+            prompt = [1, 2, 3, 4, 5] if req_id == "prefill" else [6, 7, 8]
+            req_state = self._make_request_state(worker, sampling_params, prompt)
+            req_state.prompt_embeds = np.ones((len(prompt), 4), dtype=np.float32)
+            req_state.prompt_len = len(prompt)
+            req_state.cache_slot_id = slot_id
+            worker.req_states[req_id] = req_state
+            slot_logits[slot_id] = np.arange(16, dtype=np.float32) * (slot_id + 1) / 4
+
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+        forward_model = FakeForwardModel(
+            lambda _embeds, _cache_size, slot_id: slot_logits[slot_id].copy(), config=worker.model.config
+        )
+        worker.model = forward_model
+
+        def assert_candidate_logprobs(output, req_id: str) -> None:
+            req_index = output.req_id_to_index[req_id]
+            row = output.logprobs.slice_request(req_index, 1)
+            expected_ids = candidate_ids[req_id]
+            assert row.logprob_token_ids[0, : len(expected_ids) + 1].tolist() == [15, *expected_ids]
+            slot_id = worker.req_states[req_id].cache_slot_id
+            expected_logprobs = torch.log_softmax(torch.from_numpy(slot_logits[slot_id]), dim=-1)
+            torch.testing.assert_close(
+                torch.from_numpy(row.logprobs[0, : len(expected_ids) + 1]), expected_logprobs[[15, *expected_ids]]
+            )
+
+        output = worker.execute_model(self._make_scheduler_output(dict.fromkeys(request_order, 3)))
+        assert forward_model.calls == [
+            tuple((3, 0, worker.req_states[req_id].cache_slot_id) for req_id in request_order)
+        ]
+        assert all(state.kv_cache.get_seq_length() == 3 for state in worker.req_states.values())
+        assert output is not None
+        assert output.logprobs is not None
+        assert output.sampled_token_ids[output.req_id_to_index["prefill"]] == []
+        assert output.logprobs.slice_request(output.req_id_to_index["prefill"], 0).logprob_token_ids.shape[0] == 0
+        for req_id in ("sample-a", "sample-b", "empty"):
+            assert_candidate_logprobs(output, req_id)
+        empty_row = output.logprobs.slice_request(output.req_id_to_index["empty"], 1)
+        assert np.isneginf(empty_row.logprobs[0, 1:]).all()
+        ordinary_row = output.logprobs.slice_request(output.req_id_to_index["ordinary"], 1)
+        assert ordinary_row.logprob_token_ids[0, :3].tolist() == [15, 15, 14]
+        ordinary_logits = slot_logits[worker.req_states["ordinary"].cache_slot_id]
+        torch.testing.assert_close(
+            torch.from_numpy(ordinary_row.logprobs[0, :3]),
+            torch.log_softmax(torch.from_numpy(ordinary_logits), dim=-1)[[15, 15, 14]],
+        )
+        assert worker.req_states["plain"].sampling_params.logprobs is None
+        assert worker.req_states["plain"].sampling_params.logprob_token_ids is None
+        assert output.sampled_token_ids[output.req_id_to_index["plain"]] == [15]
+
+        # The request retains its candidate IDs while an earlier prefill chunk emits no token.
+        output = worker.execute_model(self._make_scheduler_output({"prefill": 2}))
+        assert len(forward_model.calls) == 2
+        assert forward_model.calls[1] == ((2, 3, worker.req_states["prefill"].cache_slot_id),)
+        assert worker.req_states["prefill"].kv_cache.get_seq_length() == 5
+        assert all(
+            state.kv_cache.get_seq_length() == 3 for req_id, state in worker.req_states.items() if req_id != "prefill"
+        )
+        assert output is not None
+        assert output.logprobs is not None
+        assert_candidate_logprobs(output, "prefill")
+
+    def test_specific_token_logprobs_do_not_change_seeded_sampling(self) -> None:
+        outputs = []
+        generator_states = []
+        for candidates in (None, [1, 3]):
+            worker = self._make_worker()
+            worker.model.config.vocab_size = 16
+            worker.sampler.pin_memory = False
+            states = [
+                self._make_request_state(
+                    worker,
+                    SamplingParams.from_optional(temperature=0.8, seed=seed, logprobs=2, logprob_token_ids=ids),
+                    [1, 2],
+                )
+                for seed, ids in ((123, candidates), (456, None))
+            ]
+            metadata = worker._make_sampling_metadata(states)
+            logits = torch.arange(32, dtype=torch.float32).reshape(2, 16) / 8
+            outputs.append(worker._sample_next_token(logits, metadata).sampled_token_ids)
+            generator_states.append([state.cached_sampling_state.generator.get_state() for state in states])
+            assert metadata.logprob_token_ids == ({0: [1, 3]} if candidates is not None else None)
+        assert torch.equal(outputs[0], outputs[1])
+        for ordinary_state, specific_state in zip(*generator_states):
+            assert torch.equal(ordinary_state, specific_state)
+
     def test_mixed_batch_logprobs_align_with_full_req_ids(self) -> None:
         worker = self._make_worker()
         worker.max_batch_size = 3
