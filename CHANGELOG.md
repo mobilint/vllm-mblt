@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.1
+
 ### Fixed
 
 - Specific-token generation logprobs now reach the sampler through `logprob_token_ids`, preserving each request's
