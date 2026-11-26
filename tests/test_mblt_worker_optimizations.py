@@ -1928,7 +1928,7 @@ class TestMbltWorkerOptimizations:
             slot_id = worker.req_states[req_id].cache_slot_id
             expected_logprobs = torch.log_softmax(torch.from_numpy(slot_logits[slot_id]), dim=-1)
             torch.testing.assert_close(
-                row.logprobs[0, : len(expected_ids) + 1], expected_logprobs[[15, *expected_ids]]
+                torch.from_numpy(row.logprobs[0, : len(expected_ids) + 1]), expected_logprobs[[15, *expected_ids]]
             )
 
         output = worker.execute_model(self._make_scheduler_output(dict.fromkeys(request_order, 3)))
@@ -1939,12 +1939,13 @@ class TestMbltWorkerOptimizations:
         for req_id in ("sample-a", "sample-b", "empty"):
             assert_candidate_logprobs(output, req_id)
         empty_row = output.logprobs.slice_request(output.req_id_to_index["empty"], 1)
-        assert torch.isneginf(empty_row.logprobs[0, 1:]).all()
+        assert np.isneginf(empty_row.logprobs[0, 1:]).all()
         ordinary_row = output.logprobs.slice_request(output.req_id_to_index["ordinary"], 1)
         assert ordinary_row.logprob_token_ids[0, :3].tolist() == [15, 15, 14]
         ordinary_logits = slot_logits[worker.req_states["ordinary"].cache_slot_id]
         torch.testing.assert_close(
-            ordinary_row.logprobs[0, :3], torch.log_softmax(torch.from_numpy(ordinary_logits), dim=-1)[[15, 15, 14]]
+            torch.from_numpy(ordinary_row.logprobs[0, :3]),
+            torch.log_softmax(torch.from_numpy(ordinary_logits), dim=-1)[[15, 15, 14]],
         )
         assert worker.req_states["plain"].sampling_params.logprobs is None
         assert worker.req_states["plain"].sampling_params.logprob_token_ids is None
@@ -1961,6 +1962,7 @@ class TestMbltWorkerOptimizations:
         generator_states = []
         for candidates in (None, [1, 3]):
             worker = self._make_worker()
+            worker.model.config.vocab_size = 16
             worker.sampler.pin_memory = False
             states = [
                 self._make_request_state(
