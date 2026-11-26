@@ -1915,10 +1915,10 @@ class TestMbltWorkerOptimizations:
             slot_logits[slot_id] = np.arange(16, dtype=np.float32) * (slot_id + 1) / 4
 
         worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
-        worker._infer_logits_batch_with_sequence = lambda input_embeds_batch, cache_sizes, cache_ids, **_kwargs: [
-            InferenceLogits(last_token_logits=slot_logits[slot_id].copy(), full_sequence_logits=None)
-            for slot_id in cache_ids
-        ]
+        forward_model = FakeForwardModel(
+            lambda _embeds, _cache_size, slot_id: slot_logits[slot_id].copy(), config=worker.model.config
+        )
+        worker.model = forward_model
 
         def assert_candidate_logprobs(output, req_id: str) -> None:
             req_index = output.req_id_to_index[req_id]
@@ -1932,6 +1932,10 @@ class TestMbltWorkerOptimizations:
             )
 
         output = worker.execute_model(self._make_scheduler_output(dict.fromkeys(request_order, 3)))
+        assert forward_model.calls == [
+            tuple((3, 0, worker.req_states[req_id].cache_slot_id) for req_id in request_order)
+        ]
+        assert all(state.kv_cache.get_seq_length() == 3 for state in worker.req_states.values())
         assert output is not None
         assert output.logprobs is not None
         assert output.sampled_token_ids[output.req_id_to_index["prefill"]] == []
@@ -1953,6 +1957,12 @@ class TestMbltWorkerOptimizations:
 
         # The request retains its candidate IDs while an earlier prefill chunk emits no token.
         output = worker.execute_model(self._make_scheduler_output({"prefill": 2}))
+        assert len(forward_model.calls) == 2
+        assert forward_model.calls[1] == ((2, 3, worker.req_states["prefill"].cache_slot_id),)
+        assert worker.req_states["prefill"].kv_cache.get_seq_length() == 5
+        assert all(
+            state.kv_cache.get_seq_length() == 3 for req_id, state in worker.req_states.items() if req_id != "prefill"
+        )
         assert output is not None
         assert output.logprobs is not None
         assert_candidate_logprobs(output, "prefill")
